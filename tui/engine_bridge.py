@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import io
 import sys
+import re
 import queue
 import threading
 import contextlib
@@ -94,6 +95,9 @@ class _MotorState:
 
 _motor = _MotorState()
 logger = logging.getLogger(__name__)
+
+_RE_ANSI = re.compile(r"\x1b\[[0-9;]*[mGKHhJsu]")
+
 
 
 def inicializar_motor() -> None:
@@ -200,8 +204,7 @@ class _QueueWriter(io.TextIOBase):
         if "\n" not in self._buffer and "\r" not in self._buffer:
             return len(s)
 
-        import re as _re
-        partes = _re.split(r"(\n|\r)", self._buffer)
+        partes = re.split(r"(\n|\r)", self._buffer)
         self._buffer = partes.pop()  # leftover sin separador (o "" si terminó justo en uno)
 
         for i in range(0, len(partes), 2):
@@ -209,7 +212,14 @@ class _QueueWriter(io.TextIOBase):
             if sep == "\r":
                 continue  # countdown / overwrite → descartar
             texto = segmento.rstrip("\r\n")
+            # Truncar líneas larguísimas (rutas/JSON crudo) para no degradar la UI.
+            if len(texto) > 500:
+                texto = texto[:500] + "…"
             if texto.strip():
+                # Quitar códigos ANSI (colores del shell, p.ej.
+                # \x1b[1;33m...\x1b[0m) para que no rompan el
+                # parser de markup de Textual al llegar al DebugPanel.
+                texto = _RE_ANSI.sub("", texto)
                 self._q.put(StdoutLineEvent(texto=texto))
         return len(s)
 
@@ -217,8 +227,11 @@ class _QueueWriter(io.TextIOBase):
         pass
 
     def vaciar_residual(self) -> None:
-        if self._buffer.strip():
-            self._q.put(StdoutLineEvent(texto=self._buffer))
+        resto = _RE_ANSI.sub("", self._buffer)
+        if len(resto) > 500:
+            resto = resto[:500] + "…"
+        if resto.strip():
+            self._q.put(StdoutLineEvent(texto=resto))
         self._buffer = ""
 
 

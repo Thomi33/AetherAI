@@ -3075,12 +3075,14 @@ def node_fs_write(state: AetherState) -> dict:
     if isinstance(files, list) and files:
         rutas, ok, err = escribir_archivos_fs(files)
         if not ok:
+            print(f"\n❌ [FS]: No se pudieron escribir los archivos: {err}")
             return {
                 "error_activo":   True,
                 "error_mensaje":  err,
                 "error_contexto": "fs_write",
             }
         msg = "Archivos escritos:\n" + "\n".join(f"- {r}" for r in rutas)
+        print(f"\n💾 [FS]: {msg}")
         return {"fs_result": msg, "final_response": msg, "messages": [AIMessage(content=msg)]}
 
     path    = args.get("path") or args.get("filename")
@@ -3096,12 +3098,15 @@ def node_fs_write(state: AetherState) -> dict:
 
     destino, ok, err = escribir_archivo_fs(path, content or "")
     if not ok:
+        print(f"\n❌ [FS]: No se pudo escribir '{path}': {err}")
         return {
             "error_activo":   True,
             "error_mensaje":  f"No se pudo escribir '{path}': {err}",
             "error_contexto": "fs_write",
         }
     msg = f"Guardado en {destino}"
+    print(f"\n💾 [FS]: Escribiendo archivo → {destino}")
+    print(f"   └─ {msg}")
     return {"fs_result": msg, "final_response": msg, "messages": [AIMessage(content=msg)]}
 
 
@@ -3116,13 +3121,16 @@ def node_fs_read(state: AetherState) -> dict:
             "error_contexto": "fs_read",
         }
 
+    print(f"\n📖 [FS]: Leyendo archivo → {path}")
     contenido, ok, err = leer_archivo_fs(path)
     if not ok:
+        print(f"   └─ ❌ No se pudo leer '{path}': {err}")
         return {
             "error_activo":   True,
             "error_mensaje":  f"No se pudo leer '{path}': {err}",
             "error_contexto": "fs_read",
         }
+    print(f"   └─ OK ({len(contenido)} caracteres)")
     return {"fs_result": contenido}
 
 
@@ -3137,14 +3145,17 @@ def node_fs_mkdir(state: AetherState) -> dict:
             "error_contexto": "fs_mkdir",
         }
 
+    print(f"\n📁 [FS]: Creando carpeta → {path}")
     destino, ok, err = crear_directorio_fs(path)
     if not ok:
+        print(f"   └─ ❌ No se pudo crear '{path}': {err}")
         return {
             "error_activo":   True,
             "error_mensaje":  f"No se pudo crear '{path}': {err}",
             "error_contexto": "fs_mkdir",
         }
     msg = f"Directorio creado: {destino}"
+    print(f"   └─ {msg}")
     return {"fs_result": msg, "final_response": msg, "messages": [AIMessage(content=msg)]}
 
 
@@ -3159,13 +3170,16 @@ def node_fs_list(state: AetherState) -> dict:
             "error_contexto": "fs_list",
         }
 
+    print(f"\n📂 [FS]: Listando carpeta → {path}")
     listado, ok, err = listar_directorio_fs(path)
     if not ok:
+        print(f"   └─ ❌ No se pudo listar '{path}': {err}")
         return {
             "error_activo":   True,
             "error_mensaje":  f"No se pudo listar '{path}': {err}",
             "error_contexto": "fs_list",
         }
+    print(f"   └─ OK")
     return {"fs_result": listado}
 
 
@@ -3301,7 +3315,7 @@ def node_plan_executor(state: AetherState) -> dict:
     }
     for campo in (
         "llm_response", "final_response", "shell_command", "shell_output", "shell_error",
-        "web_results", "mcp_result", "vision_result",
+        "web_results", "mcp_result", "vision_result", "fs_result",
         "computer_use_log", "computer_use_result",
         "_codigo_original", "_archivo_codigo",
         "error_activo", "error_mensaje", "error_contexto", "messages",

@@ -2,13 +2,48 @@
 app.py — Aplicación principal TUI de Aether.
 """
 
-from rich.markup import escape
-
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, Input, Button
 from textual import work
 from textual.timer import Timer
+import re
 import time
+
+# ── Sanitización para widgets con markup ──
+# rich.markup.escape solo escapa tags minúsculas ([a-z#/@]...) y deja
+# [SHELL], [/SHELL], [INFO], [✓], JSON {"name":...} o ANSI \x1b[...] sin
+# tocar → Textual los parsea como markup y tira MarkupError.
+_RE_STREAM_ANSI = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def _sanear_streaming(texto: str) -> str:
+    """Texto plano seguro para Static(markup=True) como streaming_line."""
+    s = _RE_STREAM_ANSI.sub("", str(texto))
+    return s.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def limpiar_respuesta_chat(respuesta: str) -> str:
+    """Quita protocolo interno de tool-calling de la respuesta final del LLM.
+
+    El agente necesita emitir [SHELL]...[/SHELL] y JSON de tool call como
+    pasos INTERMEDIOS (los ejecuta node_shell), pero la respuesta FINAL que
+    va al chat (DoneEvent.respuesta) debería ser lenguaje natural limpio.
+    A veces Ornith deja escapar esos artefactos hasta la síntesis final;
+    esto los filtra como defensa sin tocar el flujo de ejecución.
+    """
+    s = _RE_STREAM_ANSI.sub("", str(respuesta or ""))
+    # Bloques de protocolo [SHELL]...[/SHELL] que sobrevivieron a la síntesis
+    s = re.sub(r"\[SHELL\].*?\[/SHELL\]", "", s, flags=re.DOTALL | re.IGNORECASE)
+    # JSON de tool call suelto {"name":"shell","arguments":{...}}
+    s = re.sub(
+        r'\{[^{}]*"name"\s*:\s*"shell"[^{}]*"arguments"[^{}]*\{[^{}]*\}[^{}]*\}',
+        "", s, flags=re.DOTALL,
+    )
+    # Prefijos internos de una sola línea ([MCP]..., [PLAN EXECUTOR]...)
+    s = re.sub(r"(?m)^\[(MCP|PLAN EXECUTOR|INFO|DEBUG|SHELL DETECTADO)[^\n]*\n?", "", s)
+    # Colapsar líneas en blanco múltiples dejadas por la limpieza
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s or "(sin respuesta textual)"
 
 from tui.widgets.chat_panel import ChatPanel
 from tui.widgets.plan_panel import PlanPanel
@@ -76,11 +111,13 @@ class AetherApp(App):
     CSS = """
     Screen { background: $surface; color: $text; }
     #chat_panel { height: 1fr; }
+    #chat_richlog { height: 1fr; }
+    #chat_streaming { height: auto; max-height: 12; padding: 0 1; overflow-y: auto; }
     #streaming_line { height: auto; color: $secondary-lighten-2; padding: 0 1; }
     #plan_panel, #status_bar, #debug_panel { dock: bottom; }
     #status_bar { height: 2; background: $primary; color: $text; padding: 0 1; }
     #debug_panel { height: 10; background: $surface; color: $text; padding: 0 1; border-top: solid $accent; }
-    #plan_panel { height: 6; background: $surface-darken-1; color: $text; padding: 0 1; }
+    #plan_panel { height: 8; background: $surface-darken-1; color: $text; padding: 0 1; }
     """
 
     def __init__(self, workdir: str | None = None, **kwargs):
@@ -182,15 +219,17 @@ class AetherApp(App):
         if self._startup_loading:
             self._startup_tick = (self._startup_tick + 1) % 4
             self.query_one("#streaming_line", Static).update(
-                f"iniciando grafo, espere{'.' * self._startup_tick}"
+                _sanear_streaming(f"iniciando grafo, espere{'.' * self._startup_tick}")
             )
         elif self._thinking and self._estado_real:
             self._startup_tick = (self._startup_tick + 1) % 4
             self.query_one("#streaming_line", Static).update(
-                self._estado_real + "." * self._startup_tick
+                _sanear_streaming(self._estado_real + "." * self._startup_tick)
             )
         elif not self._thinking and self._estado_real.startswith("["):
-            self.query_one("#streaming_line", Static).update(self._estado_real)
+            self.query_one("#streaming_line", Static).update(
+                _sanear_streaming(self._estado_real)
+            )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "btn_enviar":
@@ -274,6 +313,9 @@ class AetherApp(App):
 
         chat_panel = self.query_one("#chat_panel", ChatPanel)
         chat_panel.agregar_mensaje(texto, "user")
+        chat_panel.ocultar_streaming()
+        # Nuevo turno: limpiar la actividad del turno anterior.
+        self.query_one("#plan_panel", PlanPanel).reset()
 
         self._thinking = True
         self._inicio_operacion = time.monotonic()
@@ -755,7 +797,7 @@ class AetherApp(App):
         """Limpia la vista y reinicia la sesión."""
         chat_panel = self.query_one("#chat_panel", ChatPanel)
         chat_panel.reset()
-        self.query_one("#plan_panel", PlanPanel).update("")
+        self.query_one("#plan_panel", PlanPanel).reset()
         self.query_one("#debug_panel", DebugPanel).reset()
         chat_panel.agregar_mensaje("Nueva sesión iniciada.", "assistant")
 
@@ -805,7 +847,9 @@ class AetherApp(App):
 
         if isinstance(evento, TokenEvent):
             self._respuesta_en_curso += evento.fragmento
-            streaming_line.update(f"🎙️  {escape(self._respuesta_en_curso)}")
+            # El streaming se ve en vivo dentro del chat, bajo "Aether:".
+            # streaming_line queda solo para estados ([•]/[✓]/flavor).
+            chat_panel.mostrar_streaming(self._respuesta_en_curso)
 
         elif isinstance(evento, StdoutLineEvent):
             self.query_one("#debug_panel", DebugPanel).agregar_log(evento.texto)
@@ -825,13 +869,15 @@ class AetherApp(App):
             # completo del modelo. Además, el DoneEvent llega INMEDIATO al
             # terminar el grafo (ver engine_bridge), así que el usuario puede
             # volver a escribir sin esperar la consolidación de memoria.
-            chat_panel.agregar_mensaje(evento.respuesta, "assistant")
+            chat_panel.ocultar_streaming()
+            chat_panel.agregar_mensaje(limpiar_respuesta_chat(evento.respuesta), "assistant")
             streaming_line.update("")
             self._mostrar_estado_real("[✓] Operación completada")
             self._finalizar_turno()
 
         elif isinstance(evento, ErrorEvent):
             prefijo = "⏹" if "cancelada" in evento.mensaje.lower() else "⚠️ Error:"
+            chat_panel.ocultar_streaming()
             chat_panel.agregar_mensaje(f"{prefijo} {evento.mensaje}", "assistant")
             streaming_line.update("")
             self._mostrar_estado_real("[!] Se detectó un error.")
@@ -839,7 +885,9 @@ class AetherApp(App):
 
     def _mostrar_estado_real(self, estado: str) -> None:
         self._estado_real = estado
-        self.query_one("#streaming_line", Static).update(estado)
+        # streaming_line es Static(markup=True) por defecto: sanear corchetes
+        # ([•], [✓], [!]) y ANSI antes de actualizar para evitar MarkupError.
+        self.query_one("#streaming_line", Static).update(_sanear_streaming(estado))
 
     def _mostrar_flavor(self) -> None:
         if not self._thinking:
@@ -849,7 +897,7 @@ class AetherApp(App):
         flavor = choose_flavor()
         if flavor:
             self.query_one("#streaming_line", Static).update(
-                f"{self._estado_real}\n  {flavor}"
+                f"{_sanear_streaming(self._estado_real)}\n  {_sanear_streaming(flavor)}"
             )
 
     def _mostrar_banner_dir(self) -> None:

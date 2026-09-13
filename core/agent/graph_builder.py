@@ -39,7 +39,10 @@ from core.agent.node_context_manager import node_context_manager
 # CONDICIONALES
 # ══════════════════════════════════════════════════════════════════════
 
-_TOOLS_CON_RESUMEN = frozenset({"shell", "codigo", "file_write", "web", "vision", "mcp", "computer_use", "launch", "fs_read"})
+# Herramientas con un campo dedicado donde dejan datos crudos para Ornith
+# (ver _CAMPO_DATOS_CRUDOS_POR_TOOL). La TUI también los usa para mostrar
+# actividad en vivo (qué archivo/carpeta tocó cada paso).
+_TOOLS_CON_RESUMEN = frozenset({"shell", "codigo", "file_write", "web", "vision", "mcp", "computer_use", "launch", "fs_read", "fs_write", "fs_mkdir", "fs_list"})
 
 # Campo de "datos crudos" que cada tool deja en el estado para que Ornith
 # los interprete. Si ese campo está vacío pero la tool YA fijó una
@@ -55,6 +58,9 @@ _CAMPO_DATOS_CRUDOS_POR_TOOL = {
     "mcp":          "mcp_result",
     "computer_use": "computer_use_result",
     "fs_read":      "fs_result",
+    "fs_write":     "fs_result",
+    "fs_mkdir":     "fs_result",
+    "fs_list":      "fs_result",
 }
 
 

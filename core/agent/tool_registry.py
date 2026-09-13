@@ -30,6 +30,15 @@ from __future__ import annotations
 from typing import Any, Callable
 
 
+# Aliases legacy con guion (algunos prompts/modelos emiten fs-write, etc.)
+_ALIASES_TOOL: dict[str, str] = {
+    "fs-write": "fs_write",
+    "fs-read": "fs_read",
+    "fs-mkdir": "fs_mkdir",
+    "fs-list": "fs_list",
+}
+
+
 # ══════════════════════════════════════════════════════════════════════
 # REGISTRO DE TOOLS
 # ══════════════════════════════════════════════════════════════════════
@@ -66,6 +75,29 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "node": "node_codigo",
         "instruccion_requerida": True,
         "descripcion": "Generar código (python/bash/java), guardarlo en un archivo si el usuario da un nombre/ruta (ej. main.py, script.sh), y ejecutarlo.",
+    },
+    # ── Filesystem de primera clase (ver core/tools/filesystem_tool.py) ──
+    # El agent loop los llama con args estructurados (path/content/files);
+    # sin esto validar_tool_call() los rechaza como "desconocida".
+    "fs_write": {
+        "node": "node_fs_write",
+        "instruccion_requerida": False,  # path+content van en args, no en texto
+        "descripcion": "Escribir uno o varios archivos con ruta+contenido explícitos ({path, content} o {files: [{path, content}]}).",
+    },
+    "fs_read": {
+        "node": "node_fs_read",
+        "instruccion_requerida": False,
+        "descripcion": "Leer un archivo de texto dado su path.",
+    },
+    "fs_mkdir": {
+        "node": "node_fs_mkdir",
+        "instruccion_requerida": False,
+        "descripcion": "Crear un directorio (y sus padres) dado su path.",
+    },
+    "fs_list": {
+        "node": "node_fs_list",
+        "instruccion_requerida": False,
+        "descripcion": "Listar el contenido (no recursivo) de un directorio.",
     },
     "memory": {
         "node": "node_memory",
@@ -313,6 +345,7 @@ def validar_tool_call(tool: str, args: dict) -> tuple[bool, str]:
 
     Retorna (ok, motivo). motivo es "" si ok=True.
     """
+    tool = _ALIASES_TOOL.get(tool, tool)
     if tool not in TOOL_REGISTRY:
         return False, f"tool '{tool}' no existe en el registro."
     if not isinstance(args, dict):
@@ -380,6 +413,8 @@ def validar_plan(plan: Any) -> tuple[bool, list[str]]:
             continue
 
         tool = paso.get("tool")
+        if isinstance(tool, str):
+            tool = _ALIASES_TOOL.get(tool, tool)
         if not tool:
             errores.append(f"{prefijo}: falta el campo 'tool'.")
             continue
@@ -410,16 +445,20 @@ def get_node_func(tool: str) -> Callable:
 
     Import lazy de core.agent.graph_nodes para evitar import circular
     (graph_nodes importa este módulo para el executor).
+
+    El mapeo fs_* legacy también acepta alias con guion (fs-write, etc.)
+    porque algunos prompts/modelos los emiten así.
     """
-    if tool not in TOOL_REGISTRY:
+    normalizada = _ALIASES_TOOL.get(tool, tool)
+    if normalizada not in TOOL_REGISTRY:
         raise KeyError(f"Tool desconocida: {tool}")
 
     import core.agent.graph_nodes as gn
 
-    nombre_func = TOOL_REGISTRY[tool]["node"]
+    nombre_func = TOOL_REGISTRY[normalizada]["node"]
     func = getattr(gn, nombre_func, None)
     if func is None or not callable(func):
         raise AttributeError(
-            f"La función de nodo '{nombre_func}' para la tool '{tool}' no existe."
+            f"La función de nodo '{nombre_func}' para la tool '{normalizada}' no existe."
         )
     return func
