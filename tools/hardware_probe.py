@@ -5,6 +5,9 @@ No requiere dependencias externas. Prioriza modelos con thinking + tool calling
 que tengan un tamaño razonable para cada tier. MID/HIGH/ULTRA también exponen
 una suite opcional de modelos especializados/agentic para que el instalador
 pueda ofrecer más de un modelo sin cargarlos todos a la vez.
+
+Ornith se mantiene como modelo principal en HIGH/ULTRA porque las pruebas
+internas de Aether muestran mejor compatibilidad con su runtime/agent loop.
 """
 from __future__ import annotations
 import json, os, re, shutil, subprocess, sys
@@ -21,12 +24,12 @@ CATALOGO = [
     ("MID", 5.0, "qwen3.5:4b", "qwen3.5:4b", 16384, 3072, 1536, 8, 150,
      192, "5m", 1, 1, "16GB RAM o 6-10GB VRAM: buen equilibrio para agente",
      ["qwen3.5:4b", "ministral-3:3b"]),
-    ("HIGH", 9.0, "gpt-oss:20b", "qwen3.5:9b", 32768, 4096, 2048, 10, 220,
-     256, "15m", 1, 1, "12GB+ VRAM o 32GB RAM: prioridad agentic/reasoning",
-     ["gpt-oss:20b", "qwen3.5:9b", "ministral-3:8b"]),
-    ("ULTRA", 16.0, "gpt-oss:20b", "qwen3.5:35b-a3b-q4_K_M", 32768, 8192, 3072, 10, 240,
-     384, "30m", 1, 1, "24GB+ VRAM/RAM abundante: suite agentic + modelo grande local",
-     ["gpt-oss:20b", "qwen3.5:35b-a3b-q4_K_M", "ministral-3:14b"]),
+    ("HIGH", 9.0, "ornith-1.5:9b", "qwen3.5:9b", 32768, 4096, 2048, 10, 220,
+     256, "15m", 1, 1, "12GB+ VRAM o 32GB RAM: Ornith como runtime/agent loop primario",
+     ["ornith-1.5:9b", "gpt-oss:20b", "qwen3.5:9b", "ministral-3:8b"]),
+    ("ULTRA", 16.0, "ornith-1.5:9b", "qwen3.5:35b-a3b-q4_K_M", 32768, 8192, 3072, 10, 240,
+     384, "30m", 1, 1, "24GB+ VRAM/RAM abundante: Ornith primario + suite agentic completa",
+     ["ornith-1.5:9b", "gpt-oss:20b", "qwen3.5:35b-a3b-q4_K_M", "ministral-3:14b"]),
 ]
 
 
