@@ -47,6 +47,11 @@ embeddings/
 screenshots/
 backups/
 
+# Local configuration — hardware/user overrides must never be committed
+core/config/config.local.json
+core/config/config.local.json.tmp
+core/config/config.local.json.bak
+
 # MCP servers config (contiene tokens en texto plano: GitHub PAT, Notion token, etc.)
 core/config/mcp_servers.json
 
