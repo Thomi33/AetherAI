@@ -10,7 +10,7 @@
     "command": "npx",
     "args": ["-y", "@modelcontextprotocol/server-github"],
     "env": {
-      "GITHUB_PERSONAL_ACCESS_TOKEN": "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"
+      "GITHUB_PERSONAL_ACCESS_TOKEN": "{token}"
     }
   },
   "notion": {
@@ -18,7 +18,7 @@
     "command": "npx",
     "args": ["-y", "@notionhq/notion-mcp-server"],
     "env": {
-      "NOTION_TOKEN": "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"
+      "NOTION_TOKEN": "{token}"
     }
   },
   "postgres": {
