@@ -43,30 +43,13 @@ ask_yes() {
   case "$r" in ""|[SsYy]*) return 0 ;; *) return 1 ;; esac
 }
 
-# Reads the optional model suite from the probe without requiring jq.
 suite_models() {
-  python3 - <<'PY' <<<"$PROBE_JSON"
-import json,sys
-try:
-    data=json.load(sys.stdin)
-    models=(data.get("recomendado") or {}).get("SUITE_MODELOS") or []
-    print("\n".join(models))
-except Exception:
-    pass
-PY
+  PROBE_JSON="$PROBE_JSON" python3 -c 'import json,os; print("\n".join((json.loads(os.environ.get("PROBE_JSON") or "{}").get("recomendado") or {}).get("SUITE_MODELOS") or []))'
 }
 suite_available() {
-  python3 - <<'PY' <<<"$PROBE_JSON"
-import json,sys
-try:
-    print("1" if (json.load(sys.stdin).get("recomendado") or {}).get("SUITE_AGENTICA_DISPONIBLE") else "0")
-except Exception:
-    print("0")
-PY
+  PROBE_JSON="$PROBE_JSON" python3 -c 'import json,os; print("1" if (json.loads(os.environ.get("PROBE_JSON") or "{}").get("recomendado") or {}).get("SUITE_AGENTICA_DISPONIBLE") else "0")'
 }
 
-# Default to installing only the primary model. For MID/HIGH/ULTRA the
-# installer asks whether the user wants the complete local agentic suite.
 choose_suite() {
   [ "$MINIMAL" = "1" ] && { WANT_SUITE=0; return; }
   [ "$NO_OLLAMA" = "1" ] && { WANT_SUITE=0; return; }
