@@ -10,7 +10,7 @@ BRANCH="${AETHER_BRANCH:-main}"
 LAUNCH_DEST="${AETHER_BIN_DIR:-$HOME/.local/bin}"
 SEARXNG_DIR="${AETHER_SEARXNG_DIR:-$HOME/.local/share/aether/searxng}"
 SEARXNG_PORT="${AETHER_SEARXNG_PORT:-}"
-LOW_SPEC=0; MINIMAL=0; NO_SYSTEM=0; NO_OLLAMA=0; ASSUME_YES=0; WANT_MODEL=""; TIER_REQ="${AETHER_TIER:-}"
+LOW_SPEC=0; MINIMAL=0; NO_SYSTEM=0; NO_OLLAMA=0; ASSUME_YES=0; WANT_MODEL=""; TIER_REQ="${AETHER_TIER:-}"; WANT_SUITE=""
 PREV=""
 
 for arg in "$@"; do
@@ -25,6 +25,8 @@ for arg in "$@"; do
     --model=*) WANT_MODEL="${arg#--model=}" ;;
     --tier) PREV="--tier" ;;
     --tier=*) TIER_REQ="${arg#--tier=}" ;;
+    --suite|--agent-suite) WANT_SUITE="1" ;;
+    --no-suite) WANT_SUITE="0" ;;
     -y|--yes) ASSUME_YES=1 ;;
     -h|--help) sed -n '2,8p' "$0" | sed 's/^# //'; exit 0 ;;
   esac
@@ -39,6 +41,45 @@ ask_yes() {
   if [ "$ASSUME_YES" = "1" ]; then return 0; fi
   read -r -p "$1 [S/n] " r || return 1
   case "$r" in ""|[SsYy]*) return 0 ;; *) return 1 ;; esac
+}
+
+# Reads the optional model suite from the probe without requiring jq.
+suite_models() {
+  python3 - <<'PY' <<<"$PROBE_JSON"
+import json,sys
+try:
+    data=json.load(sys.stdin)
+    models=(data.get("recomendado") or {}).get("SUITE_MODELOS") or []
+    print("\n".join(models))
+except Exception:
+    pass
+PY
+}
+suite_available() {
+  python3 - <<'PY' <<<"$PROBE_JSON"
+import json,sys
+try:
+    print("1" if (json.load(sys.stdin).get("recomendado") or {}).get("SUITE_AGENTICA_DISPONIBLE") else "0")
+except Exception:
+    print("0")
+PY
+}
+
+# Default to installing only the primary model. For MID/HIGH/ULTRA the
+# installer asks whether the user wants the complete local agentic suite.
+choose_suite() {
+  [ "$MINIMAL" = "1" ] && { WANT_SUITE=0; return; }
+  [ "$NO_OLLAMA" = "1" ] && { WANT_SUITE=0; return; }
+  [ "$WANT_SUITE" != "" ] && return
+  if [ "$(suite_available)" = "1" ]; then
+    echo
+    echo "🧠 Suite agentica disponible para $TIER:"
+    suite_models | sed 's/^/   • /'
+    echo "   Los modelos se descargan, pero Aether no los carga todos simultáneamente."
+    if ask_yes "¿Querés instalar la suite completa de modelos agenticos?"; then WANT_SUITE=1; else WANT_SUITE=0; fi
+  else
+    WANT_SUITE=0
+  fi
 }
 
 echo "🚀 Aether Unified Installer (v4)"
@@ -142,7 +183,7 @@ setup_searxng() {
   $SUDO $compose_cmd up -d
   local i
   for i in $(seq 1 30); do
-    if curl -fsS --max-time 2 "http://127.0.0.1:${SEARXNG_PORT}/" >/dev/null 2>&1; then ok "SearXNG listo: http://127.0.0.1:${SEARXNG_PORT}"; cd - >/dev/null; return 0; fi
+    if curl -fsS --max-time 2 "http://127.0.0.1:${SEARXNG_PORT}/" >/dev/null 2>&1; then ok "SearXNG listo: http://127.0.0.1:$SEARXNG_PORT"; cd - >/dev/null; return 0; fi
     sleep 2
   done
   $SUDO $compose_cmd logs --tail=50 core || true; cd - >/dev/null; die "SearXNG no respondió a tiempo."
@@ -170,7 +211,6 @@ PYBIN="${AETHER_PYTHON:-python3}"; VENV_DIR="${AETHER_VENV_DIR:-.venv}"
 source "$VENV_DIR/bin/activate"; pip install --upgrade "pip<26" >/dev/null
 pip_one() { [ -f "$1" ] || return 0; echo "📚 $1..."; if [ "$TIER" = "POTATO" ] || [ "$TIER" = "LOW" ] || [ "$LOW_SPEC" = "1" ]; then pip install --prefer-binary -r "$1" 2>&1 | tail -5; else pip install -r "$1" 2>&1 | tail -5; fi; }
 pip_one requirements.txt
-# backend es legado; no se instala automáticamente.
 if ! python -c 'import whisper' >/dev/null 2>&1; then echo "🎙️ Instalando OpenAI Whisper..."; pip install --prefer-binary -U openai-whisper 2>&1 | tail -8 || warn "Whisper no pudo instalarse; revisá el error anterior."; fi
 have ffmpeg && ok "FFmpeg disponible para Whisper." || warn "FFmpeg no disponible; Whisper no podrá procesar audio."
 
@@ -196,13 +236,32 @@ for k in ("num_batch","num_thread","num_gpu"):
 cfg["OLLAMA_GEN_OPTIONS"]=g; json.dump(cfg,open(path,"w"),indent=2,ensure_ascii=False)
 PYEOF
 fi
+choose_suite
 
 # ---------------------------------------------------------------------------
-# 6. Ollama + model
+# 6. Ollama + model(s)
 # ---------------------------------------------------------------------------
-if [ "$NO_OLLAMA" = "1" ] || [ "$MINIMAL" = "1" ]; then echo "⏭️ Ollama/model omitidos."; elif have ollama; then
+if [ "$NO_OLLAMA" = "1" ] || [ "$MINIMAL" = "1" ]; then echo "⏭️ Ollama/modelos omitidos."; elif have ollama; then
   if ! ollama list >/dev/null 2>&1; then echo "🦙 Levantando Ollama..."; if have systemctl; then systemctl --user enable --now ollama 2>/dev/null || $SUDO systemctl enable --now ollama 2>/dev/null || true; fi; ollama serve >/tmp/ollama-serve.log 2>&1 & sleep 3; fi
-  if ollama list >/dev/null 2>&1; then [ -n "$WANT_MODEL" ] || { [ "$TIER" = POTATO ] && WANT_MODEL=qwen2.5:1.5b || WANT_MODEL=qwen2.5:3b; }; if ollama list | grep -qi "$WANT_MODEL"; then ok "Modelo $WANT_MODEL presente."; elif ask_yes "¿Descargar '$WANT_MODEL'?"; then ollama pull "$WANT_MODEL" || warn "No pude descargar $WANT_MODEL."; fi; else warn "Ollama no responde."; fi
+  if ollama list >/dev/null 2>&1; then
+    if [ -z "$WANT_MODEL" ]; then WANT_MODEL="$(python -c 'import json,sys;print(json.load(sys.stdin).get("recomendado",{}).get("MODELO",""))' <<<"$PROBE_JSON" 2>/dev/null || true)"; fi
+    [ -n "$WANT_MODEL" ] || { [ "$TIER" = POTATO ] && WANT_MODEL=qwen3:0.6b || WANT_MODEL=qwen3.5:2b; }
+    if ollama list | grep -qiF "$WANT_MODEL"; then ok "Modelo primario $WANT_MODEL presente."; elif ask_yes "¿Descargar modelo primario '$WANT_MODEL'?"; then ollama pull "$WANT_MODEL" || warn "No pude descargar $WANT_MODEL."; fi
+
+    if [ "$WANT_SUITE" = "1" ]; then
+      echo "🧠 Descargando suite agentica..."
+      suite_models | while IFS= read -r model; do
+        [ -n "$model" ] || continue
+        [ "$model" = "$WANT_MODEL" ] && continue
+        if ollama list | grep -qiF "$model"; then
+          ok "Suite: $model ya está presente."
+        else
+          echo "   ↓ $model"
+          ollama pull "$model" || warn "No pude descargar $model; continúo con la suite."
+        fi
+      done
+    fi
+  else warn "Ollama no responde."; fi
 else warn "Ollama no está instalado."; fi
 
 # ---------------------------------------------------------------------------
@@ -217,7 +276,8 @@ cat <<EOF
 
 ✅ Aether instalado correctamente
    Tier: $TIER
-   Modelo: ${WANT_MODEL:-?}
+   Modelo primario: ${WANT_MODEL:-?}
+   Suite agentica: $([ "$WANT_SUITE" = "1" ] && echo "instalada" || echo "solo modelo primario")
    SearXNG: http://127.0.0.1:$SEARXNG_PORT
    Whisper: $(python -c 'import whisper; print("OK")' 2>/dev/null || echo "pendiente")
 
