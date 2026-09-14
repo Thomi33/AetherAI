@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# Aether Unified Installer — v4
+# Aether Unified Installer — v5
 # Instala el stack necesario de Aether desde un único punto:
 # sistema + Docker + SearXNG + FFmpeg/Whisper + Python + Ollama + modelo.
+#
+# Principios de seguridad:
+#   - config.json es versionado y nunca se modifica.
+#   - ajustes de hardware/usuario viven en config.local.json (ignorado por Git).
+#   - cambios locales de config.json de instalaciones antiguas se migran.
+#   - cambios locales de otros archivos versionados bloquean el update.
+#   - config.local.json se escribe de forma atómica.
 set -euo pipefail
 
 REPO_URL="https://github.com/Thomi33/AetherAI.git"
@@ -12,6 +19,8 @@ SEARXNG_DIR="${AETHER_SEARXNG_DIR:-$HOME/.local/share/aether/searxng}"
 SEARXNG_PORT="${AETHER_SEARXNG_PORT:-}"
 LOW_SPEC=0; MINIMAL=0; NO_SYSTEM=0; NO_OLLAMA=0; ASSUME_YES=0; WANT_MODEL=""; TIER_REQ="${AETHER_TIER:-}"; WANT_SUITE=""
 PREV=""
+MIGRATION_FILE=""
+MIGRATION_BASE_FILE=""
 
 for arg in "$@"; do
   if [ "$PREV" = "--model" ]; then WANT_MODEL="$arg"; PREV=""; continue; fi
@@ -28,7 +37,7 @@ for arg in "$@"; do
     --suite|--agent-suite) WANT_SUITE="1" ;;
     --no-suite) WANT_SUITE="0" ;;
     -y|--yes) ASSUME_YES=1 ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# //'; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# //'; exit 0 ;;
   esac
 done
 
@@ -37,6 +46,12 @@ ok()   { printf '   ✔ %s\n' "$*"; }
 warn() { printf '   ⚠ %s\n' "$*" >&2; }
 die()  { printf '❌ %s\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+cleanup() {
+  [ -n "${MIGRATION_FILE:-}" ] && [ -f "$MIGRATION_FILE" ] && rm -f -- "$MIGRATION_FILE"
+  [ -n "${MIGRATION_BASE_FILE:-}" ] && [ -f "$MIGRATION_BASE_FILE" ] && rm -f -- "$MIGRATION_BASE_FILE"
+}
+trap cleanup EXIT
+
 ask_yes() {
   if [ "$ASSUME_YES" = "1" ]; then return 0; fi
   read -r -p "$1 [S/n] " r || return 1
@@ -49,7 +64,6 @@ suite_models() {
 suite_available() {
   PROBE_JSON="$PROBE_JSON" python3 -c 'import json,os; print("1" if (json.loads(os.environ.get("PROBE_JSON") or "{}").get("recomendado") or {}).get("SUITE_AGENTICA_DISPONIBLE") else "0")'
 }
-
 choose_suite() {
   [ "$MINIMAL" = "1" ] && { WANT_SUITE=0; return; }
   [ "$NO_OLLAMA" = "1" ] && { WANT_SUITE=0; return; }
@@ -65,7 +79,104 @@ choose_suite() {
   fi
 }
 
-echo "🚀 Aether Unified Installer (v4)"
+# ---------------------------------------------------------------------------
+# Repository safety / config migration
+# ---------------------------------------------------------------------------
+prepare_git_update() {
+  local repo="$1" config="$1/core/config/config.json" status line
+  [ -d "$repo/.git" ] || return 0
+  cd "$repo"
+  status="$(git status --porcelain --untracked-files=all)"
+  [ -z "$status" ] && { git fetch origin "$BRANCH" --depth 1 || die "No pude obtener la rama $BRANCH."; git checkout "$BRANCH" || die "No pude cambiar a la rama $BRANCH."; git pull --rebase origin "$BRANCH" || die "git pull/rebase falló."; return; }
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      " M core/config/config.json"|"M  core/config/config.json"|"MM core/config/config.json" ) : ;;
+      "?? core/config/config.local.json"|"?? core/config/config.local.json.bak"|"?? core/config/config.local.json.tmp" ) : ;;
+      *) die "Cambios locales detectados fuera de config.json; no actualizo para no sobrescribir trabajo: $line" ;;
+    esac
+  done <<< "$status"
+
+  if git status --porcelain -- core/config/config.json | grep -q .; then
+    [ -f "$config" ] || die "config.json aparece modificado pero no existe."
+    MIGRATION_FILE="$(mktemp "${TMPDIR:-/tmp}/aether-config-migration.XXXXXX.json")"
+    MIGRATION_BASE_FILE="$(mktemp "${TMPDIR:-/tmp}/aether-config-base.XXXXXX.json")"
+    cp -- "$config" "$MIGRATION_FILE"
+    git show HEAD:core/config/config.json > "$MIGRATION_BASE_FILE" || die "No pude recuperar el config.json base anterior."
+    git restore --source=HEAD -- core/config/config.json
+    ok "Configuración antigua preservada para migración local."
+  fi
+
+  git fetch origin "$BRANCH" --depth 1 || die "No pude obtener la rama $BRANCH."
+  git checkout "$BRANCH" || die "No pude cambiar a la rama $BRANCH."
+  git pull --rebase origin "$BRANCH" || die "git pull/rebase falló; no continúo en estado parcial."
+}
+
+migrate_old_config() {
+  [ -n "${MIGRATION_FILE:-}" ] || return 0
+  local local_cfg="$INSTALL_DIR/core/config/config.local.json"
+  mkdir -p "$(dirname "$local_cfg")"
+  MIGRATION_FILE="$MIGRATION_FILE" BASE_FILE="$MIGRATION_BASE_FILE" LOCAL_FILE="$local_cfg" python3 - <<'PY'
+import json, os
+from pathlib import Path
+old = json.loads(Path(os.environ["MIGRATION_FILE"]).read_text(encoding="utf-8"))
+base = json.loads(Path(os.environ["BASE_FILE"]).read_text(encoding="utf-8"))
+local_path = Path(os.environ["LOCAL_FILE"])
+local = json.loads(local_path.read_text(encoding="utf-8")) if local_path.exists() else {}
+if not isinstance(local, dict):
+    raise SystemExit("config.local.json debe contener un objeto JSON")
+for key, value in old.items():
+    if base.get(key) != value:
+        local[key] = value
+tmp = local_path.with_suffix(".json.tmp")
+tmp.write_text(json.dumps(local, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+json.loads(tmp.read_text(encoding="utf-8"))
+tmp.replace(local_path)
+PY
+  ok "Configuración local migrada a core/config/config.local.json."
+  rm -f -- "$MIGRATION_FILE" "$MIGRATION_BASE_FILE"
+  MIGRATION_FILE=""; MIGRATION_BASE_FILE=""
+}
+
+write_local_config() {
+  local local_cfg="$INSTALL_DIR/core/config/config.local.json"
+  mkdir -p "$(dirname "$local_cfg")"
+  PROBE_JSON="$PROBE_JSON" WANT_MODEL="$WANT_MODEL" LOCAL_FILE="$local_cfg" "$VENV_DIR/bin/python" - <<'PY'
+import json, os
+from pathlib import Path
+probe = json.loads(os.environ.get("PROBE_JSON") or "{}")
+rec = dict(probe.get("recomendado") or {})
+if os.environ.get("WANT_MODEL"):
+    rec["MODELO"] = os.environ["WANT_MODEL"]
+path = Path(os.environ["LOCAL_FILE"])
+local = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+if not isinstance(local, dict):
+    raise SystemExit("config.local.json debe contener un objeto JSON")
+for key in ("MODELO","MODELO_VISION","NUM_CTX","NUM_PREDICT","NUM_PREDICT_PLANNER","MAX_TURNOS_CONTEXTO_CHAT","TIMEOUT_CMD","OLLAMA_KEEP_ALIVE","OLLAMA_NUM_PARALLEL","OLLAMA_MAX_LOADED_MODELS"):
+    if rec.get(key) is not None:
+        local[key] = rec[key]
+gen = dict(local.get("OLLAMA_GEN_OPTIONS") or {})
+for key in ("num_batch","num_thread","num_gpu"):
+    if (rec.get("OLLAMA_GEN_OPTIONS") or {}).get(key) is not None:
+        gen[key] = rec["OLLAMA_GEN_OPTIONS"][key]
+if gen:
+    local["OLLAMA_GEN_OPTIONS"] = gen
+tmp = path.with_suffix(".json.tmp")
+tmp.write_text(json.dumps(local, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+json.loads(tmp.read_text(encoding="utf-8"))
+tmp.replace(path)
+PY
+  ok "Perfil local de hardware escrito de forma atómica."
+}
+
+assert_repository_integrity() {
+  git diff --exit-code -- core/config/config.json >/dev/null || die "INTEGRITY CHECK: el instalador modificó config.json versionado."
+  git check-ignore -q core/config/config.local.json || die "INTEGRITY CHECK: config.local.json no está protegido por .gitignore."
+  ok "Repository integrity: config.json intacto y configuración local ignorada."
+}
+
+echo "🚀 Aether Unified Installer (v5)"
 echo "📦 Target: $INSTALL_DIR"
 echo "🌿 Branch: $BRANCH"
 
@@ -105,18 +216,12 @@ case "$OS_ID" in
   fedora|nobara|rhel) IS_FEDORA=1 ;;
 esac
 SUDO=""; [ "$(id -u)" != "0" ] && SUDO="sudo"
-
 if [ "$NO_SYSTEM" = "0" ]; then
   [ -z "$SUDO" ] || have sudo || die "Necesito sudo para instalar dependencias del sistema."
   echo "📦 Instalando dependencias del sistema..."
   if [ "$IS_ARCH" = "1" ] && have pacman; then
     ARCH_PACKAGES=(git base-devel python python-pip python-virtualenv sqlite curl ffmpeg docker docker-compose wl-clipboard grim slurp ydotool)
-    if have ollama; then
-      ok "Ollama ya está instalado ($(ollama --version 2>/dev/null || echo 'versión desconocida'))."
-      echo "   → Reutilizando instalación existente; no se instala el paquete de pacman."
-    else
-      ARCH_PACKAGES+=(ollama)
-    fi
+    have ollama || ARCH_PACKAGES+=(ollama)
     $SUDO pacman -Sy --needed --noconfirm "${ARCH_PACKAGES[@]}" 2>&1 | tail -8 || die "Falló la instalación de dependencias con pacman."
   elif [ "$IS_DEBIAN" = "1" ] && have apt-get; then
     $SUDO apt-get update -y >/dev/null
@@ -145,13 +250,11 @@ setup_searxng() {
   fi
   local compose_cmd=""
   if docker compose version >/dev/null 2>&1; then compose_cmd="docker compose"; elif have docker-compose && docker-compose version >/dev/null 2>&1; then compose_cmd="docker-compose"; else die "Docker Compose no está disponible."; fi
-
   if [ -z "$SEARXNG_PORT" ]; then
     if [ "$ASSUME_YES" = "1" ]; then SEARXNG_PORT=8080; else read -r -p "🔎 Puerto para SearXNG [8080]: " INPUT_PORT; SEARXNG_PORT="${INPUT_PORT:-8080}"; fi
   fi
   [[ "$SEARXNG_PORT" =~ ^[0-9]+$ ]] || die "Puerto SearXNG inválido: $SEARXNG_PORT"
   [ "$SEARXNG_PORT" -ge 1 ] && [ "$SEARXNG_PORT" -le 65535 ] || die "Puerto SearXNG fuera de rango: $SEARXNG_PORT"
-
   mkdir -p "$SEARXNG_DIR/core-config"; cd "$SEARXNG_DIR"
   curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/searxng/searxng/master/container/docker-compose.yml
   curl -fsSL -o .env.example https://raw.githubusercontent.com/searxng/searxng/master/container/.env.example
@@ -174,15 +277,17 @@ setup_searxng() {
 setup_searxng
 
 # ---------------------------------------------------------------------------
-# 3. Clone / update Aether
+# 3. Clone / update Aether safely
 # ---------------------------------------------------------------------------
 if [ ! -d "$INSTALL_DIR" ]; then
-  echo "📥 Clonando Aether..."; git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR"
+  echo "📥 Clonando Aether..."; git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$INSTALL_DIR" || die "No pude clonar Aether."
+elif git -C "$INSTALL_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+  echo "🔄 Actualizando Aether..."; prepare_git_update "$INSTALL_DIR"
 else
-  echo "🔄 Actualizando Aether..."; cd "$INSTALL_DIR"
-  if git rev-parse --git-dir >/dev/null 2>&1; then git fetch origin "$BRANCH" --depth 1 2>/dev/null || true; git checkout "$BRANCH" 2>/dev/null || true; git pull --rebase origin "$BRANCH" || warn "git pull falló; continúo con lo local."; else warn "$INSTALL_DIR no es un repo git; continúo."; fi
+  warn "$INSTALL_DIR existe pero no es un repo Git; continúo con lo local."
 fi
 cd "$INSTALL_DIR"
+migrate_old_config
 
 # ---------------------------------------------------------------------------
 # 4. Python venv + Aether dependencies + Whisper
@@ -198,7 +303,7 @@ if ! python -c 'import whisper' >/dev/null 2>&1; then echo "🎙️ Instalando O
 have ffmpeg && ok "FFmpeg disponible para Whisper." || warn "FFmpeg no disponible; Whisper no podrá procesar audio."
 
 # ---------------------------------------------------------------------------
-# 5. .env + hardware tuning
+# 5. .env + hardware tuning → LOCAL CONFIG ONLY
 # ---------------------------------------------------------------------------
 if [ ! -f .env ]; then printf 'AETHER_MODE=production\nLOG_LEVEL=info\nAETHER_DATA_DIR=%s\nSEARXNG_URL=http://127.0.0.1:%s\n' "$HOME/Aether" "$SEARXNG_PORT" > .env; else grep -q '^SEARXNG_URL=' .env && sed -i "s|^SEARXNG_URL=.*|SEARXNG_URL=http://127.0.0.1:$SEARXNG_PORT|" .env || printf 'SEARXNG_URL=http://127.0.0.1:%s\n' "$SEARXNG_PORT" >> .env; fi
 if [ -f tools/hardware_probe.py ]; then
@@ -206,55 +311,42 @@ if [ -f tools/hardware_probe.py ]; then
 fi
 [ "$LOW_SPEC" = "1" ] && TIER=LOW
 [ -z "$WANT_MODEL" ] && WANT_MODEL="$(python -c 'import json,sys;print(json.load(sys.stdin).get("recomendado",{}).get("MODELO",""))' <<<"$PROBE_JSON" 2>/dev/null || true)"
-if [ -f core/config/config.json ] && [ -n "$WANT_MODEL" ]; then
-  cp -n core/config/config.json core/config/config.json.bak 2>/dev/null || true
-  PROBE_JSON="$PROBE_JSON" WANT_MODEL="$WANT_MODEL" "$VENV_DIR/bin/python" - core/config/config.json <<'PYEOF'
-import json, os, sys
-path=sys.argv[1]; probe=json.loads(os.environ.get("PROBE_JSON") or "{}"); rec=probe.get("recomendado") or {}; rec["MODELO"]=os.environ["WANT_MODEL"]; cfg=json.load(open(path))
-for k in ("MODELO","MODELO_VISION","NUM_CTX","NUM_PREDICT","NUM_PREDICT_PLANNER","MAX_TURNOS_CONTEXTO_CHAT","TIMEOUT_CMD","OLLAMA_KEEP_ALIVE","OLLAMA_NUM_PARALLEL","OLLAMA_MAX_LOADED_MODELS"):
-    if rec.get(k) is not None: cfg[k]=rec[k]
-g=cfg.get("OLLAMA_GEN_OPTIONS",{}) or {}
-for k in ("num_batch","num_thread","num_gpu"):
-    if (rec.get("OLLAMA_GEN_OPTIONS") or {}).get(k) is not None: g[k]=rec["OLLAMA_GEN_OPTIONS"][k]
-cfg["OLLAMA_GEN_OPTIONS"]=g; json.dump(cfg,open(path,"w"),indent=2,ensure_ascii=False)
-PYEOF
-fi
+write_local_config
 choose_suite
 
 # ---------------------------------------------------------------------------
 # 6. Ollama + model(s)
 # ---------------------------------------------------------------------------
-if [ "$NO_OLLAMA" = "1" ] || [ "$MINIMAL" = "1" ]; then echo "⏭️ Ollama/modelos omitidos."; elif have ollama; then
+if [ "$NO_OLLAMA" = "1" ] || [ "$MINIMAL" = "1" ]; then
+  echo "⏭️ Ollama/modelos omitidos."
+elif have ollama; then
   if ! ollama list >/dev/null 2>&1; then echo "🦙 Levantando Ollama..."; if have systemctl; then systemctl --user enable --now ollama 2>/dev/null || $SUDO systemctl enable --now ollama 2>/dev/null || true; fi; ollama serve >/tmp/ollama-serve.log 2>&1 & sleep 3; fi
   if ollama list >/dev/null 2>&1; then
     if [ -z "$WANT_MODEL" ]; then WANT_MODEL="$(python -c 'import json,sys;print(json.load(sys.stdin).get("recomendado",{}).get("MODELO",""))' <<<"$PROBE_JSON" 2>/dev/null || true)"; fi
     [ -n "$WANT_MODEL" ] || { [ "$TIER" = POTATO ] && WANT_MODEL=qwen3:0.6b || WANT_MODEL=qwen3.5:2b; }
     if ollama list | grep -qiF "$WANT_MODEL"; then ok "Modelo primario $WANT_MODEL presente."; elif ask_yes "¿Descargar modelo primario '$WANT_MODEL'?"; then ollama pull "$WANT_MODEL" || warn "No pude descargar $WANT_MODEL."; fi
-
     if [ "$WANT_SUITE" = "1" ]; then
       echo "🧠 Descargando suite agentica..."
       suite_models | while IFS= read -r model; do
-        [ -n "$model" ] || continue
-        [ "$model" = "$WANT_MODEL" ] && continue
-        if ollama list | grep -qiF "$model"; then
-          ok "Suite: $model ya está presente."
-        else
-          echo "   ↓ $model"
-          ollama pull "$model" || warn "No pude descargar $model; continúo con la suite."
-        fi
+        [ -n "$model" ] || continue; [ "$model" = "$WANT_MODEL" ] && continue
+        if ollama list | grep -qiF "$model"; then ok "Suite: $model ya está presente."; else echo "   ↓ $model"; ollama pull "$model" || warn "No pude descargar $model; continúo con la suite."; fi
       done
     fi
   else warn "Ollama no responde."; fi
-else warn "Ollama no está instalado."; fi
+else
+  warn "Ollama no está instalado."
+fi
 
 # ---------------------------------------------------------------------------
-# 7. Validation + launcher
+# 7. Validation + launcher + repository integrity
 # ---------------------------------------------------------------------------
 echo "🧪 Validando instalación..."
 python -c 'import langgraph, mcp; print("   ✔ Python core OK")' 2>/dev/null || warn "Algunas dependencias Python del core faltan."
 python -c 'import whisper; print("   ✔ Whisper OK")' 2>/dev/null || warn "Whisper no está disponible."
 mkdir -p "$LAUNCH_DEST"
 [ -x "$PWD/bin/aether" ] && { ln -sf "$PWD/bin/aether" "$LAUNCH_DEST/aether"; ok "aether disponible en $LAUNCH_DEST"; }
+assert_repository_integrity
+
 cat <<EOF
 
 ✅ Aether instalado correctamente
@@ -263,6 +355,8 @@ cat <<EOF
    Suite agentica: $([ "$WANT_SUITE" = "1" ] && echo "instalada" || echo "solo modelo primario")
    SearXNG: http://127.0.0.1:$SEARXNG_PORT
    Whisper: $(python -c 'import whisper; print("OK")' 2>/dev/null || echo "pendiente")
+   Config base: core/config/config.json (versionada, protegida)
+   Config local: core/config/config.local.json (hardware/usuario, ignorada por Git)
 
 👉 Ejecutá: aether
 EOF
