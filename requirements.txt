@@ -5,6 +5,12 @@ langchain-core>=1.0
 langchain-openai>=1.0
 langchain-ollama>=1.0
 
+# Backend API (Web UI)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.0
+pydantic-settings>=2.0
+
 # Tools y TUI
 requests>=2.31
 mcp>=1.0

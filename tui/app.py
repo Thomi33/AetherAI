@@ -22,28 +22,10 @@ def _sanear_streaming(texto: str) -> str:
     return s.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
-def limpiar_respuesta_chat(respuesta: str) -> str:
-    """Quita protocolo interno de tool-calling de la respuesta final del LLM.
-
-    El agente necesita emitir [SHELL]...[/SHELL] y JSON de tool call como
-    pasos INTERMEDIOS (los ejecuta node_shell), pero la respuesta FINAL que
-    va al chat (DoneEvent.respuesta) debería ser lenguaje natural limpio.
-    A veces Ornith deja escapar esos artefactos hasta la síntesis final;
-    esto los filtra como defensa sin tocar el flujo de ejecución.
-    """
-    s = _RE_STREAM_ANSI.sub("", str(respuesta or ""))
-    # Bloques de protocolo [SHELL]...[/SHELL] que sobrevivieron a la síntesis
-    s = re.sub(r"\[SHELL\].*?\[/SHELL\]", "", s, flags=re.DOTALL | re.IGNORECASE)
-    # JSON de tool call suelto {"name":"shell","arguments":{...}}
-    s = re.sub(
-        r'\{[^{}]*"name"\s*:\s*"shell"[^{}]*"arguments"[^{}]*\{[^{}]*\}[^{}]*\}',
-        "", s, flags=re.DOTALL,
-    )
-    # Prefijos internos de una sola línea ([MCP]..., [PLAN EXECUTOR]...)
-    s = re.sub(r"(?m)^\[(MCP|PLAN EXECUTOR|INFO|DEBUG|SHELL DETECTADO)[^\n]*\n?", "", s)
-    # Colapsar líneas en blanco múltiples dejadas por la limpieza
-    s = re.sub(r"\n{3,}", "\n\n", s).strip()
-    return s or "(sin respuesta textual)"
+# La limpieza de la respuesta final se comparte con el backend web:
+# ver core/utils/response_cleaner.py (backend/api/routes/chat.py la usa
+# para el evento "done" del SSE). Nombre mantenido por compatibilidad.
+from core.utils.response_cleaner import limpiar_respuesta_chat  # noqa: E402
 
 from tui.widgets.chat_panel import ChatPanel
 from tui.widgets.plan_panel import PlanPanel
@@ -84,6 +66,8 @@ SLASH_HELP = (
     "  /debug                 — muestra/oculta el panel de debug\n"
     "  /get [clave]           — ver config actual (todas, o una clave puntual)\n"
     "  /set <clave> <valor>   — cambiar un valor de config en caliente\n"
+    "  /prompt                — system prompt en caliente (extra/override/preview)\n"
+    "  /prompt                 — system prompt sin tocar código (ver/extra/override/sintesis/clear/preview)\n"
     "  /sesiones              — listar sesiones anteriores\n"
     "  /historial <n>         — ver la sesión #n de esa lista\n"
     "  /historial actual      — volver a la sesión en vivo\n"
@@ -399,6 +383,9 @@ class AetherApp(App):
                         texto_resp = f"❌ No se pudo aplicar {clave} = {valor} (validación falló o clave inválida)"
                     chat_panel.agregar_mensaje(texto_resp, "assistant")
 
+        elif cmd == "/prompt":
+            self._manejar_comando_prompt(partes)
+
         elif cmd == "/sesiones":
             self._listar_sesiones()
 
@@ -436,6 +423,193 @@ class AetherApp(App):
 
         else:
             chat_panel.agregar_mensaje(f"⚠️ Comando desconocido: {cmd}. Probá /help", "assistant")
+
+    def _manejar_comando_prompt(self, partes: list[str]) -> None:
+        """
+        /prompt — System prompt editable SIN tocar código, en caliente.
+
+        Subcomandos:
+          /prompt                        — estado actual (override/extra/sintesis)
+          /prompt extra <texto...>       — extra para TODOS los prompts
+          /prompt override <texto...>    — reemplaza la persona por defecto
+          /prompt sintesis <texto...>    — extra solo para la persona de síntesis
+          /prompt clear [extra|override|sintesis|all]
+          /prompt preview                — muestra el system prompt final real
+        """
+        from core.config.config_manager import get_config_manager
+        chat_panel = self.query_one("#chat_panel", ChatPanel)
+        config = get_config_manager()
+
+        claves = {
+            "extra": "SYSTEM_PROMPT_EXTRA",
+            "override": "SYSTEM_PROMPT_OVERRIDE",
+            "sintesis": "SYSTEM_PROMPT_SINTESIS_EXTRA",
+        }
+        sub = partes[1].lower() if len(partes) > 1 else ""
+
+        if sub in ("", "show", "ver"):
+            lineas = ["System prompt configurable (config.json — sin tocar código):"]
+            for nombre, clave in claves.items():
+                valor = config.get(clave, "") or ""
+                estado = "ACTIVO" if valor.strip() else "vacío (default del código)"
+                lineas.append(f"  {nombre:9} [{clave}] = {estado}")
+                if valor.strip():
+                    lineas.append(f"    → {valor}")
+            lineas.append(
+                "Uso: /prompt extra <texto> · /prompt override <texto> · "
+                "/prompt sintesis <texto> · /prompt clear [cual] · /prompt preview"
+            )
+            chat_panel.agregar_mensaje("\n".join(lineas), "assistant")
+
+        elif sub in claves:
+            if len(partes) < 3:
+                chat_panel.agregar_mensaje(
+                    f"Uso: /prompt {sub} <texto...>  (texto vacío no está permitido; para desactivar: /prompt clear {sub})",
+                    "assistant",
+                )
+                return
+            texto = partes[2].strip()
+            ok = config.set(claves[sub], texto, validate=True)
+            if ok:
+                chat_panel.agregar_mensaje(
+                    f"✅ System prompt actualizado ({sub}). Se aplica al PRÓXIMO turno.",
+                    "assistant",
+                )
+            else:
+                chat_panel.agregar_mensaje(
+                    f"❌ No se pudo aplicar {claves[sub]} (validación falló).",
+                    "assistant",
+                )
+
+        elif sub == "clear":
+            objetivo = partes[2].lower() if len(partes) > 2 else "all"
+            if objetivo == "all":
+                objetivos = list(claves.values())
+            elif objetivo in claves:
+                objetivos = [claves[objetivo]]
+            else:
+                chat_panel.agregar_mensaje(
+                    "Uso: /prompt clear [extra|override|sintesis|all]", "assistant"
+                )
+                return
+            for clave in objetivos:
+                config.set(clave, "", validate=True)
+            chat_panel.agregar_mensaje(
+                f"✅ System prompt reseteado: {', '.join(objetivos)} (usa el default del código).",
+                "assistant",
+            )
+
+        elif sub == "preview":
+            try:
+                from core.agent.prompts import construir_backstory
+                preview = construir_backstory("")
+                chat_panel.agregar_mensaje(preview, "assistant")
+            except Exception as exc:  # noqa: BLE001
+                chat_panel.agregar_mensaje(
+                    f"❌ No se pudo construir el preview: {type(exc).__name__}: {exc}",
+                    "assistant",
+                )
+
+        else:
+            chat_panel.agregar_mensaje(
+                "Uso: /prompt [extra|override|sintesis <texto>] · "
+                "/prompt clear [extra|override|sintesis|all] · /prompt preview · /prompt",
+                "assistant",
+            )
+
+    def _manejar_comando_prompt(self, partes: list) -> None:
+        """
+        Ajusta el system prompt EN CALIENTE sin tocar código (config.json).
+
+        Claves (ver core/agent/prompts.py — _aplicar_overrides_prompt):
+          SYSTEM_PROMPT_OVERRIDE        → reemplaza la persona por defecto
+          SYSTEM_PROMPT_EXTRA           → extra a TODOS los prompts
+          SYSTEM_PROMPT_SINTESIS_EXTRA  → extra solo para la persona de síntesis
+
+        Uso:
+          /prompt                        — estado actual
+          /prompt extra <texto>          — setea el extra general
+          /prompt override <texto>       — reemplaza la persona por defecto
+          /prompt sintesis <texto>       — extra solo de síntesis
+          /prompt clear [extra|override|sintesis|all]
+          /prompt preview                — el prompt final que verá el modelo
+        """
+        from core.config.config_manager import get_config_manager
+        config = get_config_manager()
+        chat_panel = self.query_one("#chat_panel", ChatPanel)
+        sub = partes[1].lower() if len(partes) > 1 else ""
+
+        _CLAVES = {
+            "extra": "SYSTEM_PROMPT_EXTRA",
+            "override": "SYSTEM_PROMPT_OVERRIDE",
+            "sintesis": "SYSTEM_PROMPT_SINTESIS_EXTRA",
+        }
+
+        if sub in ("", "show", "ver"):
+            def _estado(clave: str) -> str:
+                valor = (config.get(clave, "") or "").strip()
+                estado = "ACTIVO" if valor else "off"
+                if len(valor) > 80:
+                    muestra = valor[:80] + "…"
+                else:
+                    muestra = valor or "(vacío)"
+                return f"  {clave} [{estado}]: {muestra}"
+
+            chat_panel.agregar_mensaje(
+                "System prompt configurable (config.json — sin tocar código):\n"
+                + "\n".join(_estado(c) for c in _CLAVES.values())
+                + "\n\nUso: /prompt extra|override|sintesis <texto> · "
+                "/prompt clear [extra|override|sintesis|all] · /prompt preview",
+                "assistant",
+            )
+
+        elif sub in _CLAVES:
+            if len(partes) < 3 or not partes[2].strip():
+                chat_panel.agregar_mensaje(
+                    f"Uso: /prompt {sub} <texto> — el texto no puede quedar vacío "
+                    f"(para desactivar: /prompt clear {sub})",
+                    "assistant",
+                )
+                return
+            ok = config.set(_CLAVES[sub], partes[2].strip())
+            if ok:
+                chat_panel.agregar_mensaje(
+                    f"System prompt actualizado ({_CLAVES[sub]}). Aplica en el próximo turno.",
+                    "assistant",
+                )
+            else:
+                chat_panel.agregar_mensaje(f"No se pudo aplicar {_CLAVES[sub]}.", "assistant")
+
+        elif sub == "clear":
+            objetivo = partes[2].lower() if len(partes) > 2 else "all"
+            if objetivo == "all":
+                claves = list(_CLAVES.values())
+            elif objetivo in _CLAVES:
+                claves = [_CLAVES[objetivo]]
+            else:
+                chat_panel.agregar_mensaje(
+                    "Uso: /prompt clear [extra|override|sintesis|all]", "assistant"
+                )
+                return
+            for clave in claves:
+                config.set(clave, "")
+            chat_panel.agregar_mensaje(
+                f"System prompt limpio ({objetivo}): volvió al prompt por defecto del código.",
+                "assistant",
+            )
+
+        elif sub == "preview":
+            from core.agent.prompts import construir_backstory
+            preview = construir_backstory("")
+            chat_panel.agregar_mensaje(
+                f"PREVIEW — system prompt final ({len(preview)} chars):\n\n{preview}",
+                "assistant",
+            )
+
+        else:
+            chat_panel.agregar_mensaje(
+                "Uso: /prompt [extra|override|sintesis|clear|preview|show]", "assistant"
+            )
 
     def _manejar_play_roblox(self, accion: str) -> None:
         """Controla el runtime Roblox y permite elegir el proveedor de visión."""

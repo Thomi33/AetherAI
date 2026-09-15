@@ -18,6 +18,7 @@ LAUNCH_DEST="${AETHER_BIN_DIR:-$HOME/.local/bin}"
 SEARXNG_DIR="${AETHER_SEARXNG_DIR:-$HOME/.local/share/aether/searxng}"
 SEARXNG_PORT="${AETHER_SEARXNG_PORT:-}"
 LOW_SPEC=0; MINIMAL=0; NO_SYSTEM=0; NO_OLLAMA=0; ASSUME_YES=0; WANT_MODEL=""; TIER_REQ="${AETHER_TIER:-}"; WANT_SUITE=""
+WEB_UI="ask"
 PREV=""
 MIGRATION_FILE=""
 MIGRATION_BASE_FILE=""
@@ -30,6 +31,8 @@ for arg in "$@"; do
     --minimal) MINIMAL=1 ;;
     --no-system) NO_SYSTEM=1 ;;
     --no-ollama) NO_OLLAMA=1 ;;
+    --web-ui) WEB_UI=1 ;;
+    --no-web-ui) WEB_UI=0 ;;
     --model) PREV="--model" ;;
     --model=*) WANT_MODEL="${arg#--model=}" ;;
     --tier) PREV="--tier" ;;
@@ -347,6 +350,32 @@ mkdir -p "$LAUNCH_DEST"
 [ -x "$PWD/bin/aether" ] && { ln -sf "$PWD/bin/aether" "$LAUNCH_DEST/aether"; ok "aether disponible en $LAUNCH_DEST"; }
 assert_repository_integrity
 
+# ---------------------------------------------------------------------------
+# 8. Web UI (opcional — repo separado, la API la sirve automáticamente)
+# ---------------------------------------------------------------------------
+WEBUI_DIR="${AETHER_WEBUI_DIR:-$HOME/aether_web_ui}"
+WEBUI_REPO="https://github.com/Thomi33/aether_web_ui.git"
+case "$WEB_UI" in
+  1) : ;;
+  0) : ;;
+  *) ask_yes "¿Instalar la Web UI de Aether? (interfaz web del agente, repo separado)" && WEB_UI=1 || WEB_UI=0 ;;
+esac
+if [ "$WEB_UI" = "1" ]; then
+  have git || die "git requerido para clonar la Web UI."
+  if [ -d "$WEBUI_DIR/.git" ]; then
+    git -C "$WEBUI_DIR" pull --ff-only >/dev/null 2>&1 \
+      && ok "Web UI actualizada en $WEBUI_DIR" \
+      || warn "No pude actualizar la Web UI (existe en $WEBUI_DIR; revisala a mano)."
+  elif git clone --depth 1 "$WEBUI_REPO" "$WEBUI_DIR" >/dev/null 2>&1; then
+    ok "Web UI instalada en $WEBUI_DIR"
+  else
+    warn "No pude clonar la Web UI. Podés hacerlo a mano: git clone $WEBUI_REPO ~/aether_web_ui"
+    WEB_UI=0
+  fi
+  [ "$WEB_UI" = "1" ] && log "   → Levantala con: aether web"
+else
+  log "⏭️  Web UI omitida (instalable después: git clone $WEBUI_REPO ~/aether_web_ui)"
+fi
 cat <<EOF
 
 ✅ Aether instalado correctamente
@@ -360,3 +389,4 @@ cat <<EOF
 
 👉 Ejecutá: aether
 EOF
+[ "$WEB_UI" = "1" ] && echo "🖥️  Web UI: aether web  (o aether server / aether gateway)"

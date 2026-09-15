@@ -34,6 +34,69 @@ ANTES de actuar -- no la ignores ni reinventes el enfoque de memoria.
 {catalogo}"""
 
 
+# ══════════════════════════════════════════════════════════════════════
+# SYSTEM PROMPT EDITABLE SIN TOCAR CÓDIGO
+# ══════════════════════════════════════════════════════════════════════
+# Tres claves de config.json (ver core/config/config_manager.py):
+#
+#   SYSTEM_PROMPT_OVERRIDE        — reemplaza la persona por defecto
+#   SYSTEM_PROMPT_EXTRA           — extra para TODOS los system prompts
+#   SYSTEM_PROMPT_SINTESIS_EXTRA  — extra solo para la persona de síntesis
+#
+# Se ajustan en caliente desde la TUI (/prompt ó /set), desde la Web UI
+# (API /api/system-prompt) o editando config.json a mano. Vacío = off.
+
+_CLAVE_EXTRA = "SYSTEM_PROMPT_EXTRA"
+_CLAVE_EXTRA_SINTESIS = "SYSTEM_PROMPT_SINTESIS_EXTRA"
+_CLAVE_OVERRIDE = "SYSTEM_PROMPT_OVERRIDE"
+
+
+def _prompt_overrides(es_sintesis: bool) -> tuple[str, str]:
+    """Lee (override, extra) del system prompt desde el ConfigManager."""
+    try:
+        from core.config.config_manager import get_config_manager
+        cfg = get_config_manager()
+        override = (cfg.get(_CLAVE_OVERRIDE, "") or "").strip()
+        extra_general = (cfg.get(_CLAVE_EXTRA, "") or "").strip()
+        if es_sintesis:
+            extra_especifico = (cfg.get(_CLAVE_EXTRA_SINTESIS, "") or "").strip()
+            extra = "\n".join(x for x in (extra_general, extra_especifico) if x)
+        else:
+            extra = extra_general
+        return override, extra
+    except Exception:
+        return "", ""
+
+
+def _aplicar_overrides_prompt(prompt_default: str, contexto_memoria: str,
+                              es_sintesis: bool = False) -> str:
+    """
+    Aplica las claves de config al prompt construido en código.
+
+    - Si SYSTEM_PROMPT_OVERRIDE no está vacío: reemplaza el prompt por
+      defecto. El contexto de memoria se agrega igual al final (el agente
+      lo necesita para recordar) salvo que ya esté incluido en el override.
+    - SYSTEM_PROMPT_EXTRA (y _SINTESIS_EXTRA si es_sintesis): se agrega al
+      final con máxima prioridad, tanto con override como sin él.
+    """
+    override, extra = _prompt_overrides(es_sintesis)
+
+    if override:
+        partes = [override]
+        ctx = (contexto_memoria or "").strip()
+        if ctx and ctx not in override:
+            partes.append(ctx)
+    else:
+        partes = [prompt_default]
+
+    if extra:
+        partes.append(
+            "[INSTRUCCIONES EXTRA DEL CREADOR — MÁXIMA PRIORIDAD]:\n" + extra
+        )
+
+    return "\n\n".join(partes)
+
+
 def construir_backstory(contexto_memoria: str) -> str:
     """Construye el backstory del agente con contexto dinámico y seguridad del sistema."""
     try:
@@ -41,7 +104,7 @@ def construir_backstory(contexto_memoria: str) -> str:
         dir_trabajo = str(_s.RUTA_TRABAJO)
     except Exception:
         dir_trabajo = "?"
-    return f"""Eres Aether, un agente de IA técnico y leal. Eres el asistente de confianza del Creador: hablas con él como un amigo cercano pero actúas con precisión de ingeniero. Tienes acceso directo a una shell zsh y herramientas web. Cuando el Creador te confía código, lo ejecutas, modificas y verificas de forma autónoma hasta completar la tarea.
+    prompt_base = f"""Eres Aether, un agente de IA técnico y leal. Eres el asistente de confianza del Creador: hablas con él como un amigo cercano pero actúas con precisión de ingeniero. Tienes acceso directo a una shell zsh y herramientas web. Cuando el Creador te confía código, lo ejecutas, modificas y verificas de forma autónoma hasta completar la tarea.
     Tu objetivo es cumplir la orden del Creador con seguridad, sin alucinar ni inventar datos, y debes cumplir tu objetivo a como de lugar. No inventes salidas de terminal ni simules resultados: siempre espera la salida real del sistema antes de continuar. Si no estás seguro de un dato, si puede haber cambiado o si necesitás confirmar una solución, usá la herramienta web antes de afirmar o actuar. Preferí buscar una fuente actual y luego verificá localmente el resultado.
 
 [DIRECTORIO DE TRABAJO — CRÍTICO]:
@@ -141,6 +204,10 @@ Para ejecutar CUALQUIER comando (incluido leer, crear o verificar archivos), emi
 - No escribas la salida del comando: emite el [SHELL]...[/SHELL] y DETENTE; el sistema te dará la salida REAL en el siguiente turno.
 - Ejemplo correcto para diagnosticar la CPU: [SHELL] lscpu [/SHELL]"""
 
+    # Aplica SYSTEM_PROMPT_OVERRIDE / SYSTEM_PROMPT_EXTRA desde config.json
+    # (editable desde la TUI y la Web UI sin tocar este archivo).
+    return _aplicar_overrides_prompt(prompt_base, contexto_memoria)
+
 
 def construir_persona_chat(contexto_memoria: str) -> str:
     """
@@ -185,7 +252,7 @@ def construir_persona_sintesis(contexto_memoria: str) -> str:
     el synthesizer NO ejecuta nada, solo recibe datos crudos y los comunica.
     Por eso el protocolo [SHELL] NUNCA debe aparecer en su system prompt.
     """
-    return f"""Eres Aether, el asistente técnico de confianza del Creador. Las herramientas del sistema (shell, búsqueda web, visión, etc.) ya ejecutaron lo necesario y te entregaron los datos crudos. Tu única tarea ahora es comunicarle el resultado al Creador en lenguaje natural, claro y directo.
+    prompt_base = f"""Eres Aether, el asistente técnico de confianza del Creador. Las herramientas del sistema (shell, búsqueda web, visión, etc.) ya ejecutaron lo necesario y te entregaron los datos crudos. Tu única tarea ahora es comunicarle el resultado al Creador en lenguaje natural, claro y directo.
 
 {contexto_memoria}
 
@@ -202,6 +269,9 @@ def construir_persona_sintesis(contexto_memoria: str) -> str:
 - Si los datos disponibles no alcanzan para responder con certeza, decilo con naturalidad en vez de inventar.
 
 Responde SIEMPRE en español."""
+    # Aplica SYSTEM_PROMPT_EXTRA / SYSTEM_PROMPT_SINTESIS_EXTRA (y el
+    # override si está) desde config.json, sin tocar este archivo.
+    return _aplicar_overrides_prompt(prompt_base, contexto_memoria, es_sintesis=True)
 
 
 def construir_task_description(orden: str) -> str:

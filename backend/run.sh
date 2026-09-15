@@ -1,28 +1,18 @@
 #!/bin/bash
-
-# Script para instalar dependencias e iniciar el backend
-
+# Aether Backend — inicia la API con el venv del proyecto
 set -e
 
-echo "🚀 Iniciando setup del backend..."
+BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$BACKEND_DIR")"
+cd "$PROJECT_ROOT"
 
-# Verificar si estamos en la carpeta correcta
-if [ ! -f "requirements.txt" ]; then
-    echo "❌ requirements.txt no encontrado. Ejecuta este script desde la carpeta backend/"
-    exit 1
+PYTHON="$PROJECT_ROOT/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+    PYTHON="$(command -v python3)"
+    echo "⚠️  .venv no encontrado, usando: $PYTHON"
 fi
 
-# Instalar dependencias
-echo "📦 Instalando dependencias..."
-pip install -r requirements.txt
-
-echo "✅ Backend setup completado!"
-echo "▶️  Ejecutando servidor..."
-echo ""
-echo "API disponible en: http://localhost:8000"
-echo "Docs: http://localhost:8000/docs"
-echo ""
-
-# Ejecutar servidor
-cd ..
-python -m uvicorn backend.api.main:app --host 0.0.0.0 --port 8000 --reload
+echo "🚀 Aether API: http://localhost:${API_PORT:-8000}  (docs: /docs)"
+exec "$PYTHON" -m uvicorn backend.api.main:app \
+    --host "${API_HOST:-0.0.0.0}" \
+    --port "${API_PORT:-8000}"

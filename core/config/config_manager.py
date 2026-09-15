@@ -196,6 +196,14 @@ class ConfigManager:
         "STT_VENV_PYTHON": lambda x: isinstance(x, str),
         "AUDIO_INPUT_MATCH": ConfigValidator.validate_string,
         "STT_VOCAB_HINT": lambda x: isinstance(x, str),
+        # ── SYSTEM PROMPT EDITABLE SIN TOCAR CÓDIGO ──
+        # Lo consumen core/agent/prompts.py (construir_backstory /
+        # construir_persona_sintesis). Se ajustan desde la TUI (/prompt, /set),
+        # desde la Web UI (API /api/system-prompt) o editando config.json.
+        # "" (vacío) = desactivado, se usa el prompt por defecto del código.
+        "SYSTEM_PROMPT_OVERRIDE": lambda x: isinstance(x, str),
+        "SYSTEM_PROMPT_EXTRA": lambda x: isinstance(x, str),
+        "SYSTEM_PROMPT_SINTESIS_EXTRA": lambda x: isinstance(x, str),
     }
 
     DEFAULTS: Dict[str, Any] = {
@@ -238,6 +246,17 @@ class ConfigManager:
             "VLSM, subnetting, ydotool, faster-whisper, SQLite, "
             "consolidator, AudioBox USB 96, CrewAI."
         ),
+        # ── SYSTEM PROMPT EDITABLE SIN TOCAR CÓDIGO ──
+        # SYSTEM_PROMPT_OVERRIDE: si no está vacío, REEMPLAZA la persona/por
+        #   defecto construida en código (el contexto de memoria y las skills
+        #   se agregan igual para no romper el agente).
+        # SYSTEM_PROMPT_EXTRA: instrucciones extra que se agregan AL FINAL de
+        #   TODO system prompt (ejecución y síntesis). Máxima prioridad.
+        # SYSTEM_PROMPT_SINTESIS_EXTRA: extra solo para la persona de síntesis
+        #   (node_plan_synthesizer), además de SYSTEM_PROMPT_EXTRA.
+        "SYSTEM_PROMPT_OVERRIDE": "",
+        "SYSTEM_PROMPT_EXTRA": "",
+        "SYSTEM_PROMPT_SINTESIS_EXTRA": "",
     }
 
     def __init__(self, config_path: Optional[Path] = None):

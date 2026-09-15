@@ -1,12 +1,29 @@
+"""
+Aether API — Backend revivido.
+
+- Motor único: el grafo LangGraph de core/ (mismo motor que la TUI).
+- /api/chat/stream: SSE con tokens en vivo + delta del grafo (plan/actividad).
+- /api/config: lectura/escritura de config.json (configuración de la TUI).
+- /api/system-prompt: system prompt editable sin tocar código.
+- /api/sessions: historial de sesiones del runtime (/sesiones y /historial de la TUI).
+- /ws/chat: WebSocket (socket único, multi-mensaje; mismo contrato de eventos).
+- Sirve la Web UI (carpeta estática autodetectada, ver backend/core/config.py).
+"""
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import logging
 
-from core.config import settings
-from core.aether_service import AetherService
-from api.routes import chat
+from backend.core.config import settings, resolver_web_ui_dir
+from backend.core.aether_service import AetherService
+from backend.api.routes import chat
+from backend.api.routes import config_routes
+from backend.api.routes import prompt_routes
+from backend.api.routes import models_routes
+from backend.api.routes import session_routes
+from backend.api.routes import ws_routes
 
 # =====================================================================
 # LOGGING
@@ -24,7 +41,6 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info(f"🚀 Starting Aether API on {settings.API_HOST}:{settings.API_PORT}")
-    logger.info(f"📡 CORS Origins: {settings.CORS_ORIGINS}")
 
     try:
         AetherService.initialize()
@@ -43,16 +59,16 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Aether API",
     description="API para el agente local Aether",
-    version="1.0.0",
+    version="2.1.0",
     lifespan=lifespan
 )
 
 # =====================================================================
-# CORS (FIX REAL PARA OPTIONS 400)
+# CORS
 # =====================================================================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # CLI only, permissive CORS
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -62,36 +78,50 @@ app.add_middleware(
 # ROUTERS
 # =====================================================================
 app.include_router(chat.router, prefix="/api")
+app.include_router(config_routes.router, prefix="/api")
+app.include_router(prompt_routes.router, prefix="/api")
+app.include_router(models_routes.router, prefix="/api")
+app.include_router(session_routes.router, prefix="/api")
+app.include_router(ws_routes.router)  # /ws/chat (websocket, sin prefijo /api)
+
 
 # =====================================================================
-# ROOT
+# HEALTH / STATUS
 # =====================================================================
-@app.get("/")
-async def root():
-    return {
-        "name": "Aether",
-        "version": "1.0.0",
-        "status": "online",
-        "docs": "/docs"
-    }
-
 @app.get("/health")
 async def health_check():
     return {
         "status": "healthy",
         "agent": "Aether",
-        "ollama": settings.OLLAMA_HOST
+        "ollama": (AetherService.get_status().get("ollama") or "?"),
     }
 
+
+@app.get("/api/status")
+async def api_status():
+    return AetherService.get_status()
+
+
 # =====================================================================
-# ERROR HANDLER
+# WEB UI (estáticos — se monta al final para no pisar las rutas de la API)
 # =====================================================================
-@app.exception_handler(Exception)
-async def global_exception_handler(request, exc):
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal server error", "error": str(exc)}
-    )
+_web_ui_dir = resolver_web_ui_dir()
+if _web_ui_dir is not None:
+    app.mount("/", StaticFiles(directory=str(_web_ui_dir), html=True), name="web_ui")
+    logger.info(f"🖥️  Web UI servida desde {_web_ui_dir}")
+else:
+    logger.warning("⚠️ No se encontró la Web UI (WEB_UI_DIR vacío y sin carpeta por defecto)")
+
+    @app.get("/")
+    async def root():
+        return {
+            "name": "Aether",
+            "version": "2.1.0",
+            "status": "online",
+            "docs": "/docs",
+            "hint": "Web UI no encontrada; configurá WEB_UI_DIR en backend/.env",
+        }
+
 
 # =====================================================================
 # RUN
@@ -99,7 +129,7 @@ async def global_exception_handler(request, exc):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
-        "main:app",
+        "backend.api.main:app",
         host=settings.API_HOST,
         port=settings.API_PORT,
         reload=settings.API_RELOAD

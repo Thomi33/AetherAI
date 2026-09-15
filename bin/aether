@@ -11,6 +11,8 @@
 #   aether --workdir RUTA  → trabaja sobre RUTA (default: dir. actual $PWD)
 #   aether cli            → loop interactivo simple sin Textual (jarvis_new.py)
 #   aether doctor         → diagnóstico del entorno (python, venv, ollama, db)
+#   aether web            → levanta la Web UI (backend API + navegador)
+#                           aliases: aether server / aether gateway
 #   aether -V | --version → versión del runtime
 #   aether -h | --help    → esta ayuda
 #
@@ -119,6 +121,66 @@ case "${1:-}" in
     ;;
   doctor|--doctor)
     exec "$PY" bin/aether_run.py doctor
+    ;;
+  web|server|gateway)
+    shift || true
+    # ── Web UI: backend API (FastAPI, sirve también los estáticos) ──
+    PORT="${AETHER_WEB_PORT:-8000}"
+    URL="http://127.0.0.1:$PORT"
+    WEB_UI_ROOT="${WEB_UI_DIR:-$HOME/aether_web_ui}"
+    STATEDIR="${XDG_STATE_HOME:-$HOME/.local/state}/aether"
+    mkdir -p "$STATEDIR"
+    LOG="$STATEDIR/web.log"
+
+    NO_BROWSER=0
+    for a in "$@"; do [ "$a" = "--no-browser" ] && NO_BROWSER=1; done
+
+    # La Web UI vive en su propio repo (instalable desde el instalador):
+    if [ ! -d "$WEB_UI_ROOT/web" ]; then
+      echo "⚠️  Web UI no encontrada en $WEB_UI_ROOT/web"
+      echo "   Instalala con:  git clone https://github.com/Thomi33/aether_web_ui.git ~/aether_web_ui"
+      exit 1
+    fi
+
+    if curl -sf --max-time 2 "$URL/health" >/dev/null 2>&1; then
+      echo "✅ Backend ya activo en $URL"
+    else
+      echo "🚀 Levantando backend Aether (log: $LOG)…"
+      cd "$AETHER_HOME"
+      # El backend usa .venv (igual que backend/run.sh): la prioridad de
+      # venvs de $PY apunta a env/ (TUI), que no tiene fastapi/uvicorn.
+      PY_WEB="$PY"
+      [ -x "$AETHER_HOME/.venv/bin/python" ] && PY_WEB="$AETHER_HOME/.venv/bin/python"
+      setsid nohup "$PY_WEB" -m uvicorn backend.api.main:app \
+        --host 127.0.0.1 --port "$PORT" >"$LOG" 2>&1 </dev/null &
+      # Esperar a que responda (la primera inicialización tarda unos segundos)
+      listo=0
+      for _ in $(seq 1 60); do
+        curl -sf --max-time 2 "$URL/health" >/dev/null 2>&1 && { listo=1; break; }
+        sleep 1
+      done
+      if [ "$listo" != "1" ]; then
+        echo "❌ El backend no levantó en 60 s. Revisá el log: $LOG" >&2
+        exit 1
+      fi
+      echo "✅ Backend listo en $URL"
+    fi
+
+    if [ "$NO_BROWSER" = "0" ]; then
+      echo "🌐 Abriendo $URL en tu navegador…"
+      if command -v xdg-open >/dev/null 2>&1; then
+        (xdg-open "$URL" >/dev/null 2>&1 &)
+      elif command -v open >/dev/null 2>&1; then
+        open "$URL" >/dev/null 2>&1 || true
+      elif command -v wslview >/dev/null 2>&1; then
+        (wslview "$URL" >/dev/null 2>&1 &)
+      else
+        echo "   Abrí manualmente: $URL"
+      fi
+    else
+      echo "   → $URL"
+    fi
+    exit 0
     ;;
   *)
     exec "$PY" run.py "${WORKDIR_FLAG[@]}" "$@"

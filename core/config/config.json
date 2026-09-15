@@ -36,5 +36,8 @@
   "STT_LANGUAGE": "es",
   "STT_VENV_PYTHON": "",
   "AUDIO_INPUT_MATCH": "AudioBox USB 96",
-  "STT_VOCAB_HINT": "Aether, GitHub, Ollama, LangGraph, Ornith, MCP, Textual, Hyprland, Wayland, NVMe, Notion, Steam, Roblox, Minecraft, VLSM, subnetting, ydotool, faster-whisper, SQLite, consolidator, AudioBox USB 96, CrewAI."
+  "STT_VOCAB_HINT": "Aether, GitHub, Ollama, LangGraph, Ornith, MCP, Textual, Hyprland, Wayland, NVMe, Notion, Steam, Roblox, Minecraft, VLSM, subnetting, ydotool, faster-whisper, SQLite, consolidator, AudioBox USB 96, CrewAI.",
+  "SYSTEM_PROMPT_OVERRIDE": "",
+  "SYSTEM_PROMPT_EXTRA": "",
+  "SYSTEM_PROMPT_SINTESIS_EXTRA": ""
 }
