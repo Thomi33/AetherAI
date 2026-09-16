@@ -137,6 +137,14 @@ def construir_contexto_memoria(
     else:
         descartado.append("recuerdos (ninguno relevante)")
 
+    # ── Slot 2b: APRENDIZAJES de la memoria central compartida ─────────
+    # Recuerdos aprendidos por CUALQUIER runtime (terminal, web, roblox).
+    # Fail-open: si la memoria central no existe o falla, no se altera el
+    # contexto. Se desactiva por completo con AETHER_CENTRAL_MEMORY=0.
+    aprendizajes = _aprendizajes_centrales(tema)
+    if aprendizajes:
+        slots["APRENDIZAJES"] = aprendizajes
+
     # ── Slot 3: CONVERSACIÓN filtrada por tema ────────────────────────
     turnos_relevantes = []
 
@@ -259,6 +267,28 @@ def construir_context_dump(mem: dict, tema: str = "", sesion_id: str = "", es_mu
 # ══════════════════════════════════════════════════════════════════════
 # HELPERS
 # ══════════════════════════════════════════════════════════════════════
+
+def _aprendizajes_centrales(tema: str, *, limit: int = 5, max_chars: int = 600) -> str:
+    """Recupera aprendizajes relevantes de la memoria central compartida.
+
+    La memoria central (~/.aether/memory/) es compartida por todos los
+    runtimes de Aether: lo que aprende el Roblox Player puede aparecer aquí
+    y viceversa. Fail-open por diseño: cualquier error devuelve "".
+    """
+    import os
+    if os.environ.get("AETHER_CENTRAL_MEMORY", "1") == "0":
+        return ""
+    try:
+        from core.memory.central import get_central_memory
+        central = get_central_memory()
+        resultados = central.search(tema or "", limit=limit)
+        if not resultados:
+            return ""
+        lineas = [f"  - {r['summary']}" for r in resultados]
+        return "\n".join(lineas)[:max_chars]
+    except Exception:
+        return ""
+
 
 def _sesion_actual(mem: dict) -> str:
     """Retorna el sesion_id del turno más reciente en RAM."""

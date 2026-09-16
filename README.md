@@ -267,6 +267,26 @@ importantes sobreviven aunque el prompt se reduzca. Durante el onboarding, el
 instalador pregunta si Aether debe tener su propia carpeta. Si elegís que no,
 usa `<proyecto>/.aether-data/` para la base y sus notas.
 
+### Memoria central compartida
+
+Además del almacenamiento de sesión anterior, Aether tiene una **memoria
+central compartida** en JSON (`core/memory/central/`) que vive fuera de
+cualquier runtime (default `~/.aether/memory/`, override con
+`AETHER_CENTRAL_MEMORY_PATH`) y es la misma para todos: terminal, Web UI,
+Roblox Player y futuros runtimes. Tiene tres capas:
+
+- **Conversación**: contexto temporal por sesión, compactable.
+- **Usuario**: hechos estables del usuario; `user_set()` nunca sobrescribe
+  silenciosamente, las correcciones pasan por `user_update()` con historial.
+- **Aprendizaje**: recuerdos con `importance` (1–10) y `strength` (0–1).
+  El uso los refuerza, el desuso los debilita (`consolidate()`), y
+  `forget()` los hace inaccesibles **sin borrarlos** (solo `hard=True`
+  elimina). La personalidad es acumulativa: `personality_signals()` agrega
+  patrones, nunca reemplaza nada.
+
+El context builder inyecta los aprendizajes relevantes en el slot
+`[APRENDIZAJES]` (desactivable con `AETHER_CENTRAL_MEMORY=0`).
+
 ## Arquitectura del proyecto
 
 ```text
