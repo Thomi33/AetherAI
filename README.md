@@ -1,6 +1,6 @@
 # Aether
 
-> Agente local, terminal-first y en español rioplatense.
+> Agente local, terminal-first y en español (por temas de seguridad).
 > **LangGraph + Ollama + herramientas reales + memoria persistente.**
 
 Aether es un asistente local que conversa, analiza proyectos, busca información
