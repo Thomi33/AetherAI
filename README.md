@@ -24,18 +24,8 @@ externos. El modelo corre en tu máquina mediante Ollama.
 
 ### Descargar Aether
 
-<<<<<<< HEAD
 No necesitás instalar manualmente Python, pip, Ollama ni las dependencias de
 Aether antes de empezar. El instalador se encarga de preparar el entorno.
-=======
-- Linux (el instalador está optimizado para Arch Linux).
-- Python 3.10 o superior.
-- [Ollama](https://ollama.com) ejecutándose en `http://localhost:11434`.
-- `zsh` para las herramientas de shell.
-- `ydotool` y `ydotoold` para control de mouse/teclado.
-- `hyprctl` (Hyprland) o `swaymsg` (Sway) para verificación determinista.
-- `grim` solo si vas a usar visión en Hyprland/Wayland.
->>>>>>> 51ef6cd2 (perf: velocidad absoluta)
 
 Podés descargar el repositorio de dos formas:
 
