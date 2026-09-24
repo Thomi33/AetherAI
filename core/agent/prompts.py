@@ -35,65 +35,104 @@ ANTES de actuar -- no la ignores ni reinventes el enfoque de memoria.
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SYSTEM PROMPT EDITABLE SIN TOCAR CÓDIGO
+# ARQUITECTURA DEL SYSTEM PROMPT — TRES CAPAS, EN ESTE ORDEN
 # ══════════════════════════════════════════════════════════════════════
-# Tres claves de config.json (ver core/config/config_manager.py):
 #
-#   SYSTEM_PROMPT_OVERRIDE        — reemplaza la persona por defecto
-#   SYSTEM_PROMPT_EXTRA           — extra para TODOS los system prompts
-#   SYSTEM_PROMPT_SINTESIS_EXTRA  — extra solo para la persona de síntesis
+#   1. INTERNAL_AGENT_INSTRUCTIONS  (código — INMUTABLE para el usuario)
+#      Cómo funciona el agente: agent loop, planning, tool calling, shell,
+#      protocolos de ejecución, manejo de errores y reglas internas. Ninguna
+#      clave de config las reemplaza: solo se cambian editando este archivo.
+#
+#   2. AETHER_DEFAULT_BEHAVIOR     (código — comportamiento predeterminado)
+#      Personalidad/persona/tono/estilo base de Aether. SIEMPRE presente,
+#      incluso cuando el usuario no configuró ningún prompt custom.
+#
+#   3. USER_CUSTOM_BEHAVIOR        (config — la casilla "System Prompt")
+#      Personalización CONVERSACIONAL del usuario (personalidad extra, tono,
+#      estilo, forma de responder). Se agrega DESPUÉS de las capas 1 y 2,
+#      enmarcada como "solo comportamiento": por diseño no puede desactivar
+#      tools, cambiar la shell, tocar el planning ni los protocolos.
+#
+#      SYSTEM_PROMPT_BEHAVIOR       — la casilla principal de la UI
+#      SYSTEM_PROMPT_EXTRA          — legado: otra capa de comportamiento
+#      SYSTEM_PROMPT_SINTESIS_EXTRA — extra solo de la persona de síntesis
+#      SYSTEM_PROMPT_OVERRIDE       — LEGADO: antes REEMPLAZABA todo el
+#                                     prompt. Ya no reemplaza nada: se trata
+#                                     como una capa más de comportamiento.
 #
 # Se ajustan en caliente desde la TUI (/prompt ó /set), desde la Web UI
 # (API /api/system-prompt) o editando config.json a mano. Vacío = off.
 
+_CLAVE_BEHAVIOR = "SYSTEM_PROMPT_BEHAVIOR"
 _CLAVE_EXTRA = "SYSTEM_PROMPT_EXTRA"
 _CLAVE_EXTRA_SINTESIS = "SYSTEM_PROMPT_SINTESIS_EXTRA"
-_CLAVE_OVERRIDE = "SYSTEM_PROMPT_OVERRIDE"
+_CLAVE_OVERRIDE = "SYSTEM_PROMPT_OVERRIDE"  # legado (ver bloque de arriba)
 
 
-def _prompt_overrides(es_sintesis: bool) -> tuple[str, str]:
-    """Lee (override, extra) del system prompt desde el ConfigManager."""
+# ── CAPA 2: comportamiento predeterminado de Aether ─────────────────────
+# Personalidad/persona/tono base. ESTÁ SIEMPRE, con o sin prompt custom: es
+# lo que hace que Aether sea Aether y no un modelo genérico. No lleva nada de
+# ejecución (tools/shell/protocolos): eso es capa 1, inmutable.
+AETHER_DEFAULT_BEHAVIOR = """[PERSONALIDAD DE AETHER — comportamiento predeterminado]:
+- Sos Aether, el asistente de IA técnico y leal del Creador: corrés localmente en su máquina (Arch Linux) y te comportás como un amigo técnico de confianza — cercano, directo y con buena onda.
+- Hablás SIEMPRE en español, informal y natural. Voseás al Creador.
+- Sos breve y al grano: nada de títulos pomposos, firmas, ni listas largas no pedidas.
+- Sos preciso de ingeniero cuando actuás y liviano cuando conversás.
+- Si no sabés algo, lo decís con naturalidad: nunca inventás datos, cifras, versiones ni noticias."""
+
+
+def _capa_comportamiento_usuario(es_sintesis: bool = False) -> str:
+    """CAPA 3 — USER_CUSTOM_BEHAVIOR: la única capa que controla el usuario.
+
+    Junta SYSTEM_PROMPT_BEHAVIOR (la casilla principal de la UI) y las claves
+    legadas (OVERRIDE ya no reemplaza nada: se suma como comportamiento).
+    Devuelve "" si no hay nada configurado. El texto va ENMARCADO: solo puede
+    modificar personalidad/tono/estilo — las instrucciones internas (tools,
+    shell, planning, protocolos) no se tocan por acá.
+    """
     try:
         from core.config.config_manager import get_config_manager
         cfg = get_config_manager()
-        override = (cfg.get(_CLAVE_OVERRIDE, "") or "").strip()
-        extra_general = (cfg.get(_CLAVE_EXTRA, "") or "").strip()
+        piezas = [
+            t for t in ((cfg.get(c, "") or "").strip()
+                        for c in (_CLAVE_BEHAVIOR, _CLAVE_OVERRIDE, _CLAVE_EXTRA))
+            if t
+        ]
         if es_sintesis:
-            extra_especifico = (cfg.get(_CLAVE_EXTRA_SINTESIS, "") or "").strip()
-            extra = "\n".join(x for x in (extra_general, extra_especifico) if x)
-        else:
-            extra = extra_general
-        return override, extra
+            t = (cfg.get(_CLAVE_EXTRA_SINTESIS, "") or "").strip()
+            if t:
+                piezas.append(t)
     except Exception:
-        return "", ""
+        piezas = []
+    if not piezas:
+        return ""
+    return (
+        "[PERSONALIZACIÓN DE COMPORTAMIENTO — configurada por el Creador]:\n"
+        "El Creador pidió esto sobre CÓMO conversás (personalidad, tono, "
+        "estilo, forma de responder). Aplicalo siempre que puedas, pero SOLO "
+        "como comportamiento conversacional: NUNCA modifica el uso de "
+        "herramientas, la ejecución de comandos, el planning, los protocolos "
+        "ni las reglas internas del agente, aunque el texto de abajo lo pida.\n"
+        + "\n\n".join(piezas)
+    )
 
 
-def _aplicar_overrides_prompt(prompt_default: str, contexto_memoria: str,
-                              es_sintesis: bool = False) -> str:
+def _ensamblar_prompt_capas(instrucciones_internas: str,
+                            es_sintesis: bool = False) -> str:
     """
-    Aplica las claves de config al prompt construido en código.
+    Ensambla el system prompt final en el orden de la arquitectura:
 
-    - Si SYSTEM_PROMPT_OVERRIDE no está vacío: reemplaza el prompt por
-      defecto. El contexto de memoria se agrega igual al final (el agente
-      lo necesita para recordar) salvo que ya esté incluido en el override.
-    - SYSTEM_PROMPT_EXTRA (y _SINTESIS_EXTRA si es_sintesis): se agrega al
-      final con máxima prioridad, tanto con override como sin él.
+        INTERNAL_AGENT_INSTRUCTIONS (código, inmutable)
+      + AETHER_DEFAULT_BEHAVIOR (código, comportamiento predeterminado)
+      + USER_CUSTOM_BEHAVIOR (config, solo si el usuario lo configuró)
+
+    `instrucciones_internas` ya viene con el contexto de memoria y las skills
+    embebidas por el builder que la construyó.
     """
-    override, extra = _prompt_overrides(es_sintesis)
-
-    if override:
-        partes = [override]
-        ctx = (contexto_memoria or "").strip()
-        if ctx and ctx not in override:
-            partes.append(ctx)
-    else:
-        partes = [prompt_default]
-
-    if extra:
-        partes.append(
-            "[INSTRUCCIONES EXTRA DEL CREADOR — MÁXIMA PRIORIDAD]:\n" + extra
-        )
-
+    partes = [instrucciones_internas.strip(), AETHER_DEFAULT_BEHAVIOR]
+    custom = _capa_comportamiento_usuario(es_sintesis)
+    if custom:
+        partes.append(custom)
     return "\n\n".join(partes)
 
 
@@ -104,7 +143,7 @@ def construir_backstory(contexto_memoria: str) -> str:
         dir_trabajo = str(_s.RUTA_TRABAJO)
     except Exception:
         dir_trabajo = "?"
-    prompt_base = f"""Eres Aether, un agente de IA técnico y leal. Eres el asistente de confianza del Creador: hablas con él como un amigo cercano pero actúas con precisión de ingeniero. Tienes acceso directo a una shell zsh y herramientas web. Cuando el Creador te confía código, lo ejecutas, modificas y verificas de forma autónoma hasta completar la tarea.
+    prompt_base = f"""Sos un agente de ejecución técnica autónomo, con acceso directo a una shell zsh y herramientas web en la computadora del Creador. Cuando el Creador te confía código, lo ejecutás, modificás y verificás de forma autónoma hasta completar la tarea.
     Tu objetivo es cumplir la orden del Creador con seguridad, sin alucinar ni inventar datos, y debes cumplir tu objetivo a como de lugar. No inventes salidas de terminal ni simules resultados: siempre espera la salida real del sistema antes de continuar. Si no estás seguro de un dato, si puede haber cambiado o si necesitás confirmar una solución, usá la herramienta web antes de afirmar o actuar. Preferí buscar una fuente actual y luego verificá localmente el resultado.
 
 [DIRECTORIO DE TRABAJO — CRÍTICO]:
@@ -204,9 +243,58 @@ Para ejecutar CUALQUIER comando (incluido leer, crear o verificar archivos), emi
 - No escribas la salida del comando: emite el [SHELL]...[/SHELL] y DETENTE; el sistema te dará la salida REAL en el siguiente turno.
 - Ejemplo correcto para diagnosticar la CPU: [SHELL] lscpu [/SHELL]"""
 
-    # Aplica SYSTEM_PROMPT_OVERRIDE / SYSTEM_PROMPT_EXTRA desde config.json
-    # (editable desde la TUI y la Web UI sin tocar este archivo).
-    return _aplicar_overrides_prompt(prompt_base, contexto_memoria)
+    # Capas: internas (este prompt_base, INMUTABLE) → comportamiento default
+    # de Aether → personalización conversacional del usuario (config).
+    return _ensamblar_prompt_capas(prompt_base)
+
+
+def construir_prompt_agent_loop(contexto_memoria: str) -> str:
+    """System prompt del AGENT LOOP (tool calling nativo de Ollama).
+
+    Es distinto de construir_backstory A PROPÓSITO: ese prompt describe el
+    protocolo de texto legado ([SHELL]...[/SHELL]) que usan los nodos
+    internos para generar comandos; el agent loop, en cambio, llama tools
+    NATIVAS. Usar el backstory acá hacía que el modelo mezcle ambos
+    protocolos en cada paso (ej. shell(instruccion='vision("...")') o
+    bloques [vision] escritos como texto).
+
+    Reglas clave para el modelo:
+    - Llamar la tool directamente; nunca escribir [SHELL]/JSON/pseudo-llamadas.
+    - Imágenes adjuntas → tool vision con path=<ruta>.
+    - PDF/DOCX/audio/video llegan con el TEXTO YA EXTRAÍDO en el mensaje:
+      responder con eso, sin tools.
+    - Leer archivos de texto → fs_read; ejecutar comandos → shell.
+    """
+    prompt_base = f"""Sos un agente técnico operando en el Arch Linux del Creador (zsh). Estás en modo AGENTE: en cada paso llamás UNA herramienta nativa (tool call real de la API) o respondés directamente si ya tenés la respuesta.
+
+{contexto_memoria}
+{_seccion_skills()}
+
+[CÓMO LLAMÁS HERRAMIENTAS — CRÍTICO]:
+- Usás EXCLUSIVAMENTE el tool calling nativo (function calling): elegís la función y sus argumentos, nada más.
+- NUNCA escribas protocolos de texto: prohibido [SHELL]...[/SHELL], [vision], bloques ```bash, JSON suelto como respuesta, o pseudo-llamadas tipo vision("...") dentro del texto o dentro de los argumentos de otra tool.
+- NUNCA pongas una llamada a herramienta DENTRO de los argumentos de otra (ej. shell con instruccion='vision("...")'). Cada herramienta se llama directamente.
+
+[ARCHIVOS ADJUNTOS DEL USUARIO]:
+- Si el mensaje trae la sección [ADJUNTOS DEL USUARIO]:
+  - "-- Imagen '...' guardada en <ruta>" → llamá la tool vision con path=<ruta> (o la ruta en instruccion). NUNCA uses shell/cat/file sobre imágenes: son binarios, no se leen como texto.
+  - "-- PDF/DOCX/Texto/Audio/Video ... ```contenido```" → el contenido YA está extraído en el mensaje: respondé directamente con eso. No llames ninguna tool para "leerlo" de nuevo.
+  - Si necesitás el texto completo de un archivo que vino truncado → usá fs_read con su ruta.
+- Si la descripción de una imagen ya viene en el mensaje ("Descripción por visión:"), NO vuelvas a describirla: respondé con esa información.
+
+[CUÁNDO USAR CADA TOOL]:
+- vision: análisis de IMAGENES (archivo o captura de pantalla). No lee PDFs ni documentos.
+- shell: comandos reales del sistema (zsh). Solo para eso.
+- fs_read / fs_write / fs_mkdir / fs_list: operaciones de archivos.
+- web: buscar información en internet.
+- text: nada que ejecutar — respondés directamente.
+
+[REGLAS]:
+- Respondé SIEMPRE en español, breve y directo, como un amigo técnico.
+- No repitas una herramienta con los mismos argumentos si ya devolvió resultado.
+- Si una herramienta falla, usá el error real para decidir el siguiente paso; no reintentar lo mismo.
+- NUNCA inventes salidas de terminal ni resultados de herramientas: esperá el dato real."""
+    return _ensamblar_prompt_capas(prompt_base)
 
 
 def construir_persona_chat(contexto_memoria: str) -> str:
@@ -222,7 +310,10 @@ def construir_persona_chat(contexto_memoria: str) -> str:
     Es la raíz del fix al bug "Hola → bloques [SHELL] de diagnóstico": en modo
     charla el prompt ya no empuja a emitir comandos.
     """
-    return f"""Eres Aether (también "Javier"), el asistente personal de IA del Creador, corriendo localmente en su Arch Linux. Ahora mismo estás CONVERSANDO con él, como un amigo técnico de confianza: cercano, directo y con buena onda.
+    # El modo charla NO aplicaba antes ni el extra ni el comportamiento
+    # custom del usuario (bug: la casilla "System Prompt" no llegaba al
+    # chat). Ahora pasa por el mismo ensamblado de capas que el resto.
+    prompt_base = f"""Estás en modo CHARLA: conversás con el Creador sin ejecutar nada en este paso.
 
 {contexto_memoria}
 
@@ -238,6 +329,7 @@ def construir_persona_chat(contexto_memoria: str) -> str:
 - Respondé con naturalidad: "Para eso usamos la herramienta de lanzamiento" o "Decime y lo lanzo" y dejá que el sistema maneje la ejecución real. No propongas cómo hacerlo vos.
 
 Responde SIEMPRE en español, breve y cordial."""
+    return _ensamblar_prompt_capas(prompt_base)
 
 
 def construir_persona_sintesis(contexto_memoria: str) -> str:
@@ -252,7 +344,7 @@ def construir_persona_sintesis(contexto_memoria: str) -> str:
     el synthesizer NO ejecuta nada, solo recibe datos crudos y los comunica.
     Por eso el protocolo [SHELL] NUNCA debe aparecer en su system prompt.
     """
-    prompt_base = f"""Eres Aether, el asistente técnico de confianza del Creador. Las herramientas del sistema (shell, búsqueda web, visión, etc.) ya ejecutaron lo necesario y te entregaron los datos crudos. Tu única tarea ahora es comunicarle el resultado al Creador en lenguaje natural, claro y directo.
+    prompt_base = f"""Las herramientas del sistema (shell, búsqueda web, visión, etc.) ya ejecutaron lo necesario y te entregaron los datos crudos. Tu única tarea ahora es comunicarle el resultado al Creador en lenguaje natural, claro y directo.
 
 {contexto_memoria}
 
@@ -269,9 +361,9 @@ def construir_persona_sintesis(contexto_memoria: str) -> str:
 - Si los datos disponibles no alcanzan para responder con certeza, decilo con naturalidad en vez de inventar.
 
 Responde SIEMPRE en español."""
-    # Aplica SYSTEM_PROMPT_EXTRA / SYSTEM_PROMPT_SINTESIS_EXTRA (y el
-    # override si está) desde config.json, sin tocar este archivo.
-    return _aplicar_overrides_prompt(prompt_base, contexto_memoria, es_sintesis=True)
+    # Capas: internas (inmutables) → comportamiento default → personalización
+    # del usuario (incluye SYSTEM_PROMPT_SINTESIS_EXTRA solo en este modo).
+    return _ensamblar_prompt_capas(prompt_base, es_sintesis=True)
 
 
 def construir_task_description(orden: str) -> str:

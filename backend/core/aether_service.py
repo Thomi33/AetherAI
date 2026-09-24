@@ -162,6 +162,14 @@ class AetherService:
         return _GEN_LOCK.locked()
 
     @staticmethod
+    def actualizar_resumen_ram(texto: str) -> None:
+        """Espeja el resumen nuevo en la memoria RAM del motor (igual que
+        _motor_actualizar_resumen de la TUI): el próximo turno ya lo ve sin
+        esperar a recargar memoria desde la DB."""
+        if _AETHER_MEMORY is not None:
+            _AETHER_MEMORY["resumen"] = texto
+
+    @staticmethod
     def process_message(user_message: str) -> Dict[str, Any]:
         """
         Procesa un mensaje del usuario y devuelve respuesta del agente
@@ -242,6 +250,9 @@ class AetherService:
                 "ollama": cfg.get("OLLAMA_HOST", "?"),
                 "busy": AetherService.ocupado(),
                 "version": "2.1.0-revived",
+                # Preferencias compartidas con la TUI (/effort y /agents).
+                "effort": cfg.get("EFFORT", "medium"),
+                "agent": cfg.get("AGENTE", "build"),
             }
             if not _AETHER_INITIALIZED:
                 return {**base, "status": "uninitialized", "agent_status": "offline"}

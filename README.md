@@ -307,13 +307,17 @@ El backend FastAPI es experimental y **no forma parte de la instalación normal
 de la TUI**. Está separado para evitar que sus dependencias antiguas interfieran
 con el runtime actual. La futura WebUI se desarrollará en un repositorio aparte.
 
-Si necesitás trabajar con el backend experimental manualmente:
+Si necesitás trabajar con el backend experimental manualmente, levantalo
+**desde la raíz del repo** (los imports del paquete son absolutos,
+`backend.api…`):
 
 ```bash
-cd backend
-../crewai-env/bin/python -m pip install -r requirements.txt
-../crewai-env/bin/python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
+crewai-env/bin/python -m pip install -r backend/requirements.txt
+.venv/bin/python -m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000 --reload
 ```
+
+> Nota: el comando viejo (`cd backend && uvicorn api.main:app`) falla con
+> `ModuleNotFoundError: No module named 'backend'`.
 
 ## Desarrollo y pruebas
 

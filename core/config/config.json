@@ -1,6 +1,6 @@
 {
   "MODELO": "ornith-1.5:9b",
-  "MODELO_VISION": "ornith-1.5:9b",
+  "MODELO_VISION": "moondream:latest",
   "OLLAMA_HOST": "http://localhost:11434",
   "SEARXNG_URL": "http://localhost:8081",
   "MODO_AUTONOMO": true,
@@ -37,6 +37,7 @@
   "STT_VENV_PYTHON": "",
   "AUDIO_INPUT_MATCH": "AudioBox USB 96",
   "STT_VOCAB_HINT": "Aether, GitHub, Ollama, LangGraph, Ornith, MCP, Textual, Hyprland, Wayland, NVMe, Notion, Steam, Roblox, Minecraft, VLSM, subnetting, ydotool, faster-whisper, SQLite, consolidator, AudioBox USB 96, CrewAI.",
+  "SYSTEM_PROMPT_BEHAVIOR": "",
   "SYSTEM_PROMPT_OVERRIDE": "",
   "SYSTEM_PROMPT_EXTRA": "",
   "SYSTEM_PROMPT_SINTESIS_EXTRA": ""

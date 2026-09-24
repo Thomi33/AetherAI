@@ -150,12 +150,23 @@ def ejecutar_comando(cmd: str, cwd: str | None = None) -> tuple[str, bool]:
             return f"[Proceso lanzado en segundo plano. PID: {proc.pid}]", False
 
         # 4. Lógica para comandos estándar interactivos
+        #    Sin text=True: se decodifica a mano con errors='replace' porque
+        #    la salida puede ser binaria (ej. `cat foto.jpg` generado por un
+        #    modelo confundido). Antes, 'utf-8' lanzaba UnicodeDecodeError y
+        #    el modelo recibía un "Error de subproceso" sin contexto útil.
         resultado = subprocess.run(
             cmd, shell=True, executable="/bin/zsh",
-            capture_output=True, text=True, timeout=TIMEOUT_CMD,
+            capture_output=True, timeout=TIMEOUT_CMD,
             cwd=cwd or None,
         )
-        salida = (resultado.stdout + resultado.stderr).strip()
+        raw = (resultado.stdout or b"") + (resultado.stderr or b"")
+        salida = raw.decode("utf-8", errors="replace").strip()
+        if "\ufffd" in salida:
+            # Contenido binario: recortar y avisar — el modelo entiende este
+            # mensaje mucho mejor que un stream de caracteres de reemplazo.
+            if sum(1 for c in salida if c == "\ufffd") > 16:
+                salida = (salida[:1000]
+                          + "\n…[salida binaria truncada: el archivo no es texto]")
         return salida or "[Comando completado sin salida]", resultado.returncode != 0
 
     except subprocess.TimeoutExpired:

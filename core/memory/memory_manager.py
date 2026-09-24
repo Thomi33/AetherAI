@@ -1,114 +1,66 @@
 """
 memory_manager.py — Gestor de memoria de Aether.
-Habla directo con la DB de producción (current.db). Sin capas intermedias.
 
-Tablas esperadas:
-  conversaciones  — historial filtrable por sesión y tema
-  comandos        — comandos shell ejecutados
-  recuerdos       — hechos permanentes (archival memory)
-  core_memory     — estado siempre presente (se auto-crea si no existe)
+Persistencia: un ÚNICO archivo JSON (ver core/memory/memoria_store.py):
+
+    <BASE_AETHER>/db/memoria.json   (+ memoria.json.bak rotativo)
+
+NO hay SQLite en ningún lado: la escritura es atómica, con backup y
+recuperación automática ante corrupción. La primera vez que arranca sin
+memoria.json, el store importa UNA SOLA VEZ el contenido de la DB legacy
+(current.db) si existiera (one-shot dentro de memoria_store); después el
+formato viejo no se vuelve a tocar.
+
+Estructura gestionada:
+  conversaciones/comandos — historial operativo (acotado)
+  recuerdos        — hechos permanentes (archival memory)
+  core             — estado siempre presente
+  resumen          — rolling summary (curado por consolidación)
 """
-import sqlite3
-from contextlib import contextmanager
+from __future__ import annotations
+
 from datetime import datetime
-from pathlib import Path
 
-from core.config.settings import BASE_AETHER
-
-# ── Ruta de la DB ────────────────────────────────────────────────────
-# Antes apuntaba a /mnt/basurero/Javier/db/memoria.db (ruta vieja).
-# Ahora usa la DB de producción documentada en el README.
-DB_PATH = Path(BASE_AETHER) / "db" / "current.db"
+from core.memory import memoria_store
 
 # ── Límites ──────────────────────────────────────────────────────────
 MAX_HISTORIAL_RAM = 200   # turnos que se mantienen en el dict RAM
-MAX_TEXTO         = 1000  # caracteres máximos por turno/comando
+MAX_TEXTO         = 1000  # caracteres máximos por turno/comando/recuerdo
 
 
 # ══════════════════════════════════════════════════════════════════════
-# CONEXIÓN
-# ══════════════════════════════════════════════════════════════════════
-@contextmanager
-def _db():
-    """Context manager para conexiones SQLite seguras."""
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    try:
-        con.execute("PRAGMA busy_timeout = 5000")
-        con.execute("PRAGMA journal_mode = WAL")
-        con.execute("PRAGMA synchronous = NORMAL")
-        yield con
-        con.commit()
-    except Exception:
-        con.rollback()
-        raise
-    finally:
-        con.close()
-
-
-# ══════════════════════════════════════════════════════════════════════
-# ESQUEMA — asegura que las tablas existen (idempotente)
+# COMPAT DE ARRANQUE (antes era el inicializador del esquema sqlite)
 # ══════════════════════════════════════════════════════════════════════
 def asegurar_esquema() -> None:
-    """
-    Crea las tablas que memory_manager necesita si no existen.
-    Llama a esto UNA VEZ al arrancar el agente (antes de cargar_memoria).
+    """Con el store JSON no hay esquema que preparar: solo garantiza que el
+    archivo exista (y dispara la migración legacy si corresponde)."""
+    try:
+        memoria_store.guardar(memoria_store.cargar())
+        print("[MEMORIA] Store JSON verificado en", memoria_store.RUTA_JSON)
+    except Exception as e:
+        print(f"[MEMORIA] ⚠️  No se pudo inicializar el store JSON: {e}")
+
+
+def inicializar_db() -> None:
+    """Compat con arranques viejos (era el inicializador sqlite)."""
+    asegurar_esquema()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# IDENTIDAD DEL USUARIO — sin hardcodear nombres en código
+# ══════════════════════════════════════════════════════════════════════
+def nombre_usuario_default() -> str:
+    """Nombre del usuario desde el perfil de Account (config ACCOUNT_PROFILE).
+
+    La identidad NUNCA se hardcodea en código: si no hay perfil de cuenta
+    configurado, devuelve "" y el prompt/contexto no menciona ningún nombre.
     """
     try:
-        with _db() as con:
-            con.executescript("""
-                CREATE TABLE IF NOT EXISTS conversaciones (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fecha      TEXT,
-                    rol        TEXT,
-                    texto      TEXT,
-                    sesion_id  TEXT DEFAULT '',
-                    tema       TEXT DEFAULT '',
-                    proyecto   TEXT DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS comandos (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fecha      TEXT,
-                    orden      TEXT,
-                    cmd        TEXT,
-                    sesion_id  TEXT DEFAULT '',
-                    exitoso    INTEGER DEFAULT 1
-                );
-
-                CREATE TABLE IF NOT EXISTS recuerdos (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    fecha       TEXT,
-                    categoria   TEXT DEFAULT '',
-                    contenido   TEXT,
-                    importancia INTEGER DEFAULT 1
-                );
-
-                CREATE TABLE IF NOT EXISTS core_memory (
-                    clave        TEXT PRIMARY KEY,
-                    valor        TEXT,
-                    actualizado  TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS resumen_memoria (
-                    id               INTEGER PRIMARY KEY CHECK (id = 1),
-                    texto            TEXT DEFAULT '',
-                    ultimo_turno_id  INTEGER DEFAULT 0,
-                    actualizado      TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_conversaciones_tema_sesion_id
-                    ON conversaciones (tema, sesion_id, id DESC);
-                CREATE INDEX IF NOT EXISTS idx_conversaciones_sesion_id
-                    ON conversaciones (sesion_id, id);
-                CREATE INDEX IF NOT EXISTS idx_recuerdos_categoria_importancia
-                    ON recuerdos (categoria, importancia, id DESC);
-                CREATE INDEX IF NOT EXISTS idx_comandos_sesion_id
-                    ON comandos (sesion_id, id);
-            """)
-        print("[MEMORIA] Esquema verificado/creado en", DB_PATH)
-    except Exception as e:
-        print(f"[MEMORIA] ⚠️  No se pudo asegurar esquema: {e}")
+        from core.config.config_manager import get_config_manager
+        perfil = get_config_manager().get("ACCOUNT_PROFILE", {}) or {}
+        return str(perfil.get("nombre") or "").strip()
+    except Exception:
+        return ""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -116,15 +68,13 @@ def asegurar_esquema() -> None:
 # ══════════════════════════════════════════════════════════════════════
 def _memoria_vacia() -> dict:
     return {
-        # Contrato legacy que sigue consumiendo node_memory, la TUI y algunos
-        # conectores. Se conserva mientras la memoria persistente migra al
-        # modelo core/resumen; quitarlo rompía sesiones existentes.
-        "preferencias":      {"nombre_usuario": "Thomas", "navegador": "brave", "notas": []},
+        "preferencias":      {"nombre_usuario": nombre_usuario_default(),
+                              "navegador": "brave", "notas": []},
         "flatpaks":          {},
         "conversacion":       [],   # [{rol, texto, fecha, sesion_id, tema}]
         "historial_comandos": [],   # [{orden, cmd, fecha, sesion_id}]
-        "core":               {},   # espejo de core_memory
-        "resumen":            "",   # espejo de resumen_memoria.texto (rolling summary)
+        "core":               {},   # espejo de core
+        "resumen":            "",   # espejo de resumen.texto
         "sesion_id":          "",
     }
 
@@ -134,15 +84,16 @@ def normalizar_mem(mem: dict | None) -> dict:
     base = _memoria_vacia()
     if not isinstance(mem, dict):
         return base
-    # Mantener el mismo objeto de sesión, pero completar todos los campos del
-    # contrato en vez de devolver estructuras parciales según el caller.
     for clave, valor in base.items():
-        mem.setdefault(clave, valor.copy() if isinstance(valor, dict) else list(valor) if isinstance(valor, list) else valor)
+        mem.setdefault(clave, valor.copy() if isinstance(valor, dict)
+                       else list(valor) if isinstance(valor, list) else valor)
     if not isinstance(mem.get("preferencias"), dict):
         mem["preferencias"] = dict(base["preferencias"])
     else:
         prefs = mem["preferencias"]
-        prefs.setdefault("nombre_usuario", "Thomas")
+        # Una clave vacía/legacy ("" o ausente) se completa desde la cuenta.
+        if not str(prefs.get("nombre_usuario") or "").strip():
+            prefs["nombre_usuario"] = nombre_usuario_default()
         prefs.setdefault("navegador", "brave")
         if not isinstance(prefs.get("notas"), list):
             prefs["notas"] = []
@@ -165,162 +116,93 @@ def normalizar_mem(mem: dict | None) -> dict:
 # CORE MEMORY — siempre presente en el contexto
 # ══════════════════════════════════════════════════════════════════════
 def leer_core_memory() -> dict:
-    """Lee toda la core_memory como dict {clave: valor}."""
+    """Lee toda la core como dict {clave: valor}."""
     try:
-        with _db() as con:
-            filas = con.execute("SELECT clave, valor FROM core_memory").fetchall()
-            return {f["clave"]: f["valor"] for f in filas}
+        return dict(memoria_store.cargar()["core"])
     except Exception as e:
-        print(f"[MEMORIA] Error leyendo core_memory: {e}")
+        print(f"[MEMORIA] Error leyendo core: {e}")
         return {}
 
 
 def actualizar_core(clave: str, valor: str) -> None:
-    """Actualiza o inserta un valor en core_memory."""
+    """Actualiza o inserta un valor en core."""
     try:
-        with _db() as con:
-            con.execute("""
-                INSERT INTO core_memory (clave, valor, actualizado)
-                VALUES (?, ?, ?)
-                ON CONFLICT(clave) DO UPDATE SET
-                    valor=excluded.valor,
-                    actualizado=excluded.actualizado
-            """, (clave, valor, datetime.now().isoformat()))
+        data = memoria_store.cargar()
+        data["core"][str(clave)] = str(valor)
+        memoria_store.guardar(data)
     except Exception as e:
         print(f"[MEMORIA] Error actualizando core '{clave}': {e}")
 
 
 # ══════════════════════════════════════════════════════════════════════
-# RESUMEN ACUMULATIVO (rolling summary) — reemplaza la inyección de chats
-# crudos como fuente de contexto de largo plazo. Se actualiza por
-# CONSOLIDACIÓN (core/memory/consolidator.py), no por append: cada corrida
-# reescribe el resumen completo incorporando lo nuevo relevante.
+# RESUMEN ACUMULATIVO (rolling summary) — lo cura el consolidador.
 # ══════════════════════════════════════════════════════════════════════
 def obtener_resumen() -> dict:
-    """
-    Retorna {"texto": str, "ultimo_turno_id": int, "actualizado": str}.
-    Si todavía no hay resumen (primera vez), texto viene vacío.
-    """
+    """{"texto": str, "ultimo_turno_id": int, "actualizado": str}."""
     try:
-        with _db() as con:
-            fila = con.execute(
-                "SELECT texto, ultimo_turno_id, actualizado FROM resumen_memoria WHERE id = 1"
-            ).fetchone()
-            if fila:
-                return dict(fila)
+        return dict(memoria_store.cargar()["resumen"])
     except Exception as e:
         print(f"[MEMORIA] Error leyendo resumen: {e}")
-    return {"texto": "", "ultimo_turno_id": 0, "actualizado": ""}
+        return {"texto": "", "ultimo_turno_id": 0, "actualizado": ""}
 
 
 def guardar_resumen(texto: str, ultimo_turno_id: int | None = None) -> None:
-    """
-    Reemplaza el resumen acumulativo completo (fila única id=1).
+    """Reemplaza el resumen acumulativo completo.
 
-    Si ultimo_turno_id es None, preserva el que ya estaba guardado (útil
-    para ediciones manuales desde /memory en la TUI, donde no corresponde
-    tocar el cursor de consolidación automática).
+    Si ultimo_turno_id es None, preserva el cursor de consolidación vigente
+    (ediciones manuales desde la Web UI/TUI no re-procesan turnos viejos).
     """
     try:
-        with _db() as con:
-            if ultimo_turno_id is None:
-                fila = con.execute(
-                    "SELECT ultimo_turno_id FROM resumen_memoria WHERE id = 1"
-                ).fetchone()
-                ultimo_turno_id = fila["ultimo_turno_id"] if fila else 0
-            con.execute("""
-                INSERT INTO resumen_memoria (id, texto, ultimo_turno_id, actualizado)
-                VALUES (1, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    texto=excluded.texto,
-                    ultimo_turno_id=excluded.ultimo_turno_id,
-                    actualizado=excluded.actualizado
-            """, (texto, ultimo_turno_id, datetime.now().isoformat()))
-        print(f"[MEMORIA] Resumen actualizado ({len(texto)} chars, hasta turno #{ultimo_turno_id}).")
+        data = memoria_store.cargar()
+        if ultimo_turno_id is None:
+            ultimo_turno_id = data["resumen"].get("ultimo_turno_id", 0)
+        data["resumen"] = {
+            "texto": str(texto),
+            "ultimo_turno_id": int(ultimo_turno_id),
+            "actualizado": datetime.now().isoformat(),
+        }
+        memoria_store.guardar(data)
+        print(f"[MEMORIA] Resumen guardado ({len(texto)} chars, "
+              f"hasta turno #{ultimo_turno_id}).")
     except Exception as e:
         print(f"[MEMORIA] Error guardando resumen: {e}")
 
 
 def obtener_turnos_pendientes_de_resumen(limit: int = 300) -> list[dict]:
-    """
-    Turnos crudos de `conversaciones` posteriores al último consolidado en
-    el resumen. Usado por el consolidador para saber qué integrar.
-    """
-    ultimo_id = obtener_resumen().get("ultimo_turno_id", 0)
+    """Turnos posteriores al último ya consolidado en el resumen."""
+    ultimo_id = int(obtener_resumen().get("ultimo_turno_id") or 0)
     try:
-        with _db() as con:
-            filas = con.execute("""
-                SELECT id, fecha, rol, texto
-                FROM conversaciones
-                WHERE id > ?
-                ORDER BY id ASC
-                LIMIT ?
-            """, (ultimo_id, limit)).fetchall()
-            return [dict(f) for f in filas]
+        turnos = memoria_store.cargar()["conversaciones"]
+        pendientes = [t for t in turnos if int(t.get("id") or 0) > ultimo_id]
+        return pendientes[:max(1, int(limit))]
     except Exception as e:
-        print(f"[MEMORIA] Error leyendo turnos pendientes de resumen: {e}")
+        print(f"[MEMORIA] Error leyendo turnos pendientes: {e}")
         return []
 
 
 # ══════════════════════════════════════════════════════════════════════
-# CARGA INICIAL
+# CARGA INICIAL (DB → dict RAM)
 # ══════════════════════════════════════════════════════════════════════
 def cargar_memoria() -> dict:
-    """
-    Carga el dict RAM desde current.db.
-    Se llama una vez al iniciar el agente.
-    Si falla, devuelve memoria vacía (nunca rompe el arranque).
-    """
+    """Carga el dict RAM desde el store JSON. Nunca rompe el arranque."""
     mem = _memoria_vacia()
     try:
-        with _db() as con:
-            # Core memory
-            filas = con.execute("SELECT clave, valor FROM core_memory").fetchall()
-            mem["core"] = {f["clave"]: f["valor"] for f in filas}
-
-            # Resumen acumulativo (rolling summary)
-            fila_resumen = con.execute(
-                "SELECT texto FROM resumen_memoria WHERE id = 1"
-            ).fetchone()
-            mem["resumen"] = fila_resumen["texto"] if fila_resumen else ""
-
-            # Últimos turnos conversacionales
-            turnos = con.execute("""
-                SELECT fecha, rol, texto, sesion_id, tema
-                FROM conversaciones
-                ORDER BY id DESC
-                LIMIT ?
-            """, (MAX_HISTORIAL_RAM,)).fetchall()
-            mem["conversacion"] = [
-                {
-                    "rol":       t["rol"],
-                    "texto":     t["texto"],
-                    "fecha":     t["fecha"],
-                    "sesion_id": t["sesion_id"],
-                    "tema":      t["tema"],
-                }
-                for t in reversed(turnos)
-            ]
-
-            # Últimos comandos
-            cmds = con.execute("""
-                SELECT fecha, orden, cmd, sesion_id
-                FROM comandos
-                ORDER BY id DESC
-                LIMIT 50
-            """).fetchall()
-            mem["historial_comandos"] = [
-                {
-                    "orden":     c["orden"],
-                    "cmd":       c["cmd"],
-                    "fecha":     c["fecha"],
-                    "sesion_id": c["sesion_id"],
-                }
-                for c in reversed(cmds)
-            ]
+        data = memoria_store.cargar()
+        mem["core"] = dict(data["core"])
+        mem["resumen"] = data["resumen"].get("texto", "")
+        mem["conversacion"] = [
+            {"rol": t.get("rol", ""), "texto": t.get("texto", ""),
+             "fecha": t.get("fecha", ""), "sesion_id": t.get("sesion_id", ""),
+             "tema": t.get("tema", "")}
+            for t in data["conversaciones"][-MAX_HISTORIAL_RAM:]
+        ]
+        mem["historial_comandos"] = [
+            {"orden": c.get("orden", ""), "cmd": c.get("cmd", ""),
+             "fecha": c.get("fecha", ""), "sesion_id": c.get("sesion_id", "")}
+            for c in data["comandos"][-50:]
+        ]
     except Exception as e:
         print(f"[MEMORIA] Error cargando memoria: {e}")
-
     return normalizar_mem(mem)
 
 
@@ -335,15 +217,19 @@ def registrar_turno(
     tema: str = "",
     proyecto: str = "",
 ) -> None:
-    """Registra un turno en DB y en el dict RAM."""
-    texto = texto[:MAX_TEXTO]
+    """Registra un turno en el store JSON y en el dict RAM."""
+    texto = str(texto)[:MAX_TEXTO]
     fecha = datetime.now().isoformat()
     try:
-        with _db() as con:
-            con.execute("""
-                INSERT INTO conversaciones (fecha, rol, texto, sesion_id, tema, proyecto)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (fecha, rol, texto, sesion_id, tema, proyecto))
+        data = memoria_store.cargar()
+        data["conversaciones"].append({
+            "id": memoria_store.proximo_id(data, "conversaciones"),
+            "fecha": fecha, "rol": str(rol), "texto": texto,
+            "sesion_id": str(sesion_id or ""), "tema": str(tema or ""),
+            "proyecto": str(proyecto or ""),
+        })
+        data["conversaciones"] = data["conversaciones"][-memoria_store.MAX_TURNOS_JSON:]
+        memoria_store.guardar(data)
         print(f"[MEMORIA] Turno guardado | rol={rol} | tema={tema} | texto={texto[:40]}...")
     except Exception as e:
         print(f"[MEMORIA] Error registrando turno: {e}")
@@ -367,22 +253,24 @@ def registrar_comando(
     sesion_id: str = "",
     exitoso: bool = True,
 ) -> None:
-    """Registra un comando shell en DB y en el dict RAM."""
-    cmd   = cmd[:MAX_TEXTO]
-    orden = orden[:MAX_TEXTO]
+    """Registra un comando shell en el store JSON y en el dict RAM."""
+    cmd   = str(cmd)[:MAX_TEXTO]
+    orden = str(orden)[:MAX_TEXTO]
     fecha = datetime.now().isoformat()
     try:
-        with _db() as con:
-            con.execute("""
-                INSERT INTO comandos (fecha, orden, cmd, sesion_id, exitoso)
-                VALUES (?, ?, ?, ?, ?)
-            """, (fecha, orden, cmd, sesion_id, int(exitoso)))
+        data = memoria_store.cargar()
+        data["comandos"].append({
+            "id": memoria_store.proximo_id(data, "comandos"),
+            "fecha": fecha, "orden": orden, "cmd": cmd,
+            "sesion_id": str(sesion_id or ""), "exitoso": bool(exitoso),
+        })
+        data["comandos"] = data["comandos"][-memoria_store.MAX_COMANDOS_JSON:]
+        memoria_store.guardar(data)
     except Exception as e:
         print(f"[MEMORIA] Error registrando comando: {e}")
 
     mem["historial_comandos"].append({
-        "orden": orden, "cmd": cmd,
-        "fecha": fecha, "sesion_id": sesion_id,
+        "orden": orden, "cmd": cmd, "fecha": fecha, "sesion_id": sesion_id,
     })
     mem["historial_comandos"] = mem["historial_comandos"][-50:]
 
@@ -395,13 +283,21 @@ def guardar_recuerdo(
     categoria: str = "",
     importancia: int = 1,
 ) -> None:
-    """Guarda un hecho permanente en recuerdos."""
+    """Guarda un hecho permanente en recuerdos (store JSON)."""
+    contenido = str(contenido or "").strip()[:MAX_TEXTO]
+    if not contenido:
+        print("[MEMORIA] Recuerdo vacío: no se guarda.")
+        return
     try:
-        with _db() as con:
-            con.execute("""
-                INSERT INTO recuerdos (fecha, categoria, contenido, importancia)
-                VALUES (?, ?, ?, ?)
-            """, (datetime.now().isoformat(), categoria, contenido[:MAX_TEXTO], importancia))
+        data = memoria_store.cargar()
+        data["recuerdos"].append({
+            "id": memoria_store.proximo_id(data, "recuerdos"),
+            "fecha": datetime.now().isoformat(),
+            "categoria": str(categoria or "").strip(),
+            "contenido": contenido,
+            "importancia": max(1, min(int(importancia), 10)),
+        })
+        memoria_store.guardar(data)
     except Exception as e:
         print(f"[MEMORIA] Error guardando recuerdo: {e}")
 
@@ -411,129 +307,113 @@ def obtener_recuerdos(
     importancia_min: int = 1,
     limit: int = 20,
 ) -> list[dict]:
-    """Lee recuerdos filtrando por categoría e importancia mínima."""
+    """Recuerdos filtrados por categoría e importancia mínima (orden: más
+    importantes primero, y a igualdad los más recientes)."""
     try:
-        with _db() as con:
-            if categoria:
-                filas = con.execute("""
-                    SELECT fecha, categoria, contenido, importancia
-                    FROM recuerdos
-                    WHERE categoria = ? AND importancia >= ?
-                    ORDER BY importancia DESC, id DESC
-                    LIMIT ?
-                """, (categoria, importancia_min, limit)).fetchall()
-            else:
-                filas = con.execute("""
-                    SELECT fecha, categoria, contenido, importancia
-                    FROM recuerdos
-                    WHERE importancia >= ?
-                    ORDER BY importancia DESC, id DESC
-                    LIMIT ?
-                """, (importancia_min, limit)).fetchall()
-            return [dict(f) for f in filas]
+        recs = [r for r in memoria_store.cargar()["recuerdos"]
+                if int(r.get("importancia") or 1) >= int(importancia_min)
+                and (not categoria or r.get("categoria", "") == categoria)]
+        recs.sort(key=lambda r: (-int(r.get("importancia") or 1),
+                                 -int(r.get("id") or 0)))
+        return recs[:max(1, int(limit))]
     except Exception as e:
         print(f"[MEMORIA] Error leyendo recuerdos: {e}")
         return []
 
 
+def borrar_recuerdo(recuerdo_id: int) -> bool:
+    """Borra un recuerdo por id. True si existía (botón de la Web UI)."""
+    try:
+        data = memoria_store.cargar()
+        rid = int(recuerdo_id)
+        antes = len(data["recuerdos"])
+        data["recuerdos"] = [r for r in data["recuerdos"]
+                             if int(r.get("id") or -1) != rid]
+        if len(data["recuerdos"]) == antes:
+            return False
+        memoria_store.guardar(data)
+        return True
+    except Exception as e:
+        print(f"[MEMORIA] Error borrando recuerdo {recuerdo_id}: {e}")
+        return False
+
+
 # ══════════════════════════════════════════════════════════════════════
-# RECUPERACIÓN POR RELEVANCIA (para el Context Manager)
+# RECUPERACIÓN POR RELEVANCIA / SESIONES (Context Manager, Web UI, TUI)
 # ══════════════════════════════════════════════════════════════════════
 def obtener_turnos_por_tema(tema: str, sesion_id: str = "", limit: int = 10) -> list[dict]:
-    """
-    Recupera turnos anteriores del mismo tema (para contexto relevante).
-
-    Si se pasa sesion_id, filtra SOLO turnos de esa sesión (evita que
-    contexto de sesiones viejas con el mismo tema contamine la actual).
-    Sin sesion_id, mantiene el comportamiento legacy (busca en todo el historial).
-    """
+    """Turnos anteriores del mismo tema. Si se pasa sesion_id, filtra SOLO
+    turnos de esa sesión (evita contaminar el contexto con sesiones viejas)."""
     try:
-        with _db() as con:
-            if sesion_id:
-                filas = con.execute("""
-                    SELECT fecha, rol, texto, sesion_id
-                    FROM conversaciones
-                    WHERE tema = ? AND sesion_id = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                """, (tema, sesion_id, limit)).fetchall()
-            else:
-                filas = con.execute("""
-                    SELECT fecha, rol, texto, sesion_id
-                    FROM conversaciones
-                    WHERE tema = ?
-                    ORDER BY id DESC
-                    LIMIT ?
-                """, (tema, limit)).fetchall()
-            return [dict(f) for f in reversed(filas)]
+        turnos = memoria_store.cargar()["conversaciones"]
+        filas = [t for t in turnos if t.get("tema") == tema]
+        if sesion_id:
+            filas = [t for t in filas if t.get("sesion_id") == sesion_id]
+        filas = filas[-max(1, int(limit)):]
+        return [
+            {"fecha": t.get("fecha", ""), "rol": t.get("rol", ""),
+             "texto": t.get("texto", ""), "sesion_id": t.get("sesion_id", "")}
+            for t in filas
+        ]
     except Exception as e:
         print(f"[MEMORIA] Error buscando turnos por tema: {e}")
         return []
 
+
 def obtener_turnos_por_sesion(sesion_id: str) -> list[dict]:
-    """Recupera todos los turnos de una sesión específica."""
+    """Todos los turnos de una sesión, en orden cronológico."""
     try:
-        with _db() as con:
-            filas = con.execute("""
-                SELECT fecha, rol, texto, tema
-                FROM conversaciones
-                WHERE sesion_id = ?
-                ORDER BY id ASC
-            """, (sesion_id,)).fetchall()
-            return [dict(f) for f in filas]
+        filas = [t for t in memoria_store.cargar()["conversaciones"]
+                 if t.get("sesion_id") == sesion_id]
+        return [
+            {"fecha": t.get("fecha", ""), "rol": t.get("rol", ""),
+             "texto": t.get("texto", ""), "tema": t.get("tema", "")}
+            for t in filas
+        ]
     except Exception as e:
         print(f"[MEMORIA] Error buscando sesión: {e}")
         return []
 
 
 def obtener_ultimos_turnos(n: int = 5) -> list[dict]:
-    """Últimos N turnos sin filtro (para debug o fallback)."""
+    """Últimos N turnos sin filtro (debug/fallback)."""
     try:
-        with _db() as con:
-            filas = con.execute("""
-                SELECT fecha, rol, texto, tema, sesion_id
-                FROM conversaciones
-                ORDER BY id DESC
-                LIMIT ?
-            """, (n,)).fetchall()
-            return [dict(f) for f in reversed(filas)]
+        filas = memoria_store.cargar()["conversaciones"][-max(1, int(n)):]
+        return [
+            {"fecha": t.get("fecha", ""), "rol": t.get("rol", ""),
+             "texto": t.get("texto", ""), "tema": t.get("tema", ""),
+             "sesion_id": t.get("sesion_id", "")}
+            for t in filas
+        ]
     except Exception as e:
         print(f"[MEMORIA] Error leyendo últimos turnos: {e}")
         return []
 
 
 def listar_sesiones(limit: int = 15) -> list[dict]:
-    """
-    Resumen de las últimas `limit` sesiones distintas (para el comando
-    '/sesiones' de la TUI): sesion_id, fecha de inicio, cantidad de turnos,
-    y un preview del primer mensaje de usuario para identificarlas de un
-    vistazo sin tener que abrirlas.
-    """
+    """Resumen de las últimas `limit` sesiones distintas: sesion_id, fecha de
+    inicio, cantidad de turnos y preview del primer mensaje del usuario.
+    (Equivale a /sesiones de la TUI y al sidebar de la Web UI.)"""
     try:
-        with _db() as con:
-            filas = con.execute("""
-                SELECT sesion_id, MIN(fecha) AS inicio, COUNT(*) AS turnos
-                FROM conversaciones
-                WHERE sesion_id != ''
-                GROUP BY sesion_id
-                ORDER BY inicio DESC
-                LIMIT ?
-            """, (limit,)).fetchall()
-
-            resultado = []
-            for f in filas:
-                primer = con.execute("""
-                    SELECT texto FROM conversaciones
-                    WHERE sesion_id = ? AND rol = 'usuario'
-                    ORDER BY id ASC LIMIT 1
-                """, (f["sesion_id"],)).fetchone()
-                resultado.append({
-                    "sesion_id": f["sesion_id"],
-                    "inicio":    f["inicio"],
-                    "turnos":    f["turnos"],
-                    "preview":   (primer["texto"][:60] if primer and primer["texto"] else ""),
-                })
-            return resultado
+        agrupadas: dict[str, dict] = {}
+        for t in memoria_store.cargar()["conversaciones"]:
+            sid = t.get("sesion_id") or ""
+            if not sid:
+                continue
+            g = agrupadas.setdefault(sid, {"inicio": t.get("fecha", ""),
+                                           "turnos": 0, "preview": ""})
+            g["turnos"] += 1
+            if not t.get("fecha") or t["fecha"] < g["inicio"]:
+                g["inicio"] = t["fecha"]
+            if not g["preview"] and t.get("rol") == "usuario" and t.get("texto"):
+                g["preview"] = str(t["texto"])[:60]
+        sesiones = [
+            {"sesion_id": sid, "inicio": g["inicio"],
+             "turnos": g["turnos"], "preview": g["preview"]}
+            for sid, g in agrupadas.items()
+        ]
+        sesiones.sort(key=lambda s: s["inicio"], reverse=True)
+        return sesiones[:max(1, min(int(limit), 50))]
     except Exception as e:
         print(f"[MEMORIA] Error listando sesiones: {e}")
         return []
@@ -547,15 +427,6 @@ def guardar_memoria(mem: dict) -> None:
     Stub de compatibilidad.
     Algunos nodos viejos del grafo siguen importando `guardar_memoria`,
     pero ya no hace falta: cada escritura (registrar_turno / registrar_comando
-    / actualizar_core / guardar_recuerdo) persiste al instante.
+    / actualizar_core / guardar_recuerdo) persiste al instante en el JSON.
     """
-    # Intencionalmente vacío: la persistencia ya es inmediata.
     return None
-
-
-# ══════════════════════════════════════════════════════════════════════
-# COMPATIBILIDAD LEGACY (para engine_bridge, backend, etc.)
-# ══════════════════════════════════════════════════════════════════════
-def inicializar_db() -> None:
-    """Alias de compatibilidad. Llama a asegurar_esquema()."""
-    asegurar_esquema()

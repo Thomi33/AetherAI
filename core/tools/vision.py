@@ -41,7 +41,7 @@ def ver_pantalla(
     - grim instalado (pacman -S grim)
     - Un modelo multimodal en Ollama (el modelo principal configurado)
     """
-    screenshot = "/tmp/javier_vision.png"
+    screenshot = "/tmp/aether_vision.png"
 
     try:
         # Detectar monitor activo en Hyprland

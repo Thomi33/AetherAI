@@ -46,6 +46,7 @@ class ConfigValidator:
     VALID_NUM_PREDICT_RANGE = (1, 65536)
     VALID_TIMEOUT_RANGE = (10, 300)
     VALID_CTX_RANGE = (4096, 262144)
+    VALID_MAX_TURNOS_RANGE = (0, 1000)
 
     @staticmethod
     def validate_mode(value: Any) -> bool:
@@ -64,6 +65,14 @@ class ConfigValidator:
         try:
             val = int(value)
             return ConfigValidator.VALID_CTX_RANGE[0] <= val <= ConfigValidator.VALID_CTX_RANGE[1]
+        except (ValueError, TypeError):
+            return False
+
+    @staticmethod
+    def validate_max_turnos(value: Any) -> bool:
+        try:
+            val = int(value)
+            return ConfigValidator.VALID_MAX_TURNOS_RANGE[0] <= val <= ConfigValidator.VALID_MAX_TURNOS_RANGE[1]
         except (ValueError, TypeError):
             return False
 
@@ -170,9 +179,9 @@ class ConfigManager:
         "TOOL_CALLING_NATIVO": ConfigValidator.validate_bool,
         "TIMEOUT_CMD": ConfigValidator.validate_timeout,
         "NUM_CTX": ConfigValidator.validate_num_ctx,
-        "MAX_TURNOS_CONTEXTO": ConfigValidator.validate_num_ctx,
-        "MAX_TURNOS_CONTEXTO_PLAN": ConfigValidator.validate_num_ctx,
-        "MAX_TURNOS_CONTEXTO_CHAT": ConfigValidator.validate_num_ctx,
+        "MAX_TURNOS_CONTEXTO": ConfigValidator.validate_max_turnos,
+        "MAX_TURNOS_CONTEXTO_PLAN": ConfigValidator.validate_max_turnos,
+        "MAX_TURNOS_CONTEXTO_CHAT": ConfigValidator.validate_max_turnos,
         "OLLAMA_KEEP_ALIVE": ConfigValidator.validate_keep_alive,
         "OLLAMA_GEN_OPTIONS": lambda x: isinstance(x, dict),
         "OLLAMA_NUM_PARALLEL": lambda x: isinstance(x, int) and x > 0,
@@ -196,14 +205,27 @@ class ConfigManager:
         "STT_VENV_PYTHON": lambda x: isinstance(x, str),
         "AUDIO_INPUT_MATCH": ConfigValidator.validate_string,
         "STT_VOCAB_HINT": lambda x: isinstance(x, str),
-        # ── SYSTEM PROMPT EDITABLE SIN TOCAR CÓDIGO ──
-        # Lo consumen core/agent/prompts.py (construir_backstory /
-        # construir_persona_sintesis). Se ajustan desde la TUI (/prompt, /set),
-        # desde la Web UI (API /api/system-prompt) o editando config.json.
-        # "" (vacío) = desactivado, se usa el prompt por defecto del código.
+        # ── SYSTEM PROMPT POR CAPAS (ver el bloque de core/agent/prompts.py) ──
+        # BEHAVIOR es la casilla principal ("solo comportamiento conversacional").
+        # EXTRA / SINTESIS_EXTRA / OVERRIDE son claves legadas que ahora se
+        # suman como capa de comportamiento: ninguna REEMPLAZA las
+        # instrucciones internas ni el comportamiento predeterminado.
+        "SYSTEM_PROMPT_BEHAVIOR": lambda x: isinstance(x, str),
         "SYSTEM_PROMPT_OVERRIDE": lambda x: isinstance(x, str),
         "SYSTEM_PROMPT_EXTRA": lambda x: isinstance(x, str),
         "SYSTEM_PROMPT_SINTESIS_EXTRA": lambda x: isinstance(x, str),
+        # ── RUNTIME EDITABLE (TUI /effort y /agents; Web UI /api/effort y
+        # /api/agent). EFFORT persiste el último nivel elegido; el mapeo a
+        # TEMPERATURE/NUM_CTX/NUM_PREDICT lo aplica quien lo setea (mismo mapa
+        # en tui/app.py y backend/api/routes/runtime_routes.py).
+        "EFFORT": lambda x: x in ("low", "medium", "high", "max"),
+        # Nativos (build/plan) + custom (kebab-case lowercase, ver
+        # runtime_routes._RE de agentes). Antes solo aceptaba build/plan y los
+        # agentes custom no se podían activar ("no hacía nada").
+        "AGENTE": lambda x: (
+            isinstance(x, str)
+            and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", x) is not None
+        ),
     }
 
     DEFAULTS: Dict[str, Any] = {
@@ -246,17 +268,21 @@ class ConfigManager:
             "VLSM, subnetting, ydotool, faster-whisper, SQLite, "
             "consolidator, AudioBox USB 96, CrewAI."
         ),
-        # ── SYSTEM PROMPT EDITABLE SIN TOCAR CÓDIGO ──
-        # SYSTEM_PROMPT_OVERRIDE: si no está vacío, REEMPLAZA la persona/por
-        #   defecto construida en código (el contexto de memoria y las skills
-        #   se agregan igual para no romper el agente).
-        # SYSTEM_PROMPT_EXTRA: instrucciones extra que se agregan AL FINAL de
-        #   TODO system prompt (ejecución y síntesis). Máxima prioridad.
-        # SYSTEM_PROMPT_SINTESIS_EXTRA: extra solo para la persona de síntesis
-        #   (node_plan_synthesizer), además de SYSTEM_PROMPT_EXTRA.
+        # ── SYSTEM PROMPT POR CAPAS (ver core/agent/prompts.py) ──
+        # SYSTEM_PROMPT_BEHAVIOR: la casilla principal — comportamiento
+        #   conversacional del usuario (personalidad/tono/estilo), capa que
+        #   NO puede pisar ni las instrucciones internas ni la personalidad
+        #   predeterminada de Aether.
+        # OVERRIDE/EXTRA/SINTESIS_EXTRA: legado — se suman como capa de
+        #   comportamiento; OVERRIDE ya NO reemplaza el prompt completo.
+        "SYSTEM_PROMPT_BEHAVIOR": "",
         "SYSTEM_PROMPT_OVERRIDE": "",
         "SYSTEM_PROMPT_EXTRA": "",
         "SYSTEM_PROMPT_SINTESIS_EXTRA": "",
+        # ── RUNTIME EDITABLE (TUI /effort y /agents; Web UI /api/effort y
+        # /api/agent). Persisten la última elección para compartir estado.
+        "EFFORT": "medium",
+        "AGENTE": "build",
     }
 
     def __init__(self, config_path: Optional[Path] = None):

@@ -164,7 +164,7 @@ def calentar_modelo() -> None:
 
 def obtener_historial_para_mostrar(n: int = 50) -> list[dict]:
     """
-    Trae los últimos N turnos guardados en current.db para mostrarlos al
+    Trae los últimos N turnos guardados en el store JSON para mostrarlos al
     abrir la TUI. No filtra por sesion_id: cada corrida de la TUI genera
     una sesión nueva (ver arriba), así que filtrar por la sesión actual
     siempre daría una lista vacía. Esto es solo para continuidad visual

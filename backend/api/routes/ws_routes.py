@@ -37,7 +37,7 @@ from backend.core.aether_service import (
     DoneEvent,
     ErrorEvent,
 )
-from backend.api.routes.chat import _delta_front
+from backend.api.routes.chat import _delta_front, _preparar_orden
 from core.utils.response_cleaner import limpiar_respuesta_chat
 from tui.status_messages import real_state_for_node
 
@@ -107,8 +107,10 @@ async def ws_chat(ws: WebSocket):
                 request_cancel()
                 await ws.send_json({"type": "stopped"})
                 continue
-            mensaje = (data.get("message") or data.get("content") or "").strip()
-            if not mensaje:
+            # Visión/IO fuera del event loop (ver chat.py /chat/stream).
+            mensaje, _metas = await asyncio.get_running_loop().run_in_executor(
+                None, _preparar_orden, data)
+            if not mensaje.strip():
                 await ws.send_json(
                     {"type": "error", "message": "Mandá {'message': 'texto'}"}
                 )

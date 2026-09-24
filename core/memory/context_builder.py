@@ -35,6 +35,56 @@ _TEMAS_SIN_COMANDOS = {"chat", "text", "memory", "web", ""}
 MAX_RECUERDOS     = 10
 
 
+_PRONOMBRES_POR_GENERO = {
+    "hombre": "él/lo/suyo (masculino)",
+    "mujer": "ella/la/suya (femenino)",
+    "no_binario": "elle/le/sue (neutro)",
+}
+
+
+def _lineas_perfil_cuenta() -> list[str]:
+    """Datos del perfil de Account (config ACCOUNT_PROFILE) para el contexto.
+
+    - género → pronombres: el agente se dirige al usuario con esos
+      pronombres (masculino/femenino/neutro/pronombre a elección).
+    - fecha de nacimiento: solo es relevante si HOY es su cumpleaños
+      (en ese caso se le pide al agente que lo salude).
+    - El avatar NUNCA entra al contexto: es decoración de la UI.
+    """
+    try:
+        from core.config.config_manager import get_config_manager
+        perfil = get_config_manager().get("ACCOUNT_PROFILE", {}) or {}
+    except Exception:
+        return []
+
+    lineas: list[str] = []
+    genero = str(perfil.get("genero") or "").strip().lower()
+    if genero:
+        pronombres = _PRONOMBRES_POR_GENERO.get(
+            genero, str(perfil.get("pronombre_custom") or "").strip())
+        if pronombres:
+            lineas.append(
+                f"  pronombres: {pronombres} — dirigite a la persona "
+                "usando esos pronombres, siempre")
+    fecha_nac = str(perfil.get("fecha_nacimiento") or "").strip()
+    if fecha_nac:
+        try:
+            from datetime import date
+            nacimiento = date.fromisoformat(fecha_nac)
+            hoy = date.today()
+            if (nacimiento.month, nacimiento.day) == (hoy.month, hoy.day):
+                lineas.append(
+                    "  ¡HOY ES SU CUMPLEAÑOS! Saludalo/a/e por su cumpleaños "
+                    "de forma cálida y natural en tu primera respuesta.")
+            else:
+                lineas.append(
+                    f"  fecha de nacimiento: {fecha_nac} (no la menciones; "
+                    "solo importa el día de su cumpleaños)")
+        except ValueError:
+            pass
+    return lineas
+
+
 # ══════════════════════════════════════════════════════════════════════
 # BUILDER PRINCIPAL
 # ══════════════════════════════════════════════════════════════════════
@@ -92,16 +142,21 @@ def construir_contexto_memoria(
     # Compatibilidad útil: el perfil explícito sigue siendo más legible para
     # el modelo que inferir estos datos desde una conversación o resumen.
     prefs = mem.get("preferencias") or {}
+    perfil = []
     if prefs:
-        perfil = []
         if prefs.get("nombre_usuario"):
             perfil.append(f"  nombre: {prefs['nombre_usuario']}")
         if prefs.get("navegador"):
             perfil.append(f"  navegador: {prefs['navegador']}")
         if prefs.get("notas"):
             perfil.extend(f"  nota: {nota}" for nota in prefs["notas"][-10:] if nota)
-        if perfil:
-            slots["PERFIL DEL CREADOR"] = "\n".join(perfil)
+
+    # Perfil de Account (Settings → Account): género → pronombres con los que
+    # dirigirse al usuario, y fecha de nacimiento (relevante solo en su
+    # cumpleaños). El avatar NUNCA se inyecta: es solo para la UI.
+    perfil.extend(_lineas_perfil_cuenta())
+    if perfil:
+        slots["PERFIL DEL USUARIO"] = "\n".join(perfil)
 
     # ── Slot 1.5: RESUMEN acumulativo (rolling summary, siempre presente) ──
     # Fuente PRINCIPAL de memoria de largo plazo. A diferencia del historial

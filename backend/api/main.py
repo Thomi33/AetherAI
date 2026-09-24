@@ -6,7 +6,14 @@ Aether API — Backend revivido.
 - /api/config: lectura/escritura de config.json (configuración de la TUI).
 - /api/system-prompt: system prompt editable sin tocar código.
 - /api/sessions: historial de sesiones del runtime (/sesiones y /historial de la TUI).
+- /api/memory: resumen acumulativo y recuerdos (/memory de la TUI).
+- /api/skills: catálogo de skills (core/skills/registry.py).
+- /api/mcps: servers MCP (/mcps de la TUI) + alta de MCPs custom.
+- /api/effort y /api/agent: nivel de esfuerzo y agente activo (/effort, /agents).
+- /api/roblox: runtime autónomo de Roblox (/play-roblox).
+- /api/proyectos y /api/tareas: registros de workspace (~<BASE_AETHER>/*.json).
 - /ws/chat: WebSocket (socket único, multi-mensaje; mismo contrato de eventos).
+- /api/chat y /ws/chat aceptan "attachments" (imágenes/archivos en base64).
 - Sirve la Web UI (carpeta estática autodetectada, ver backend/core/config.py).
 """
 
@@ -24,6 +31,14 @@ from backend.api.routes import prompt_routes
 from backend.api.routes import models_routes
 from backend.api.routes import session_routes
 from backend.api.routes import ws_routes
+from backend.api.routes import memory_routes
+from backend.api.routes import skills_routes
+from backend.api.routes import mcp_routes
+from backend.api.routes import runtime_routes
+from backend.api.routes import roblox_routes
+from backend.api.routes import workspace_routes
+from backend.api.routes import account_routes
+from backend.api.routes import stt_routes
 
 # =====================================================================
 # LOGGING
@@ -82,6 +97,14 @@ app.include_router(config_routes.router, prefix="/api")
 app.include_router(prompt_routes.router, prefix="/api")
 app.include_router(models_routes.router, prefix="/api")
 app.include_router(session_routes.router, prefix="/api")
+app.include_router(memory_routes.router, prefix="/api")
+app.include_router(skills_routes.router, prefix="/api")
+app.include_router(mcp_routes.router, prefix="/api")
+app.include_router(runtime_routes.router, prefix="/api")
+app.include_router(roblox_routes.router, prefix="/api")
+app.include_router(workspace_routes.router, prefix="/api")
+app.include_router(account_routes.router, prefix="/api")
+app.include_router(stt_routes.router, prefix="/api")
 app.include_router(ws_routes.router)  # /ws/chat (websocket, sin prefijo /api)
 
 
@@ -100,6 +123,18 @@ async def health_check():
 @app.get("/api/status")
 async def api_status():
     return AetherService.get_status()
+
+
+# =====================================================================
+# AVATARES (Settings → Account) — servidos desde <BASE_AETHER>/avatars
+# =====================================================================
+try:
+    from backend.api.routes.account_routes import _AVATAR_DIR
+    _AVATAR_DIR.mkdir(parents=True, exist_ok=True)
+    app.mount("/avatars", StaticFiles(directory=str(_AVATAR_DIR)),
+              name="avatars")
+except Exception as _avatars_exc:  # nunca bloquear el arranque por avatares
+    logger.warning(f"⚠️ No se pudo montar /avatars: {_avatars_exc}")
 
 
 # =====================================================================

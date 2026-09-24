@@ -59,7 +59,7 @@ _WAV_HEADER_BYTES = 44
 def _stt_venv_python() -> Path:
     """
     Resuelve el intérprete del venv de STT, con posibilidad de override
-    desde config.json (útil si Thomas mueve el venv de lugar).
+    desde config.json (útil si el usuario mueve el venv de lugar).
     """
     try:
         from core.config.config_manager import get_config_manager
@@ -295,7 +295,7 @@ def transcribir_wav(wav_path: Path, idioma: str | None = "es") -> str:
     levanta SttNoDisponible.
 
     idioma="es" por default: fijarlo evita que faster-whisper pierda tiempo
-    en detección automática y reduce errores cuando Thomas alterna es/en a
+    en detección automática y reduce errores cuando el usuario alterna es/en a
     mitad de frase (code-switching, ya manejado igual del lado de
     faster-whisper con vad_filter). Pasar idioma=None para autodetección.
 

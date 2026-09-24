@@ -24,9 +24,8 @@ SLASH_COMMANDS = [
     ("/memory",    "Editar resumen de memoria"),
     ("/models",    "Switch model"),
     ("/play-roblox", "Iniciar Roblox; opcionalmente usar google u ollama"),
-    ("/prompt",    "System prompt sin tocar código"),
-    ("/new",       "New session"),
     ("/prompt",    "System prompt sin tocar código (extra/override/sintesis)"),
+    ("/new",       "New session"),
     ("/sesiones",  "List sessions"),
     ("/set",       "Set config value"),
     ("/themes",    "Switch theme"),
@@ -94,7 +93,14 @@ class SlashCompleter(Widget):
             return
 
         query = text.lower()
-        self._matches = [(cmd, desc) for cmd, desc in SLASH_COMMANDS if cmd.startswith(query)]
+        # Dedup por comando: ids derivan de cmd (sc-<cmd>) y duplicados
+        # rompen el DOM con DuplicateIds en Textual 8.x.
+        seen: set[str] = set()
+        self._matches = [
+            (cmd, desc)
+            for cmd, desc in SLASH_COMMANDS
+            if cmd.startswith(query) and not (cmd in seen or seen.add(cmd))
+        ]
 
         lv = self.query_one("#sc-list", ListView)
         await lv.clear()

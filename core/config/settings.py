@@ -73,7 +73,6 @@ MAX_STEPS_COMPUTER_USE = _config_value("MAX_STEPS_COMPUTER_USE", 8)
 
 TOOL_CALLING_NATIVO = _config_value("TOOL_CALLING_NATIVO", True)
 
-RUTA_DB          = BASE_AETHER / "db"          / "memoria.db"
 RUTA_LOGS        = BASE_AETHER / "logs"
 RUTA_SCREENSHOTS = BASE_AETHER / "screenshots"
 RUTA_EMBEDDINGS  = BASE_AETHER / "embeddings"
@@ -81,17 +80,12 @@ RUTA_BACKUPS     = BASE_AETHER / "backups"
 RUTA_NOTAS       = BASE_AETHER / "notes"
 
 # ─────────────────────────────────────────────────────────────────────
-# 🧠 SUBSISTEMA DE MEMORIA CONTROLADO (core/memory/store)
+# 🧠 MEMORIA — store JSON único (core/memory/memoria_store.py)
 # ─────────────────────────────────────────────────────────────────────
-# DB ÚNICA de producción + DBs auxiliares. Toda escritura va por la write-API
-# (core.memory.store) que valida con el guard de integridad y nunca cambia el
-# esquema implícitamente. RUTA_DB (memoria.db) queda SOLO como fuente legacy
-# para el importador de datos viejos.
+# NO hay SQLite: toda la memoria persistente vive en
+# <BASE_AETHER>/db/memoria.json (+ .bak rotativo). current.db (sqlite) solo
+# se lee UNA VEZ si existe, para la migración legacy automática del store.
 MEMORIA_DIR   = BASE_AETHER / "db"
-DB_CURRENT    = MEMORIA_DIR / "current.db"      # ← única DB de producción
-DB_STAGING    = MEMORIA_DIR / "staging.db"      # ← pruebas antes de producción
-SNAPSHOTS_DIR = MEMORIA_DIR / "snapshots"       # ← copias inmutables (rollback)
-BACKUPS_DIR   = MEMORIA_DIR / "backups"         # ← respaldos pre-rollback
 
 BASE_AETHER.mkdir(parents=True, exist_ok=True)
 RUTA_NOTAS.mkdir(parents=True, exist_ok=True)

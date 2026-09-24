@@ -428,12 +428,16 @@ class AetherApp(App):
         """
         /prompt — System prompt editable SIN tocar código, en caliente.
 
-        Subcomandos:
-          /prompt                        — estado actual (override/extra/sintesis)
-          /prompt extra <texto...>       — extra para TODOS los prompts
-          /prompt override <texto...>    — reemplaza la persona por defecto
+        Subcomandos (arquitectura de capas: las instrucciones internas del
+          agente y la personalidad base de Aether NO se pueden pisar — todo
+          lo que se escribe acá es una capa de COMPORTAMIENTO encima de eso):
+          /prompt                        — estado actual (behavior/extra/sintesis)
+          /prompt behavior <texto...>    — personalidad/tono/estilo (la casilla)
+          /prompt extra <texto...>       — legado: otra capa de comportamiento
+          /prompt override <texto...>    — LEGADO: antes reemplazaba el prompt;
+                                           ahora también es solo comportamiento
           /prompt sintesis <texto...>    — extra solo para la persona de síntesis
-          /prompt clear [extra|override|sintesis|all]
+          /prompt clear [behavior|extra|override|sintesis|all]
           /prompt preview                — muestra el system prompt final real
         """
         from core.config.config_manager import get_config_manager
@@ -441,6 +445,7 @@ class AetherApp(App):
         config = get_config_manager()
 
         claves = {
+            "behavior": "SYSTEM_PROMPT_BEHAVIOR",
             "extra": "SYSTEM_PROMPT_EXTRA",
             "override": "SYSTEM_PROMPT_OVERRIDE",
             "sintesis": "SYSTEM_PROMPT_SINTESIS_EXTRA",
@@ -448,15 +453,21 @@ class AetherApp(App):
         sub = partes[1].lower() if len(partes) > 1 else ""
 
         if sub in ("", "show", "ver"):
-            lineas = ["System prompt configurable (config.json — sin tocar código):"]
+            lineas = [
+                "System prompt por capas (config.json — sin tocar código):",
+                "  Las instrucciones internas del agente y la personalidad base",
+                "  de Aether NO se reemplazan; todo esto son capas de",
+                "  comportamiento conversacional encima de ellas.",
+            ]
             for nombre, clave in claves.items():
                 valor = config.get(clave, "") or ""
                 estado = "ACTIVO" if valor.strip() else "vacío (default del código)"
-                lineas.append(f"  {nombre:9} [{clave}] = {estado}")
+                nota = " (la casilla principal)" if nombre == "behavior" else ""
+                lineas.append(f"  {nombre:9} [{clave}] = {estado}{nota}")
                 if valor.strip():
                     lineas.append(f"    → {valor}")
             lineas.append(
-                "Uso: /prompt extra <texto> · /prompt override <texto> · "
+                "Uso: /prompt behavior <texto> · /prompt extra <texto> · "
                 "/prompt sintesis <texto> · /prompt clear [cual] · /prompt preview"
             )
             chat_panel.agregar_mensaje("\n".join(lineas), "assistant")

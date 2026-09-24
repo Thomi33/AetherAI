@@ -69,7 +69,11 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     "vision": {
         "node": "node_vision",
         "instruccion_requerida": False,  # puede capturar pantalla sin instrucción explícita
-        "descripcion": "Capturar la pantalla y analizar su contenido.",
+        "descripcion": (
+            "Analizar una IMAGEN: un archivo adjunto del usuario (pasando "
+            "'path' con la ruta del archivo) o la pantalla actual (captura "
+            "del monitor) si no hay archivo."
+        ),
     },
     "codigo": {
         "node": "node_codigo",
@@ -116,6 +120,16 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
             "Limpiar/extraer el contenido pedido por el usuario a partir del "
             "resultado crudo de un paso anterior (descarta metadatos de "
             "búsqueda, HTML sin decodificar y relleno conversacional)."
+        ),
+    },
+    # ── Sub-agentes (paralelización de tareas) ──
+    "subagent": {
+        "node": "node_subagent",
+        "instruccion_requerida": True,
+        "descripcion": (
+            "Lanzar sub-agentes aislados para tareas paralelas. "
+            "Args: {tareas: [string, ...]} o {tarea: string}. "
+            "Cada sub-agente tiene su propio contexto y devuelve su resultado."
         ),
     },
     "mcp": {
@@ -212,7 +226,12 @@ TOOL_PARAMETROS: dict[str, dict] = {
     "vision": {
         "type": "object",
         "properties": {
-            "instruccion": {"type": "string", "description": "Qué mirar/analizar en la pantalla (opcional)."},
+            "instruccion": {"type": "string", "description": "Qué mirar/analizar (opcional)."},
+            "path": {"type": "string", "description": (
+                "Ruta absoluta de la imagen adjunta a describir "
+                "(png/jpg/jpeg/webp/gif/bmp/tiff). Si se indica, se analiza "
+                "ese archivo en vez de capturar la pantalla."
+            )},
         },
         "required": [],
     },
@@ -370,7 +389,7 @@ def _instruccion_de_paso(paso: dict) -> str:
     """
     Extrae la instrucción de un paso, aceptando varias ubicaciones por
     compatibilidad: top-level 'instruccion', o dentro de 'args'
-    (instruccion/query/command/app).
+    (instruccion/query/command/app/tarea/tareas).
     """
     if not isinstance(paso, dict):
         return ""
@@ -378,7 +397,7 @@ def _instruccion_de_paso(paso: dict) -> str:
         return paso["instruccion"].strip()
     args = paso.get("args")
     if isinstance(args, dict):
-        for clave in ("instruccion", "query", "command", "app", "orden"):
+        for clave in ("instruccion", "query", "command", "app", "orden", "tarea", "tareas"):
             val = args.get(clave)
             if isinstance(val, str) and val.strip():
                 return val.strip()

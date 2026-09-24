@@ -236,6 +236,27 @@ def _system_prompt(mem: dict, state: "AetherState | None" = None) -> str:
     return construir_backstory(contexto)
 
 
+def _system_prompt_agent_loop(mem: dict, state: "AetherState | None" = None) -> str:
+    """System prompt del agent loop: tool calling NATIVO, sin protocolo [SHELL].
+
+    Backstory (vía _system_prompt) está pensado para los nodos que GENERAN
+    comandos en formato texto ([SHELL]...[/SHELL]); usarlo en el agent loop
+    enseñaba al modelo a emitir texto legado en vez de tool calls nativas —
+    de ahí los 'el modelo usó el formato de texto; convitiendo...' en cada
+    paso y las pseudo-llamadas vision("...") anidadas dentro de shell.
+    """
+    from core.agent.prompts import construir_prompt_agent_loop
+
+    if state is not None:
+        slots = state.get("context_slots") or {}
+        contexto = slots.get("contexto", "")
+        if contexto:
+            return construir_prompt_agent_loop(contexto)
+
+    contexto = construir_contexto_memoria(mem)
+    return construir_prompt_agent_loop(contexto)
+
+
 def _system_prompt_sintesis(mem: dict, state: "AetherState | None" = None) -> str:
     """
     System prompt para node_plan_synthesizer: reporta resultados, no ejecuta.
@@ -530,7 +551,12 @@ Respuesta:"""
         return False
 
     # Aceptamos varias formas robustas que el modelo puede devolver.
-    if raw.startswith("si") or raw.startswith("sí") or "si" == raw or "yes" in raw:
+    # IMPORTANTE: comparar por PALABRA (\b), no por prefijo crudo. El check
+    # anterior (raw.startswith("si")) daba falsos positivos con respuestas
+    # que arrancan con "sin ..." ("sin duda es autosuficiente", "sin contexto
+    # previo no se sabe") — "sin" empieza con "si" y la orden se trataba como
+    # anafórica, desviando el flujo a resolución de referencias inexistente.
+    if re.match(r"^(sí|si|yes)\b", raw.strip().strip("\"'")):
         return True
     # Cualquier otra cosa (incluido "no", basura, explicaciones) → tratamos como no anafórica
     # para no quedarnos en un bucle de aclaraciones.
@@ -796,28 +822,49 @@ def node_planner(state: AetherState) -> dict:
                 cmd = ref.get("command")
                 if cmd:
                     cmd_clean = cmd.strip()
-                    is_likely_app = bool(re.match(r'^[a-zA-Z0-9\.-]+$', cmd_clean)) and len(cmd_clean.split()) <= 1
                     tema_prev = ref.get("tema", "")
                     last_lower = (ref.get("last_texto") or "").lower()
 
-                    if is_likely_app or tema_prev == "launch" or any(w in last_lower for w in ("lanza", "abre", "ejecuta", "flatpak", "jugar", "programa")):
-                        print(f"   └─ Referencia anafórica resuelta → launch: {cmd}")
-                        launch_instruccion = orden
-                        if cmd.strip().startswith("flatpak run "):
-                            parts = cmd.strip().split()
-                            if len(parts) >= 3:
-                                app_id = parts[2]
-                                launch_instruccion = f"ejecuta {app_id}"
+                    # Routing launch vs shell.
+                    #
+                    # Un comando con argumentos o sintaxis de shell (pipes,
+                    # redirecciones, paths, flags) NO es una app lanzable:
+                    # node_launch lo buscaría en flatpak por nombre ("pip
+                    # cache purge") y fallaría. El bug concreto: Aether decía
+                    # "ejecutá `pip cache purge`" y el usuario respondía
+                    # "dale" — "ejecuta" estaba en la lista de señales de
+                    # launch y el comando mult-token terminaba en node_launch.
+                    #
+                    # node_shell, en cambio, ejecuta correctamente TANTO
+                    # comandos como apps instaladas, así que es el default
+                    # seguro. Solo va a launch un nombre de app de UN token
+                    # cuando el turno previo tenía contexto de lanzamiento.
+                    tokens = cmd_clean.split()
+                    es_comando_shell = (
+                        len(tokens) > 1
+                        or any(c in cmd_clean for c in ("|", "&", ";", ">", "<", "/", "$"))
+                    )
+                    hay_contexto_launch = (
+                        tema_prev == "launch"
+                        or any(w in last_lower for w in ("lanza", "abre", "abri", "arranca", "inicia", "flatpak", "jugar", "programa"))
+                    )
+
+                    if not es_comando_shell and hay_contexto_launch:
+                        # Pasamos el nombre REAL extraído a node_launch
+                        # ("ejecuta sober") en vez de la orden cruda
+                        # ("ejecutalo"), para que no dependa de
+                        # mem['ultimo_lanzado'] para resolver la app.
+                        print(f"   └─ Referencia anafórica resuelta → launch: {cmd_clean}")
                         return _plan_activado(
-                            [{"tool": "launch", "instruccion": launch_instruccion, "args": {}}],
+                            [{"tool": "launch", "instruccion": f"ejecuta {cmd_clean}", "args": {}}],
                             orden, mem,
                         )
-                    else:
-                        print(f"   └─ Referencia anafórica resuelta → shell: {cmd}")
-                        return _plan_activado(
-                            [{"tool": "shell", "instruccion": orden, "args": {"command": cmd}}],
-                            orden, mem,
-                        )
+
+                    print(f"   └─ Referencia anafórica resuelta → shell: {cmd}")
+                    return _plan_activado(
+                        [{"tool": "shell", "instruccion": orden, "args": {"command": cmd}}],
+                        orden, mem,
+                    )
 
                 tema_prev = ref.get("tema", "")
                 last_texto = ref.get("last_texto") or ""
@@ -936,8 +983,9 @@ def node_planner(state: AetherState) -> dict:
     # qué usar -- incluyendo si hacía falta más de una, en qué orden, y qué
     # hacer si una falla. node_agent_loop es un self-loop en el grafo (ver
     # graph_builder.py) que corre hasta que el modelo devuelve una
-    # respuesta de texto en vez de una tool call -- sin límite de pasos
-    # fijado por código, el usuario corta desde la TUI si hace falta.
+    # respuesta de texto en vez de una tool call, o hasta llegar a
+    # MAX_AGENT_STEPS (configurable, default 6) — ese límite existe y es
+    # intencional: evita bucles infinitos de tool calling.
     #
     # NOTA: todo el bloque de abajo (detección por keywords, casos MCP/
     # single-tool/multi-tool/fallback) quedó inalcanzable tras este return.
@@ -1038,6 +1086,140 @@ def _llm_chat_agente(messages: list, tools: list, min_predict: int | None = None
     return {"content": msg.get("content", "") or "", "tool_calls": tool_calls}
 
 
+# ── Fallback: formato de herramientas por texto → tool call nativa ────────
+# El system prompt documenta el protocolo legado ([SHELL]...[/SHELL]), y
+# algunos modelos (p. ej. gemma4) lo imitan escribiendo [vision]...[/vision]
+# etc. en el CONTENT en vez de usar el tool calling nativo de Ollama. Sin
+# este fallback, la llamada quedaba como texto plano: el agent loop cerraba
+# con "Respuesta final tras 0 pasos" y la imagen/archivo nunca se procesaba.
+
+_LEGACY_BLOCK_RE = re.compile(
+    r"\[(?P<tool>[A-Za-z][\w-]*)\]\s*(?P<cuerpo>.*?)\s*\[/\s*(?P=tool)\s*\]",
+    re.DOTALL | re.IGNORECASE)
+
+# Bloque ABIERTO al final del contenido ("[vision]\n{...}" sin cierre porque
+# el modelo se quedó sin tokens o soltó un pseudo-token roto como
+# "<tool_call|>"). Solo se acepta si el cuerpo es JSON parseable.
+_LEGACY_OPEN_RE = re.compile(
+    r"\[(?P<tool>[A-Za-z][\w-]*)\]\s*(?P<cuerpo>\{.*)\s*$",
+    re.DOTALL | re.IGNORECASE)
+
+# Artefactos de pseudo-tokens de tool calling que algunos modelos dejan en
+# el texto final (templates mal renderizados por Ollama).
+_ARTEFACTO_TOOL_RE = re.compile(
+    r"<\s*/?\s*\|?\s*(tool_call|function|invoke|parameter)[^<>\n]*\|?\s*>?",
+    re.IGNORECASE)
+
+
+def _args_tool_legada(tool: str, cuerpo: str) -> dict:
+    """Args normalizados para una tool call legada. Prioriza JSON; si no,
+    usa el cuerpo plano como 'instruccion' (param de casi todas las tools)."""
+    texto = cuerpo.strip()
+    if texto.startswith("{"):
+        try:
+            args = json.loads(texto)
+            if isinstance(args, dict):
+                return args
+        except json.JSONDecodeError:
+            pass
+    return {"instruccion": texto}
+
+
+def _tool_calls_desde_texto(contenido: str) -> list[dict]:
+    """Convierte bloques [tool]...[/tool] del formato legado en tool calls.
+
+    Devuelve [] si no hay ninguna (o si los bloques no son tools válidas);
+    en ese caso el agent loop cierra con respuesta final como siempre.
+    """
+    from core.agent.tool_registry import TOOLS_VALIDAS
+    calls: list[dict] = []
+    if not contenido:
+        return calls
+    texto = _ARTEFACTO_TOOL_RE.sub("", contenido)
+    for m in _LEGACY_BLOCK_RE.finditer(texto):
+        tool = m.group("tool").lower().replace("-", "_")
+        if tool in TOOLS_VALIDAS:
+            cuerpo = m.group("cuerpo")
+            if cuerpo.strip():
+                args = _args_tool_legada(tool, cuerpo)
+                calls.append({"function": {"name": tool, "arguments": args}})
+    if calls:
+        return calls
+    # Bloque abierto al final (modelo cortado): una sola tool con JSON.
+    m = _LEGACY_OPEN_RE.search(texto)
+    if m:
+        tool = m.group(1).lower().replace("-", "_")
+        if tool in TOOLS_VALIDAS:
+            try:
+                args = json.loads(m.group("cuerpo").strip())
+                if isinstance(args, dict) and args:
+                    calls.append({"function": {"name": tool, "arguments": args}})
+            except json.JSONDecodeError:
+                pass
+    return calls
+
+
+def _limpiar_artefactos_tool_call(texto: str) -> str:
+    """Quita pseudo-tokens de tool calling colados en la respuesta final."""
+    if not texto:
+        return texto
+    limpio = _ARTEFACTO_TOOL_RE.sub("", texto)
+    return limpio.strip()
+
+
+_LLAMADA_ESCRITA_RE = re.compile(
+    r"^\s*([A-Za-z][\w-]*)\s*\(\s*[\"']?(.*?)[\"']?\s*\)\s*$", re.DOTALL)
+
+# Variantes sin paréntesis que los modelos también emiten (observadas en
+# producción): 'vision -- Imagen <path>', 'vision: {...}', 'vision ...'.
+_LLAMADA_ESTILO_CLI_RE = re.compile(
+    r"^\s*([A-Za-z][\w-]*)\s*(?:--|:|\n)\s*(.+)$", re.DOTALL)
+
+
+def _rescatar_llamada_confundida(tool: str, args: dict) -> tuple[str, dict]:
+    """El modelo a veces mete una tool DENTRO de otra: shell con
+    instruccion 'vision("Describe la imagen adjunta: ...")', 'vision -- ...'
+    o un JSON con la llamada anidada. shell la trata como comando y ejecuta
+    cualquier cosa (ej. `file <ruta>`, `cat <binario>`). Si la instrucción
+    arranca como otra tool del registro, se re-rutea a esa tool."""
+    if tool != "shell":
+        return tool, args
+    from core.agent.tool_registry import TOOLS_VALIDAS
+
+    instruccion = str((args or {}).get("instruccion", "") or "").strip()
+
+    # Variante JSON: la instrucción es ella misma un payload de tool call
+    # ({"instruccion": "vision(...)"}): desempaquetar un nivel.
+    if instruccion.startswith("{"):
+        try:
+            payload = json.loads(instruccion)
+        except (ValueError, TypeError):
+            payload = None
+        if isinstance(payload, dict):
+            interna = payload.get("instruccion")
+            if isinstance(interna, str) and interna.strip():
+                return _rescatar_llamada_confundida(
+                    "shell", {"instruccion": interna.strip()})
+
+    for patron in (_LLAMADA_ESCRITA_RE, _LLAMADA_ESTILO_CLI_RE):
+        m = patron.match(instruccion)
+        if not m:
+            continue
+        anidada = m.group(1).lower().replace("-", "_")
+        if anidada in TOOLS_VALIDAS and anidada != "shell":
+            cuerpo = str(m.group(2)).strip().strip("\"'")
+            if cuerpo:
+                return anidada, {"instruccion": cuerpo}
+    return tool, args
+
+
+def _firma_call(tool: str, args: dict) -> str:
+    try:
+        return tool + "|" + json.dumps(args or {}, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        return f"{tool}|{args}"
+
+
 def node_agent_loop(state: AetherState) -> dict:
     """
     Un paso del agent loop: el modelo ve el objetivo + todas las tools
@@ -1076,7 +1258,7 @@ def node_agent_loop(state: AetherState) -> dict:
 
     if not agent_messages:
         agent_messages = [
-            {"role": "system", "content": _system_prompt(mem, state)},
+            {"role": "system", "content": _system_prompt_agent_loop(mem, state)},
             {"role": "user", "content": orden},
         ]
         print("\n🔁 [AGENT LOOP]: Iniciando razonamiento con tool calling nativo...")
@@ -1096,9 +1278,19 @@ def node_agent_loop(state: AetherState) -> dict:
     tool_calls = respuesta.get("tool_calls") or []
     contenido  = (respuesta.get("content") or "").strip()
 
+    # Fallback: el modelo escribió las tool calls como TEXTO (formato
+    # legado o JSON suelto) en vez de usar el tool calling nativo. Se
+    # convierten y el loop sigue con herramientas reales.
+    if not tool_calls and contenido:
+        tool_calls = _tool_calls_desde_texto(contenido)
+        if tool_calls:
+            print(f"   └─ ⟲ [AGENT LOOP]: el modelo usó el formato de texto; "
+                  f"convitiendo {len(tool_calls)} tool call(s) a nativas.")
+
     # Sin tool calls → el modelo decidió que ya puede responder: fin del loop.
     if not tool_calls:
         _, texto_final = _parse_ornith_thinking(contenido)
+        texto_final = _limpiar_artefactos_tool_call(texto_final or contenido)
         print(f"   └─ [AGENT LOOP]: Respuesta final tras {len(agent_pasos_log)} paso(s) de tool calling.")
         return {
             "final_response": texto_final or contenido,
@@ -1120,13 +1312,81 @@ def node_agent_loop(state: AetherState) -> dict:
         tool = fn.get("name", "")
         args = fn.get("arguments", {}) or {}
 
+        # Rescate: el modelo anidó otra tool dentro de shell
+        # (p. ej. instruccion='vision("...")').
+        tool, args = _rescatar_llamada_confundida(tool, args)
+
+        # ── Tool 'text' = respuesta final directa (CIERRE del loop) ──────
+        # El modelo a veces "llama" a text con la respuesta completa ya
+        # escrita en instruccion. Ejecutarla como paso normal la devolvía
+        # como resultado de tool y el modelo respondía DE NUEVO con otra
+        # llamada a text → bucle hasta MAX_AGENT_STEPS y una respuesta
+        # final duplicada/concatenada (bug real en producción).
+        if tool == "text":
+            respuesta_directa = _limpiar_artefactos_tool_call(
+                str((args or {}).get("instruccion") or "")).strip()
+            if len(respuesta_directa) >= 20:
+                print(f"   └─ [AGENT LOOP]: respuesta directa vía tool text "
+                      f"({len(respuesta_directa)} chars). Fin del loop.")
+                agent_messages.append(
+                    {"role": "assistant", "content": respuesta_directa})
+                agent_pasos_log.append({"tool": "text", "args": args,
+                                        "resultado": respuesta_directa})
+                return {
+                    "final_response":  respuesta_directa,
+                    "done":            True,
+                    "agent_activo":    False,
+                    "agent_messages":  agent_messages,
+                    "agent_pasos_log": agent_pasos_log,
+                }
+            # instruccion demasiado corta/vacía: no es una respuesta real;
+            # se le devuelve guía al modelo y el loop sigue (cerrará con
+            # texto plano en la próxima ronda).
+            resultado = ("[SISTEMA] La tool text necesita la respuesta "
+                         "completa para el usuario en 'instruccion' (una "
+                         "frase útil, no una meta-descripción). Si ya podés "
+                         "responder, hacelo en texto plano, sin llamar tools.")
+            agent_pasos_log.append({"tool": tool, "args": args,
+                                    "resultado": resultado})
+            agent_messages.append({"role": "tool", "content": resultado,
+                                   "name": tool})
+            continue
+
+        # Anti-bucle: la MISMA tool con los MISMOS args ya se ejecutó dos
+        # veces sin aportar nada nuevo → no ejecutarla otra vez y ordenarle
+        # al modelo que cierre con lo que ya tiene.
+        repeticiones = sum(
+            1 for p in agent_pasos_log
+            if _firma_call(p.get("tool", ""), p.get("args") or {})
+            == _firma_call(tool, args)
+        )
+        if repeticiones >= 2:
+            print(f"   └─ 🔁 [AGENT LOOP]: '{tool}' ya se ejecutó {repeticiones} veces "
+                  "con los mismos args; no se repite.")
+            resultado = (
+                "[SISTEMA] Esta acción ya se ejecutó dos veces con los mismos "
+                "argumentos y no aportó nada nuevo. NO la repitas: respondé al "
+                "usuario ahora con la información que ya tenés."
+            )
+            agent_pasos_log.append({"tool": tool, "args": args, "resultado": resultado})
+            agent_messages.append({
+                "role": "tool",
+                "content": resultado,
+                "name": tool,
+            })
+            continue
+
         ok, motivo = validar_tool_call(tool, args)
         if not ok:
             print(f"   └─ ⚠️  [AGENT LOOP]: Sanity-check rechazó tool call '{tool}': {motivo}")
             resultado = f"[ERROR] Llamada inválida a '{tool}': {motivo}"
         else:
             print(f"\n🔧 [AGENT LOOP]: Paso {len(agent_pasos_log) + 1} → tool={tool} args={args}")
-            instruccion = _instruccion_de_paso({"args": args}) or orden
+            # Nota: en el agent loop no hay plan_pasos, así que la
+            # instrucción base es siempre la orden original; los args
+            # estructurados se inyectan vía _construir_orden_paso y
+            # _tool_args más abajo.
+            instruccion = orden
             sub_estado = dict(state)
             sub_estado["orden"]           = _construir_orden_paso(instruccion, args, resultados_previos)
             sub_estado["error_activo"]    = False
@@ -1623,6 +1883,78 @@ def node_mcp(state: AetherState) -> dict:
 
     return {
         "mcp_result":     resultado_final,
+        "llm_response":   None,
+        "final_response": None,
+        "messages":       [HumanMessage(content=state.get("orden", ""))],
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+# NODO: SUBAGENT — lanza sub-agentes aislados para tareas paralelas
+# ══════════════════════════════════════════════════════════════════════
+
+def node_subagent(state: AetherState) -> dict:
+    """
+    Lanza uno o varios sub-agentes aislados para ejecutar tareas en paralelo.
+    
+    Espera args:
+    - {tareas: ["tarea 1", "tarea 2", ...]} para múltiples sub-agentes
+    - {tarea: "tarea única"} para un solo sub-agente
+    
+    Cada sub-agente corre el grafo completo con su propio contexto,
+    heredando la memoria del padre (solo lectura). Los resultados
+    se agregan al estado para que el plan_synthesizer los procese.
+    """
+    from core.tools.subagent import lanzar_subagentes, lanzar_subagente
+    from langchain_core.messages import HumanMessage
+
+    args = _args_del_paso_mcp(state)  # reutiliza el parser de args MCP
+    if not isinstance(args, dict):
+        return {
+            "error_activo": True,
+            "error_mensaje": f"args debe ser dict, no {type(args).__name__}",
+            "error_contexto": "subagent",
+        }
+
+    # Soporte para ambos formatos: {tareas: [...]} o {tarea: "..."}
+    tareas = args.get("tareas")
+    if tareas is None:
+        tarea = args.get("tarea")
+        if tarea:
+            tareas = [tarea]
+    
+    if not tareas or not isinstance(tareas, list) or not all(isinstance(t, str) for t in tareas):
+        return {
+            "error_activo": True,
+            "error_mensaje": "Se requiere 'tareas' (lista de strings) o 'tarea' (string).",
+            "error_contexto": "subagent",
+        }
+
+    print(f"\n🤖 [SUBAGENT]: Lanzando {len(tareas)} sub-agente(s)...")
+    for i, t in enumerate(tareas):
+        print(f"   └─ [{i+1}] {t[:80]}{'...' if len(t) > 80 else ''}")
+
+    # Memoria del padre para heredar contexto
+    parent_mem = state.get("mem") or {}
+    
+    # Ejecutar sub-agentes
+    resultados = lanzar_subagentes(tareas, parent_mem)
+    
+    # Formatear resultados para el sintetizador
+    lineas = ["[RESULTADOS SUB-AGENTES]"]
+    for r in resultados:
+        status = "✅" if r.success else "❌"
+        lineas.append(f"{status} Tarea {r.task_id}: {r.task[:100]}")
+        if r.success:
+            lineas.append(f"   → {r.response[:300]}{'...' if len(r.response) > 300 else ''}")
+        else:
+            lineas.append(f"   → ERROR: {r.error}")
+    subagent_result = "\n".join(lineas)
+
+    print(f"   └─ [SUBAGENT]: {len([r for r in resultados if r.success])}/{len(resultados)} completados.")
+
+    return {
+        "subagent_result": subagent_result,
         "llm_response":   None,
         "final_response": None,
         "messages":       [HumanMessage(content=state.get("orden", ""))],
@@ -2374,14 +2706,133 @@ def node_codigo(state: AetherState) -> dict:
 # NODO: VISION — proveedor de datos puro
 # ══════════════════════════════════════════════════════════════════════
 
+_IMAGEN_PATH_RE = re.compile(
+    r"(/[\w.\- /]+\.(?:png|jpe?g|webp|gif|bmp|tiff?))", re.IGNORECASE)
+_EXTS_IMAGEN = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif",
+                          ".bmp", ".tif", ".tiff"})
+# Cualquier path absoluto con extensión (no solo imágenes): sirve para
+# detectar que el modelo quiere describir un archivo NO-imagen (pdf, docx,
+# mp4...) y responder con guía en vez de capturar la pantalla.
+_ARCHIVO_PATH_RE = re.compile(r"(/[\w.\- /]+\.[\w]{1,8})")
+
+
+def _extraer_path_imagen(texto: str) -> str | None:
+    """Primer path absoluto de imagen existente mencionado en el texto
+    (típico: 'Describe la imagen adjunta: /…/adjuntos/foto.jpg')."""
+    for candidato in _IMAGEN_PATH_RE.findall(texto or ""):
+        ruta = candidato.rstrip(").,\"'")
+        if os.path.isfile(ruta):
+            return ruta
+    return None
+
+
+def _extraer_path_archivo(texto: str) -> str | None:
+    """Primer path absoluto existente de CUALQUIER archivo en el texto."""
+    for candidato in _ARCHIVO_PATH_RE.findall(texto or ""):
+        ruta = candidato.rstrip(").,\"'")
+        if os.path.isfile(ruta):
+            return ruta
+    return None
+
+
 def node_vision(state: AetherState) -> dict:
     """
-    Captura pantalla → ver_pantalla().
+    Visión: describe una IMAGEN DE ARCHIVO si la orden referencia una
+    (típico caso de adjuntos de la Web UI); si no, captura la pantalla
+    con grim como siempre.
     REFACTOR: NO pone final_response. Devuelve vision_result crudo
     para que Ornith (plan_synthesizer) lo procese y responda.
     """
     import time
     orden = state["orden"]
+    tool_args = state.get("_tool_args") or {}
+
+    # ── Prioridad: path estructurado pasado como argumento de la tool ───
+    imagen: str | None = None
+    path_arg = str(tool_args.get("path") or "").strip().strip("\"'")
+    if path_arg:
+        ruta_arg = os.path.abspath(os.path.expanduser(path_arg))
+        if os.path.isfile(ruta_arg):
+            if os.path.splitext(ruta_arg)[1].lower() in _EXTS_IMAGEN:
+                imagen = ruta_arg
+            else:
+                # Archivo real pero NO imagen (pdf/docx/mp4/...): la visión
+                # no lo puede ver. Nada de capturar la pantalla — eso sería
+                # responder con contenido que el usuario no pidió.
+                print(f"\\n👁️  [VISIÓN]: {ruta_arg} no es una imagen; sin captura.")
+                return {
+                    "vision_result": (
+                        f"[ERROR] El archivo '{ruta_arg}' no es una imagen "
+                        "soportada (png/jpg/webp/gif/bmp/tiff). Si el mensaje "
+                        "del usuario incluye su texto extraído (sección "
+                        "[ADJUNTOS DEL USUARIO]), respondé con eso; si no, "
+                        "leé el contenido con fs_read o explicá que no se "
+                        "puede analizar visualmente."
+                    ),
+                    "final_response": None,
+                    "messages": [HumanMessage(content=orden)],
+                }
+        else:
+            print(f"\\n👁️  [VISIÓN]: path inexistente: {ruta_arg}")
+            return {
+                "vision_result": (
+                    f"[ERROR] El archivo '{ruta_arg}' no existe. Revisá la "
+                    "sección [ADJUNTOS DEL USUARIO] del mensaje del usuario "
+                    "y usá la ruta exacta que figura ahí; no inventes rutas."
+                ),
+                "final_response": None,
+                "messages": [HumanMessage(content=orden)],
+            }
+
+    # ── Camino de archivo: el modelo pide describir un adjunto ─────────
+    # (path en args.path, o mencionado en la instrucción de la tool, o en
+    # la orden del usuario — en ese orden de prioridad de búsqueda)
+    if imagen is None:
+        imagen = (
+            _extraer_path_imagen(str(tool_args.get("instruccion") or ""))
+            or _extraer_path_imagen(orden)
+        )
+    if imagen is None:
+        # Hay un path de archivo real pero NO es imagen: mismo comportamiento
+        # explícito que arriba, nunca capturar la pantalla por accidente.
+        otro = _extraer_path_archivo(
+            f"{tool_args.get('instruccion') or ''}\\n{orden}")
+        if otro and os.path.splitext(otro)[1].lower() not in _EXTS_IMAGEN:
+            print(f"\\n👁️  [VISIÓN]: {otro} no es imagen; sin captura.")
+            return {
+                "vision_result": (
+                    f"[ERROR] '{otro}' no es una imagen. Usá su texto "
+                    "extraído ([ADJUNTOS DEL USUARIO]) o fs_read; la visión "
+                    "solo analiza imágenes."
+                ),
+                "final_response": None,
+                "messages": [HumanMessage(content=orden)],
+            }
+    if imagen:
+        print(f"\n👁️  [VISIÓN]: describiendo archivo {imagen}")
+        try:
+            from backend.core.attachments import describir_imagen
+            pregunta = orden if len(orden) > 10 else (
+                "Describí esta imagen de forma objetiva y detallada.")
+            descripcion = describir_imagen(imagen, pregunta=pregunta)
+        except Exception as e:
+            descripcion = None
+            print(f"   └─ ❌ [VISIÓN]: falló describiendo archivo: {e}")
+        if descripcion:
+            print(f"   └─ [VISIÓN]: descripción obtenida ({len(descripcion)} chars).")
+            return {
+                "vision_result":  descripcion,
+                "final_response": None,   # ← Ornith sintetiza
+                "messages":       [HumanMessage(content=orden)],
+            }
+        # Sin descripción: aviso explícito para que el modelo no loopee.
+        return {
+            "vision_result":  (f"No pude describir la imagen {imagen} con el "
+                               "modelo de visión. Respondé al usuario con lo "
+                               "que sepas de su nombre/contexto."),
+            "final_response": None,
+            "messages":       [HumanMessage(content=orden)],
+        }
 
     print("\n👁️  [VISIÓN]: Preparando captura — mové el cursor al monitor deseado")
     for i in range(2, 0, -1):
@@ -2787,6 +3238,16 @@ def node_memory(state: AetherState) -> dict:
         if m:
             nombre = m.group(1).strip().capitalize()
             mem["preferencias"]["nombre_usuario"] = nombre
+            # Sincronizar con el perfil de Account (Settings → Account de la
+            # Web UI): una sola fuente de verdad para la identidad.
+            try:
+                from core.config.config_manager import get_config_manager
+                cfg = get_config_manager()
+                perfil = cfg.get("ACCOUNT_PROFILE", {}) or {}
+                perfil["nombre"] = nombre
+                cfg.set("ACCOUNT_PROFILE", perfil, validate=True)
+            except Exception:
+                pass
             resp = f"Nombre registrado: {nombre}."
 
         m2 = re.search(r"tengo (\d+) años", orden, re.IGNORECASE)
@@ -3234,7 +3695,7 @@ def _construir_orden_paso(instruccion: str, args: dict, plan_resultados: list[st
     partes = [instruccion]
 
     if isinstance(args, dict):
-        for clave in ("query", "command", "app", "filename"):
+        for clave in ("query", "command", "app", "filename", "path"):
             val = args.get(clave)
             if isinstance(val, str) and val.strip() and val.strip() not in instruccion:
                 partes.append(f"[{clave}] {val.strip()}")

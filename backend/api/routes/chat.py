@@ -4,13 +4,16 @@ chat.py — Rutas de chat del backend revivido.
 - POST /api/chat         → respuesta completa (bloqueante, compat)
 - POST /api/chat/stream  → SSE con tokens en vivo (motor LangGraph real)
 - POST /api/stop         → cancela la inferencia en curso
+- POST /api/attachments/upload  → upload multipart (imágenes, PDF, DOCX, audio, video)
+- POST /api/attachments/transcribe  → transcripción audio/video con progress SSE
 """
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse, StreamingResponse
 import json
 import asyncio
 import itertools
+from pathlib import Path
 
 from backend.core.aether_service import (
     AetherService,
@@ -39,6 +42,7 @@ _CLAVES_DELTA_FRONT = (
     "shell_output",
     "context_compactado",
     "error_activo",
+    "_ornith_reasoning",   # razonamiento del modelo ([Pensando] en la Web UI)
 )
 
 _LIMITE_CAMPO = 1500  # truncado por campo para no inflar el SSE
@@ -63,41 +67,90 @@ def _sanear_campo(v, profundidad: int = 0):
     return str(v)[:_LIMITE_CAMPO]
 
 
+_LIMITE_RAZONAMIENTO = 12000  # el razonamiento se muestra completo en la UI
+
+
 def _delta_front(delta) -> dict:
     """Extrae del delta del grafo solo lo que la Web UI consume (JSON-safe)."""
     if not isinstance(delta, dict):
         return {}
-    return {
-        clave: _sanear_campo(delta[clave])
-        for clave in _CLAVES_DELTA_FRONT
-        if clave in delta and delta[clave] not in (None, "", [], {}, False)
-    }
+    out = {}
+    for clave in _CLAVES_DELTA_FRONT:
+        if clave not in delta or delta[clave] in (None, "", [], {}, False):
+            continue
+        if clave == "_ornith_reasoning":
+            # Va al chip "Pensando…" de la Web UI: límite más generoso que
+            # el truncado general de 1500 chars (el razonamiento es largo).
+            razonamiento = str(delta[clave])
+            out[clave] = (razonamiento[:_LIMITE_RAZONAMIENTO]
+                          + ("…" if len(razonamiento) > _LIMITE_RAZONAMIENTO
+                             else ""))
+        else:
+            out[clave] = _sanear_campo(delta[clave])
+    return out
 
 
 def _extraer_mensaje(request: dict) -> str:
     return (request.get("message") or request.get("content") or "").strip()
 
 
+def _preparar_orden(body: dict) -> tuple[str, list[dict]]:
+    """
+    Mensaje del usuario + adjuntos (imágenes/archivos) → orden final para el
+    grafo. Los adjuntos pueden venir de dos formas (se mezclan):
+
+    - {name, mime, data}  — base64 crudo: se guardan en disco ahora.
+    - {name, mime, path}  — ya subidos vía POST /attachments/upload: se
+      referencian por path validado, SIN volver a guardarlos ni a mandar
+      su contenido por el body (evita el bug de "adjunto vacío" y el
+      doble envío de base64 pesado).
+
+    Devuelve (orden, metas).
+    """
+    mensaje = _extraer_mensaje(body)
+    adjuntos = body.get("attachments") or []
+    if not isinstance(adjuntos, list) or not adjuntos:
+        return mensaje, []
+    from backend.core.attachments import (
+        adjuntos_ya_guardados, componer_orden, guardar_adjuntos,
+    )
+    pendientes = [a for a in adjuntos if a.get("data")]
+    pre_subidos = [a for a in adjuntos if not a.get("data") and a.get("path")]
+    metas_previas = adjuntos_ya_guardados(pre_subidos)
+    metas_nuevas, errores = guardar_adjuntos(pendientes)
+    metas = metas_previas + metas_nuevas
+    return componer_orden(mensaje, metas, errores), metas
+
+
 @router.post("/chat")
 async def chat(request: dict):
-    message = _extraer_mensaje(request)
-    if not message:
-        return JSONResponse({"detail": "El campo 'message' es obligatorio"}, status_code=400)
+    # La preparación puede describir imágenes con el modelo de visión
+    # (segundos): nunca dentro del event loop.
+    orden, _metas = await asyncio.get_running_loop().run_in_executor(
+        None, _preparar_orden, request)
+    if not orden.strip():
+        return JSONResponse(
+            {"detail": "Enviá 'message' o al menos un adjunto válido"},
+            status_code=400)
 
-    result = AetherService.process_message(message)
+    result = AetherService.process_message(orden)
     return result
 
 
 @router.post("/chat/stream")
 async def chat_stream(raw_request: Request):
     body = await raw_request.json()
-    message = _extraer_mensaje(body)
-    if not message:
-        return JSONResponse({"detail": "El campo 'message' es obligatorio"}, status_code=400)
+    # Igual que /chat: visión/IO fuera del event loop.
+    orden, _metas = await asyncio.get_running_loop().run_in_executor(
+        None, _preparar_orden, body)
+    if not orden.strip():
+        return JSONResponse(
+            {"detail": "Enviá 'message' o al menos un adjunto válido"},
+            status_code=400)
 
     def _consumir():
         """El generador es síncrono: el grafo corre en su propio hilo."""
-        for evento in AetherService.iter_eventos(message):
+        for evento in AetherService.iter_eventos(orden):
             if isinstance(evento, TokenEvent):
                 payload = {"type": "token", "data": evento.fragmento}
             elif isinstance(evento, NodeUpdateEvent):
@@ -181,3 +234,106 @@ async def stop():
     from core.agent.streaming import request_cancel
     request_cancel()
     return {"ok": True, "message": "Señal de cancelación enviada"}
+
+
+@router.post("/attachments/upload")
+async def upload_attachments(
+    files: list[UploadFile] = File(...),
+    message: str = Form(""),
+):
+    """Upload multipart de archivos (imágenes, PDF, DOCX, audio, video).
+    Devuelve metadatos de los archivos guardados + texto extraído/transcrito.
+    """
+    from backend.core.attachments import guardar_adjuntos, componer_orden
+
+    attachments = []
+    for f in files[:8]:  # tope 8
+        data = await f.read()
+        import base64
+        attachments.append({
+            "name": f.filename,
+            "mime": f.content_type or "application/octet-stream",
+            "data": base64.b64encode(data).decode(),
+        })
+
+    def _procesar():
+        metas_, errores_ = guardar_adjuntos(attachments)
+        # describir=False: la visión corre UNA vez, al enviar el mensaje por
+        # /chat|/chat/stream. Describir acá duplicaba la llamada al modelo
+        # de visión (segundos por imagen) con un resultado que se descartaba.
+        orden_ = componer_orden(message, metas_, errores_, describir=False)
+        return metas_, errores_, orden_
+
+    metas, errores, orden = await asyncio.get_running_loop().run_in_executor(
+        None, _procesar)
+    
+    return {
+        "ok": True,
+        "orden": orden,
+        "metas": [
+            {
+                "name": m["name"],
+                "mime": m["mime"],
+                "kind": m["kind"],
+                "path": m.get("path"),
+                "size": m.get("size"),
+                "texto_extraido": m.get("texto_extraido"),
+            }
+            for m in metas
+        ],
+        "errores": errores,
+    }
+
+
+@router.post("/attachments/transcribe")
+async def transcribe_audio(
+    file: UploadFile = File(...),
+    model: str = Form("base"),
+):
+    """Transcribe audio/video usando faster-whisper con progress SSE.
+    Modelo: tiny, base, small, medium, large.
+    """
+    from backend.core.attachments import _transcribir_audio
+    from backend.core.attachments import _directorio_adjuntos
+    import base64
+    import tempfile
+    
+    # Guardar archivo temporal
+    import tempfile
+    sufijo = Path(file.filename or "audio.webm").suffix or ".webm"
+    data = await file.read()
+    if not data:
+        return JSONResponse({"ok": False, "error": "Audio vacío"}, status_code=400)
+    with tempfile.NamedTemporaryFile(suffix=sufijo, delete=False) as tmp:
+        tmp.write(data)
+        tmp_path = Path(tmp.name)
+    
+    try:
+        # Usar modelo especificado
+        from backend.core.attachments import _transcribir_audio
+        from core.config.config_manager import get_config_manager
+        
+        cfg = get_config_manager()
+        original_model = cfg.get("WHISPER_MODEL", "base")
+        cfg.set("WHISPER_MODEL", model, validate=False)
+        
+        try:
+            texto = await asyncio.get_event_loop().run_in_executor(None, _transcribir_audio, tmp_path)
+        finally:
+            cfg.set("WHISPER_MODEL", original_model, validate=False)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    
+    return {"ok": True, "text": texto, "model": model}
+
+
+@router.post("/attachments/transcribe/stream")
+async def transcribe_audio_stream(
+    file: UploadFile = File(...),
+    model: str = Form("base"),
+):
+    """Transcribe audio/video con progress SSE (tokens de progreso)."""
+    # TODO: implementar streaming de progreso real con faster-whisper
+    # Por ahora, delega al endpoint simple
+    return await transcribe_audio(file, model)
+

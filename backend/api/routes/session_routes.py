@@ -7,7 +7,7 @@ Es la MISMA fuente de datos que los comandos de la TUI:
                                    /historial <n>, pero por sesion_id)
 
 Las "conversaciones" de la Web UI viven en localStorage del navegador;
-estos endpoints la conectan con el historial real del runtime (memoria.db),
+estos endpoints la conectan con el historial real del runtime (memoria.json),
 así la web puede abrir sesiones hechas desde la TUI (y viceversa: todo lo
 que la web procesa también queda registrado por el grafo).
 """

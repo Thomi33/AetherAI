@@ -9,7 +9,6 @@
 #   aether tui            → idem, explícito
 #   aether task "ORDEN"   → one-shot: ejecuta UNA orden y devuelve la respuesta
 #   aether --workdir RUTA  → trabaja sobre RUTA (default: dir. actual $PWD)
-#   aether cli            → loop interactivo simple sin Textual (jarvis_new.py)
 #   aether doctor         → diagnóstico del entorno (python, venv, ollama, db)
 #   aether web            → levanta la Web UI (backend API + navegador)
 #                           aliases: aether server / aether gateway
@@ -41,12 +40,10 @@ while [[ $# -gt 0 ]]; do
       AETHER_CWD="$2" || true; EXTRA_ARGS+=("$1" "$2"); shift 2 ;;
     --workdir=*)
       AETHER_CWD="${1#--workdir=}"; EXTRA_ARGS+=("$1"); shift ;;
-    tui|task|cli|doctor|version|--doctor)
+    tui|task|doctor|version|--doctor)
       EXTRA_ARGS+=("$1"); shift ;;
     -t|--task)
       EXTRA_ARGS+=("task"); shift ;;
-    -i|--interactive)
-      EXTRA_ARGS+=("cli"); shift ;;
     -V|--version)
       EXTRA_ARGS+=("version"); shift ;;
     *) EXTRA_ARGS+=("$1"); shift ;;
@@ -115,9 +112,6 @@ case "${1:-}" in
   -t|--task|task)
     shift
     exec "$PY" bin/aether_run.py task "${WORKDIR_FLAG[@]}" "$@"
-    ;;
-  cli|-i|--interactive)
-    exec "$PY" jarvis_new.py "${WORKDIR_FLAG[@]}" "$@"
     ;;
   doctor|--doctor)
     exec "$PY" bin/aether_run.py doctor

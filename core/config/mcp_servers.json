@@ -2,29 +2,35 @@
   "server_filesystem": {
     "transport": "stdio",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/"],
-    "env": null
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-filesystem",
+      "/"
+    ],
+    "env": null,
+    "enabled": true
   },
   "github": {
     "transport": "stdio",
     "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-github"],
+    "args": [
+      "-y",
+      "@modelcontextprotocol/server-github"
+    ],
     "env": {
       "GITHUB_PERSONAL_ACCESS_TOKEN": "{token}"
-    }
+    },
+    "enabled": true
   },
   "notion": {
     "transport": "stdio",
     "command": "npx",
-    "args": ["-y", "@notionhq/notion-mcp-server"],
+    "args": [
+      "-y",
+      "@notionhq/notion-mcp-server"
+    ],
     "env": {
       "NOTION_TOKEN": "{token}"
     }
-  },
-  "postgres": {
-    "transport": "stdio",
-    "command": "npx",
-    "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://usuario:password@localhost:5432/nombre_db"],
-    "env": null
   }
 }
