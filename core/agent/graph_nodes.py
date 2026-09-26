@@ -89,7 +89,7 @@ from core.agent.graph_state import AetherState
 # ══════════════════════════════════════════════════════════════════════
 
 
-def _llm_chat(system: str = None, user: str = None, messages: list = None, on_token=None, tools: list = None, min_predict: int | None = None) -> str:
+def _llm_chat(system: str = None, user: str = None, messages: list = None, on_token=None, tools: list = None, min_predict: int | None = None, imagenes: list[str] | None = None) -> str:
     """
     Llamada directa a ollama con streaming opcional.
 
@@ -108,9 +108,14 @@ def _llm_chat(system: str = None, user: str = None, messages: list = None, on_to
     if messages is None:
         if system is None or user is None:
             raise ValueError("_llm_chat requiere o 'messages' o (system + user)")
+        msg_user: dict = {"role": "user", "content": user}
+        if imagenes:
+            # Thumbnails (b64) de adjuntos: Ollama los procesa como imágenes
+            # del mensaje → el modelo con visión nativa las ve directo.
+            msg_user["images"] = list(imagenes)
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            msg_user,
         ]
 
     opts = {
@@ -782,6 +787,33 @@ def _plan_activado(plan: list[dict], orden: str, mem: dict | None = None) -> dic
     return update
 
 
+def _intentar_ruta_semantica(orden: str, mem: dict) -> dict | None:
+    """
+    Adaptador del semantic router OPT-IN (core/agent/semantic_router.py).
+
+    Devuelve la actualización de estado de un plan de 1 paso hacia la tool
+    predicha por embeddings (embeddinggemma + prototipos), o None para que
+    node_planner siga su camino actual (agent loop). Nunca lanza: cualquier
+    error del router semántico degrada silenciosamente a fallback. Con
+    PLANNER_ROUTER=default es un no-op (ruta_semantica corta antes de tocar
+    Ollama).
+    """
+    try:
+        from core.agent.semantic_router import ruta_semantica
+        resultado = ruta_semantica(orden)
+    except Exception as exc:  # noqa: BLE001 — el router nunca debe romper un turno
+        print(f"   └─ ⚠️  [SEMANTIC]: error inesperado ({type(exc).__name__}); fallback al agent loop.")
+        return None
+    if resultado is None:
+        return None
+    print(f"   └─ 🧭 [SEMANTIC]: '{orden[:40]}' → {resultado.tool} "
+          f"(score {resultado.top_score:.3f}, margin {resultado.margin:.3f} ≥ {resultado.margin_threshold})")
+    return _plan_activado(
+        [{"tool": resultado.tool, "instruccion": orden, "args": {}}],
+        orden, mem,
+    )
+
+
 def node_planner(state: AetherState) -> dict:
     """
     ÚNICA puerta de decisión del grafo.
@@ -983,15 +1015,31 @@ def node_planner(state: AetherState) -> dict:
     # qué usar -- incluyendo si hacía falta más de una, en qué orden, y qué
     # hacer si una falla. node_agent_loop es un self-loop en el grafo (ver
     # graph_builder.py) que corre hasta que el modelo devuelve una
-    # respuesta de texto en vez de una tool call, o hasta llegar a
-    # MAX_AGENT_STEPS (configurable, default 6) — ese límite existe y es
-    # intencional: evita bucles infinitos de tool calling.
+    # respuesta de texto en vez de una tool call. SIN límite de pasos:
+    # quién decide cuándo detenerlo es el usuario (Stop de la Web UI →
+    # POST /api/stop, o el stop de la TUI → request_cancel());
+    # node_agent_loop chequea la cancelación al inicio de cada paso. La red
+    # de seguridad anti-bucle (misma tool+args repetida dos veces) sigue
+    # activa.
     #
     # NOTA: todo el bloque de abajo (detección por keywords, casos MCP/
     # single-tool/multi-tool/fallback) quedó inalcanzable tras este return.
     # Se deja sin borrar por ahora para no tocar más código del necesario en
     # este cambio; es candidato a limpieza en un próximo pase una vez que el
     # agent loop esté validado en uso real.
+    # ══════════════════════════════════════════════════════════════════════
+    # SEMANTIC ROUTER (OPT-IN: PLANNER_ROUTER=semantic, ver
+    # core/agent/semantic_router.py). Atajo de baja latencia por embeddings.
+    # SOLO decide la intención (tool): la ejecución pasa por el nodo real de
+    # la tool con TODAS sus validaciones y confirmaciones (el runtime sigue
+    # siendo la autoridad). Margin < umbral, tools fs_* (requieren args
+    # estructurados) o errores de Ollama → None → fallback al agent loop.
+    # Con PLANNER_ROUTER=default (default del repo) esto es costo cero.
+    # ══════════════════════════════════════════════════════════════════════
+    update_semantic = _intentar_ruta_semantica(orden, mem)
+    if update_semantic is not None:
+        return update_semantic
+
     print("   └─ Sin atajo determinista aplicable → agent loop (razonamiento + tool calling nativo).")
     return _agent_loop_activado(orden, mem)
 
@@ -1229,8 +1277,14 @@ def node_agent_loop(state: AetherState) -> dict:
     Es un self-loop en el grafo (como antes lo era plan_executor): cada
     invocación hace UNA ronda de razonamiento + ejecución de las tool
     calls que haya, y vuelve a entrar mientras agent_activo=True. Termina
-    cuando el modelo devuelve texto sin tool_calls (respuesta final) o si
-    ocurre un error irrecuperable llamando al modelo.
+    cuando el modelo devuelve texto sin tool_calls (respuesta final), si
+    ocurre un error irrecuperable llamando al modelo, o si el USUARIO
+    cancela (Stop → InferenceCancelled). NO hay límite de pasos: quién
+    decide cuándo detenerlo es el usuario.
+
+    Si el turno trae adjuntos de imagen (state["agent_images"], thumbnails
+    b64), van incrustados en el primer mensaje del usuario: el modelo con
+    visión nativa analiza la foto directamente junto con su prompt.
 
     Reutiliza get_node_func() -- los mismos nodos reales (node_web,
     node_shell, etc.) que usaba plan_executor -- así que no hay ejecución
@@ -1244,22 +1298,30 @@ def node_agent_loop(state: AetherState) -> dict:
 
     agent_messages  = list(state.get("agent_messages") or [])
     agent_pasos_log = list(state.get("agent_pasos_log") or [])
-    max_agent_steps = get_config_manager().get("MAX_AGENT_STEPS", 6)
 
-    if len(agent_pasos_log) >= max_agent_steps:
-        return {
-            "final_response": (
-                f"Detuve el razonamiento tras {max_agent_steps} pasos para "
-                "evitar un bucle prolongado."
-            ),
-            "done": True,
-            "agent_activo": False,
-        }
+    # ── Cancelación: el USUARIO decide cuándo detener el loop ──────────
+    # (Stop de la Web UI → POST /api/stop → request_cancel(); ídem el stop
+    # de la TUI). Se chequea al inicio de CADA paso y corta con la misma
+    # excepción que usa el streaming de texto, así la UI muestra
+    # "Inferencia cancelada por el usuario." sin pasos huérfanos.
+    from core.agent.streaming import InferenceCancelled, is_cancelled
+    if is_cancelled():
+        print(f"   └─ 🛑 [AGENT LOOP]: cancelado por el usuario antes del "
+              f"paso {len(agent_pasos_log) + 1}.")
+        raise InferenceCancelled()
 
     if not agent_messages:
+        msg_user: dict = {"role": "user", "content": orden}
+        imagenes_inline = state.get("agent_images") or []
+        if imagenes_inline:
+            # Thumbnails (b64) de los adjuntos del turno: el modelo con
+            # visión nativa los ve junto con el prompt del usuario.
+            msg_user["images"] = list(imagenes_inline)
+            print(f"   └─ 🖼️ [AGENT LOOP]: {len(imagenes_inline)} thumbnail(s) "
+                  "de adjunto(s) incrustado(s) en el mensaje del usuario.")
         agent_messages = [
             {"role": "system", "content": _system_prompt_agent_loop(mem, state)},
-            {"role": "user", "content": orden},
+            msg_user,
         ]
         print("\n🔁 [AGENT LOOP]: Iniciando razonamiento con tool calling nativo...")
 
@@ -1320,8 +1382,8 @@ def node_agent_loop(state: AetherState) -> dict:
         # El modelo a veces "llama" a text con la respuesta completa ya
         # escrita en instruccion. Ejecutarla como paso normal la devolvía
         # como resultado de tool y el modelo respondía DE NUEVO con otra
-        # llamada a text → bucle hasta MAX_AGENT_STEPS y una respuesta
-        # final duplicada/concatenada (bug real en producción).
+        # llamada a text → bucle de respuestas duplicadas/concatenadas
+        # (bug real en producción).
         if tool == "text":
             respuesta_directa = _limpiar_artefactos_tool_call(
                 str((args or {}).get("instruccion") or "")).strip()
@@ -3153,6 +3215,7 @@ def node_text(state: AetherState) -> dict:
             system=_system_prompt_chat(mem, state),
             user=orden,
             on_token=_on_token,
+            imagenes=state.get("agent_images") or None,
         )
     except Exception as e:
         print(f"   └─ [TEXT]: Error llamando al modelo ({e}). Respuesta simple de fallback.")

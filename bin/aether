@@ -9,6 +9,10 @@
 #   aether tui            → idem, explícito
 #   aether task "ORDEN"   → one-shot: ejecuta UNA orden y devuelve la respuesta
 #   aether --workdir RUTA  → trabaja sobre RUTA (default: dir. actual $PWD)
+#   aether --planner MODO  → router del planner SOLO para esta sesión:
+#                            default = agent loop (comportamiento actual)
+#                            semantic = routing por embeddings OPT-IN
+#                            (core/agent/semantic_router.py)
 #   aether doctor         → diagnóstico del entorno (python, venv, ollama, db)
 #   aether web            → levanta la Web UI (backend API + navegador)
 #                           aliases: aether server / aether gateway
