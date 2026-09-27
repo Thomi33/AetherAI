@@ -89,7 +89,72 @@ from core.agent.graph_state import AetherState
 # ══════════════════════════════════════════════════════════════════════
 
 
-def _llm_chat(system: str = None, user: str = None, messages: list = None, on_token=None, tools: list = None, min_predict: int | None = None, imagenes: list[str] | None = None) -> str:
+class _ThinkingStreamSplitter:
+    """
+    Separador stateful de razonamiento para el stream de content de Ollama.
+
+    El BACKEND separa el thinking del content A MEDIDA QUE LLEGA (no es un
+    parseo post-hoc del texto final, y mucho menos un parseo del lado del
+    cliente): cada token se enruta a su canal en el momento en que se genera.
+
+    - Marcadores inline de razonamiento (apertura/cierre del tag "think",
+      formato Ornith/QwQ): lo previo al cierre va al canal de reasoning;
+      el resto, a la respuesta.
+    - Tolerante a marcadores partidos entre chunks: retiene el prefijo
+      parcial posible-tag y lo resuelve con el chunk siguiente.
+
+    feed(token) -> (razonamiento_delta, content_delta)
+    flush()     -> drena el buffer residual al terminar el stream.
+    """
+
+    # Se construyen por partes para que el texto exacto quede visible y
+    # auditable en el diff (equivale a los marcadores de
+    # _parse_ornith_thinking: apertura y cierre del tag "think".
+    OPEN = "<" + "think" + ">"
+    CLOSE = "<" + "/think" + ">"
+
+    def __init__(self) -> None:
+        self._carry = ""
+        self._in_think = False
+
+    def feed(self, token: str) -> tuple[str, str]:
+        buf = self._carry + (token or "")
+        self._carry = ""
+        razonamiento: list[str] = []
+        contenido: list[str] = []
+        while buf:
+            tag = self.CLOSE if self._in_think else self.OPEN
+            idx = buf.find(tag)
+            if idx == -1:
+                k = self._prefijo_parcial(buf, tag)
+                seguro = buf[:len(buf) - k]
+                self._carry = buf[len(buf) - k:]
+                (razonamiento if self._in_think else contenido).append(seguro)
+                break
+            (razonamiento if self._in_think else contenido).append(buf[:idx])
+            self._in_think = not self._in_think
+            buf = buf[idx + len(tag):]
+        return "".join(razonamiento), "".join(contenido)
+
+    def flush(self) -> tuple[str, str]:
+        resto, self._carry = self._carry, ""
+        if not resto:
+            return "", ""
+        # Stream cortado a mitad de marcador: lo retenido es texto normal
+        # (razonamiento solo si YA estábamos dentro de un bloque).
+        return (resto, "") if self._in_think else ("", resto)
+
+    @classmethod
+    def _prefijo_parcial(cls, buf: str, tag: str) -> int:
+        """Mayor k tal que buf termina con tag[:k] (posible tag partido)."""
+        maximo = min(len(buf), len(tag) - 1)
+        for k in range(maximo, 0, -1):
+            if buf.endswith(tag[:k]):
+                return k
+        return 0
+
+
+def _llm_chat(system: str = None, user: str = None, messages: list = None, on_token=None, tools: list = None, min_predict: int | None = None, imagenes: list[str] | None = None, on_reasoning=None) -> str:
     """
     Llamada directa a ollama con streaming opcional.
 
@@ -165,17 +230,46 @@ def _llm_chat(system: str = None, user: str = None, messages: list = None, on_to
     prompt_chars = sum(len(str(m.get("content", ""))) for m in messages) if BENCH_INSTRUMENT else 0
 
     respuesta = ""
+    hubo_reasoning = False
+    splitter = _ThinkingStreamSplitter()
     policy_start = time.time()
     try:
-        from core.agent.streaming import InferenceCancelled, is_cancelled
+        from core.agent.streaming import InferenceCancelled, is_cancelled, emit_reasoning
+
+        def _emitir_reasoning(delta: str) -> None:
+            nonlocal hubo_reasoning
+            if not delta:
+                return
+            hubo_reasoning = True
+            emit_reasoning(delta)       # canal global (TUI / Web UI / SSE)
+            if on_reasoning:
+                on_reasoning(delta)     # collector del nodo (delta._ornith_reasoning)
+
         for chunk in ollama.chat(**call_kwargs):
             if is_cancelled():
                 raise InferenceCancelled()
             msg = chunk.get("message", {})
-            token = msg.get("content", "")
-            if token and on_token:
-                on_token(token)
-            respuesta += token
+            # (1) Canal NATIVO de razonamiento de Ollama (campo "thinking"
+            # separado del content, modelos con thinking soportado).
+            _emitir_reasoning(msg.get("thinking") or "")
+            # (2) Content: el splitter enruta el razonamiento inline en vivo;
+            # la respuesta acumula SOLO content limpio.
+            token = msg.get("content", "") or ""
+            if not token:
+                continue
+            razonamiento_delta, content_delta = splitter.feed(token)
+            _emitir_reasoning(razonamiento_delta)
+            if content_delta:
+                if on_token:
+                    on_token(content_delta)
+                respuesta += content_delta
+        # Prefijo retenido a mitad de marcador (stream cortado): drenar.
+        razonamiento_delta, content_delta = splitter.flush()
+        _emitir_reasoning(razonamiento_delta)
+        if content_delta:
+            if on_token:
+                on_token(content_delta)
+            respuesta += content_delta
     finally:
         record_model_latency(decision_modelo, int((time.time() - policy_start) * 1000))
 
@@ -1061,17 +1155,29 @@ def _agent_loop_activado(orden: str, mem: dict) -> dict:
 
 def _llm_chat_agente(messages: list, tools: list, min_predict: int | None = None) -> dict:
     """
-    Variante de _llm_chat para el agent loop (tool calling nativo).
+    Variante de _llm_chat para el agent loop (tool calling nativo) CON STREAMING.
 
-    _llm_chat() acumula solo texto del stream y DESCARTA cualquier
-    tool_calls que Ollama devuelva -- nadie lo necesitaba hasta ahora
-    porque nada consumía tool calling real. Esta función corre sin
-    streaming (más simple y confiable para extraer tool_calls que
-    reensamblarlos token a token) y devuelve tanto el texto como las
-    tool calls que el modelo haya decidido invocar, normalizadas a:
+    Comportamiento estilo Open WebUI — el reasoning es OPCIONAL y la respuesta
+    JAMÁS lo espera:
 
-        {"content": str, "tool_calls": [{"function": {"name": str, "arguments": dict}}, ...]}
+    - El content se emite EN VIVO (emit_token → TokenEvent): un modelo sin
+      reasoning (p. ej. Gemma-4) muestra su respuesta apenas empieza a
+      generar; no hay estado bloqueado esperando tags.
+    - El razonamiento, si existe, viaja por su canal DEDICADO (emit_reasoning
+      → ReasoningEvent): campo nativo "thinking" de Ollama y/o marcadores
+      inline separados por _ThinkingStreamSplitter (tolerante a tags
+      partidos entre chunks).
+    - Las tool_calls se REENSAMBLAN del stream: merge por índice con
+      arguments como dict completo (chunk único) o como string JSON
+      acumulada a lo largo de varios chunks.
+
+    Devuelve {"content": str, "tool_calls": [{"function": {"name": str,
+    "arguments": dict}}, ...]} — mismo contrato que siempre.
     """
+    from core.agent.streaming import (
+        InferenceCancelled, is_cancelled, emit_reasoning, emit_token,
+    )
+
     opts = {"num_ctx": NUM_CTX, "num_predict": 2048}
     opts.update(OLLAMA_GEN_OPTIONS)
 
@@ -1090,48 +1196,94 @@ def _llm_chat_agente(messages: list, tools: list, min_predict: int | None = None
     if min_predict:
         opts["num_predict"] = max(opts["num_predict"], min_predict)
 
+    splitter = _ThinkingStreamSplitter()
+    contenido: list[str] = []
+    # índice de tool call → slot {"name": str, "args_dict": dict, "args_str": str}
+    tool_calls_brutos: dict[int, dict] = {}
+
+    def _acumular_tool_call(tc, pos_en_chunk: int) -> None:
+        fn = tc.get("function") or {} if isinstance(tc, dict) else getattr(tc, "function", {}) or {}
+        if isinstance(fn, dict):
+            nombre = fn.get("name") or ""
+            args = fn.get("arguments")
+        else:
+            nombre = getattr(fn, "name", "") or ""
+            args = getattr(fn, "arguments", None)
+        idx = tc.get("index") if isinstance(tc, dict) else getattr(tc, "index", None)
+        if not isinstance(idx, int):
+            # Sin "index" (formato completo en un solo chunk): la primera call
+            # va al slot 0 si está libre; las siguientes se apendean.
+            idx = 0 if 0 not in tool_calls_brutos else len(tool_calls_brutos)
+        slot = tool_calls_brutos.setdefault(idx, {"name": "", "args_dict": None, "args_str": ""})
+        if nombre:
+            slot["name"] = nombre
+        if isinstance(args, dict):
+            slot["args_dict"] = {**(slot["args_dict"] or {}), **args}
+        elif isinstance(args, str):
+            slot["args_str"] += args  # JSON partida entre chunks: concatenar
+
+    def _emitir_content_delta(delta: str) -> None:
+        if delta:
+            emit_token(delta)     # respuesta EN VIVO (canal de tokens)
+            contenido.append(delta)
+
     policy_start = time.time()
     try:
-        resp = ollama.chat(
+        for chunk in ollama.chat(
             model=decision_modelo.model,
             messages=messages,
             tools=tools,
-            stream=False,
+            stream=True,
             options=opts,
             keep_alive=OLLAMA_KEEP_ALIVE,
-        )
+        ):
+            if is_cancelled():
+                raise InferenceCancelled()
+            if isinstance(chunk, dict):
+                msg = chunk.get("message", {}) or {}
+            else:
+                msg = getattr(chunk, "message", None) or {}
+            if not isinstance(msg, dict):
+                msg = {"content": getattr(msg, "content", "") or "",
+                       "tool_calls": getattr(msg, "tool_calls", None) or [],
+                       "thinking": getattr(msg, "thinking", "") or ""}
+            # (1) Reasoning NATIVO (campo separado de Ollama): directo al canal.
+            _thinking_nativo = msg.get("thinking") or ""
+            if _thinking_nativo:
+                emit_reasoning(_thinking_nativo)
+            # (2) Content: splitter en vivo — la respuesta no espera al
+            #     razonamiento; apenas hay texto visible, sale.
+            token = msg.get("content", "") or ""
+            if token:
+                _razon_delta, _content_delta = splitter.feed(token)
+                if _razon_delta:
+                    emit_reasoning(_razon_delta)
+                _emitir_content_delta(_content_delta)
+            # (3) Tool calls: reensamblado incremental del stream.
+            for pos, tc in enumerate(msg.get("tool_calls") or []):
+                _acumular_tool_call(tc, pos)
+        # Prefijo retenido a mitad de tag (stream cortado): drenar.
+        _razon_delta, _content_delta = splitter.flush()
+        if _razon_delta:
+            emit_reasoning(_razon_delta)
+        _emitir_content_delta(_content_delta)
     finally:
         record_model_latency(decision_modelo, int((time.time() - policy_start) * 1000))
 
-    msg = resp.get("message", {}) if isinstance(resp, dict) else getattr(resp, "message", {})
-    if not isinstance(msg, dict):
-        # El cliente ollama-python puede devolver un objeto Message en vez
-        # de un dict según la versión -- normalizamos a dict acá para no
-        # duplicar chequeos de tipo más abajo.
-        msg = {
-            "content": getattr(msg, "content", "") or "",
-            "tool_calls": getattr(msg, "tool_calls", None) or [],
-        }
-
     tool_calls: list[dict] = []
-    for tc in (msg.get("tool_calls") or []):
-        fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", {})
-        if isinstance(fn, dict):
-            nombre = fn.get("name", "")
-            args = fn.get("arguments", {})
-        else:
-            nombre = getattr(fn, "name", "")
-            args = getattr(fn, "arguments", {})
-        if isinstance(args, str):
+    for idx in sorted(tool_calls_brutos):
+        slot = tool_calls_brutos[idx]
+        args = slot["args_dict"]
+        if not args and slot["args_str"]:
             try:
-                args = json.loads(args)
-            except Exception:
+                args = json.loads(slot["args_str"])
+            except Exception:  # noqa: BLE001 — igual criterio que antes: {} 
                 args = {}
         if not isinstance(args, dict):
             args = {}
-        tool_calls.append({"function": {"name": nombre, "arguments": args}})
+        tool_calls.append({"function": {"name": slot["name"], "arguments": args}})
 
-    return {"content": msg.get("content", "") or "", "tool_calls": tool_calls}
+    return {"content": "".join(contenido), "tool_calls": tool_calls}
 
 
 # ── Fallback: formato de herramientas por texto → tool call nativa ────────
@@ -3206,15 +3358,19 @@ def node_text(state: AetherState) -> dict:
     mem   = state["mem"]
 
     tokens: list[str] = []
+    razonamiento: list[str] = []
     def _on_token(t):
         tokens.append(t)
         emit_token(t)   # 👈 antes: print del prefijo + print(t, end="", flush=True)
+    def _on_reasoning(t):
+        razonamiento.append(t)
 
     try:
         raw = _llm_chat(
             system=_system_prompt_chat(mem, state),
             user=orden,
             on_token=_on_token,
+            on_reasoning=_on_reasoning,
             imagenes=state.get("agent_images") or None,
         )
     except Exception as e:
@@ -3228,9 +3384,13 @@ def node_text(state: AetherState) -> dict:
 
     # (se borra el `if tokens: print()` — ya no escribe a stdout)
 
-    reasoning, respuesta = _parse_ornith_thinking(raw)
-    if reasoning:
-        print(f"\n🧠 [Ornith thinking (chat)]: {reasoning[:250]}{'...' if len(reasoning)>250 else ''}")
+    # El razonamiento ya viajó por su canal DEDICADO en streaming
+    # (on_reasoning → ReasoningEvent en la Web UI). NUNCA se imprime: stdout
+    # es el canal de logs y el razonamiento no debe aparecer ahí.
+    # _parse_ornith_thinking queda como red de seguridad: si un marcador se
+    # coló por el stream (caso degenerado), se rescata acá sin duplicar.
+    _razonamiento_rescate, respuesta = _parse_ornith_thinking(raw)
+    reasoning = "".join(razonamiento) or _razonamiento_rescate
 
     comando_colado = _extraer_comando_de_texto(respuesta)
     if comando_colado:
@@ -3417,9 +3577,12 @@ def node_plan_synthesizer(state: AetherState) -> dict:
             contexto_datos += f"\n\n[ACCIONES EJECUTADAS EN PANTALLA]:\n{state['computer_use_result']}"
 
     tokens = []
+    razonamiento: list[str] = []
     def _on_token(t):
         tokens.append(t)
         emit_token(t)          # 👈 antes era print(t, end="", flush=True) (+ el print del prefijo)
+    def _on_reasoning(t):
+        razonamiento.append(t)
 
     raw = _llm_chat(
         system=_system_prompt_sintesis(mem, state),
@@ -3430,13 +3593,14 @@ def node_plan_synthesizer(state: AetherState) -> dict:
             "No menciones los pasos internos ni el proceso técnico, solo el resultado."
         ),
         on_token=_on_token,
+        on_reasoning=_on_reasoning,
     )
 
     # ya no hace falta el `if tokens: print()` de acá abajo, se borra
 
-    reasoning, respuesta = _parse_ornith_thinking(raw)
-    if reasoning:
-        print(f"\n🧠 [Ornith thinking (síntesis)]: {reasoning[:200]}{'...' if len(reasoning)>200 else ''}")
+    # Razonamiento por canal dedicado (ídem node_text): sin print a logs.
+    _razonamiento_rescate, respuesta = _parse_ornith_thinking(raw)
+    reasoning = "".join(razonamiento) or _razonamiento_rescate
 
     return {
         "final_response": respuesta,

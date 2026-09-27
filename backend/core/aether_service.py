@@ -57,9 +57,22 @@ class TokenEvent:
 
 
 @dataclass
+class ReasoningEvent:
+    """Fragmento de streaming de RAZONAMIENTO del modelo.
+
+    Canal SEPARADO de la respuesta: nunca se mezcla con TokenEvent (content
+    limpio), ni con StdoutLineEvent (logs). La Web UI lo usa para el bloque
+    de razonamiento expandible bajo la cabecera de estado.
+    """
+    fragmento: str
+
+
+@dataclass
 class DoneEvent:
-    """El grafo terminó. Trae la respuesta final."""
+    """El grafo terminó. Trae la respuesta final y el razonamiento completo
+    del turno (por robustez, por si algún fragmento de streaming se perdió)."""
     respuesta: str
+    reasoning: str = ""
 
 
 @dataclass
@@ -68,7 +81,8 @@ class ErrorEvent:
     mensaje: str
 
 
-Evento = NodeUpdateEvent | StdoutLineEvent | TokenEvent | DoneEvent | ErrorEvent
+Evento = (NodeUpdateEvent | StdoutLineEvent | TokenEvent | ReasoningEvent
+          | DoneEvent | ErrorEvent)
 
 
 class _QueueWriter:
@@ -170,10 +184,14 @@ class AetherService:
             _AETHER_MEMORY["resumen"] = texto
 
     @staticmethod
-    def process_message(user_message: str) -> Dict[str, Any]:
+    def process_message(user_message: str,
+                        imagenes: list[str] | None = None) -> Dict[str, Any]:
         """
         Procesa un mensaje del usuario y devuelve respuesta del agente
         (bloqueante, sin streaming). Para la Web UI usar iter_eventos().
+
+        imagenes: thumbnails b64 de adjuntos (visión inline del modelo
+        principal, ver backend/core/attachments.py).
         """
         try:
             AetherService._asegurar_inicializado()
@@ -186,7 +204,9 @@ class AetherService:
 
             with _AETHER_LOCK:
                 logger.debug(f"Procesando mensaje: {user_message[:50]}...")
-                respuesta = procesar_orden_grafo(user_message, _AETHER_MEMORY, modo_autonomo=True)
+                respuesta = procesar_orden_grafo(
+                    user_message, _AETHER_MEMORY, modo_autonomo=True,
+                    imagenes=imagenes)
 
             return {"response": respuesta, "agent_status": "ready"}
 
@@ -195,13 +215,16 @@ class AetherService:
             return {"response": "Aether encontró un error interno", "agent_status": "error"}
 
     @staticmethod
-    def iter_eventos(orden: str) -> Iterator[Evento]:
+    def iter_eventos(orden: str,
+                     imagenes: list[str] | None = None) -> Iterator[Evento]:
         """
         Generador con STREAMING real del grafo (mismo contrato que la TUI):
         TokenEvent / StdoutLineEvent / NodeUpdateEvent / DoneEvent / ErrorEvent.
 
         Lanza el grafo en un hilo y los eventos llegan vía queue.Queue.
         Solo una inferencia a la vez (token sink global compartido con la TUI).
+
+        imagenes: thumbnails b64 de adjuntos de imagen (visión inline).
         """
         from core.agent.streaming import reset_cancel
         reset_cancel()
@@ -221,7 +244,7 @@ class AetherService:
 
         q: "queue.Queue[Evento]" = queue.Queue()
         hilo = threading.Thread(
-            target=_correr_grafo_en_hilo, args=(orden, q), daemon=True
+            target=_correr_grafo_en_hilo, args=(orden, q, imagenes), daemon=True
         )
         hilo.start()
 
@@ -272,7 +295,8 @@ class AetherService:
 # =====================================================================
 # EJECUCIÓN DEL GRAFO EN HILO (espejo de tui/engine_bridge.py)
 # =====================================================================
-def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
+def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
+                           imagenes: list[str] | None = None) -> None:
     writer = _QueueWriter(q)
     try:
         from core.agent.graph_builder import get_graph
@@ -281,15 +305,34 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
         from core.agent.streaming import (
             InferenceCancelled,
             set_token_sink,
+            set_reasoning_sink,
             clear_token_sink,
+            clear_reasoning_sink,
         )
         from core.memory.consolidator import programar_consolidacion
 
         set_token_sink(lambda frag: q.put(TokenEvent(fragmento=frag)))
-        registrar_turno(_AETHER_MEMORY, "usuario", orden)
+
+        # Canal de razonamiento: separado de tokens y de stdout (logs).
+        # Además de streamear cada fragmento, se acumula el razonamiento del
+        # turno para el DoneEvent (por si el cliente pierde fragmentos).
+        razonamiento_turno: list[str] = []
+
+        def _sink_reasoning(frag: str) -> None:
+            razonamiento_turno.append(frag)
+            q.put(ReasoningEvent(fragmento=frag))
+
+        set_reasoning_sink(_sink_reasoning)
+
+        # NO registrar el turno del usuario aquí: si lo hacemos antes de correr
+        # el grafo, el context_manager lo verá en la memoria y lo incluirá en
+        # el contexto de conversación. El modelo vería el mensaje del usuario
+        # tanto en el historial como en el prompt actual, generando eco.
+        # El turno del usuario se registra al final (ver bloque finally).
 
         grafo = get_graph()
-        estado = crear_estado_inicial(orden, _AETHER_MEMORY, modo_autonomo=True)
+        estado = crear_estado_inicial(orden, _AETHER_MEMORY, modo_autonomo=True,
+                                      imagenes=imagenes)
         ultimo_estado: dict[str, Any] = dict(estado)
 
         with contextlib.redirect_stdout(writer):
@@ -302,7 +345,7 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
 
         respuesta = ultimo_estado.get("final_response") or "Operación completada."
         programar_consolidacion(_AETHER_MEMORY)
-        q.put(DoneEvent(respuesta=respuesta))
+        q.put(DoneEvent(respuesta=respuesta, reasoning="".join(razonamiento_turno)))
 
     except InferenceCancelled:
         writer.vaciar_residual()
@@ -312,8 +355,17 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
         q.put(ErrorEvent(mensaje=f"{type(e).__name__}: {e}"))
     finally:
         try:
-            from core.agent.streaming import clear_token_sink
+            from core.agent.streaming import clear_token_sink, clear_reasoning_sink
             clear_token_sink()
+            clear_reasoning_sink()
+        except Exception:
+            pass
+        # Registrar el turno del usuario AHORA (después de que el grafo terminó).
+        # Así el context_manager no lo ve en el historial de la inferencia actual,
+        # evitando que el modelo eco el mensaje del usuario.
+        try:
+            from core.memory.memory_manager import registrar_turno
+            registrar_turno(_AETHER_MEMORY, "usuario", orden)
         except Exception:
             pass
         # Una sola inferencia a la vez: el lock se libera ACÁ, en el hilo,

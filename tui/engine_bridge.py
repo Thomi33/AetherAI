@@ -244,7 +244,11 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
         from core.agent.streaming import InferenceCancelled, set_token_sink, clear_token_sink
 
         set_token_sink(lambda frag: q.put(TokenEvent(fragmento=frag)))
-        registrar_turno(_motor.mem, "usuario", orden)
+        # FIX eco: NO registrar el turno del usuario antes de correr el grafo.
+        # obtener_turnos_por_tema lee del store PERSISTENTE, así que el turno
+        # recién registrado terminaba en el contexto de CONVERSACIÓN → el
+        # modelo veía su input dos veces (historial + prompt) y lo ecoaba.
+        # Se registra al final (bloque finally), cuando la inferencia ya corrió.
 
         grafo = get_graph()
         estado = crear_estado_inicial(orden, _motor.mem, modo_autonomo=True)
@@ -272,6 +276,13 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
         writer.vaciar_residual()
         q.put(ErrorEvent(mensaje=f"{type(e).__name__}: {e}"))
     finally:
+        # Registrar el turno del usuario AHORA (después de la inferencia):
+        # el context_manager ya no lo ve en el historial del turno actual.
+        try:
+            from core.memory.memory_manager import registrar_turno
+            registrar_turno(_motor.mem, "usuario", orden)
+        except Exception:
+            pass
         try:
             from core.agent.streaming import clear_token_sink
             clear_token_sink()

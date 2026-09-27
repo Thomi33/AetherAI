@@ -90,11 +90,42 @@ def _delta_front(delta) -> dict:
     return out
 
 
+def _payload_de_evento(event) -> dict | None:
+    """Convierte eventos internos a payloads SSE/WS normalizados.
+    Devuelve None para eventos desconocidos (se omiten en el stream)."""
+    from backend.core.aether_service import (
+        TokenEvent, ReasoningEvent, NodeUpdateEvent, StdoutLineEvent,
+        DoneEvent, ErrorEvent,
+    )
+    if isinstance(event, TokenEvent):
+        return {"type": "token", "data": event.fragmento}
+    if isinstance(event, ReasoningEvent):
+        return {"type": "reasoning", "data": event.fragmento}
+    if isinstance(event, NodeUpdateEvent):
+        return {
+            "type": "node",
+            "node": event.nodo,
+            "estado": getattr(event, "estado", ""),
+            "delta": _delta_front(event.delta),
+        }
+    if isinstance(event, StdoutLineEvent):
+        return {"type": "log", "data": event.texto}
+    if isinstance(event, DoneEvent):
+        return {
+            "type": "done",
+            "response": event.respuesta,
+            "reasoning": event.reasoning or "",
+        }
+    if isinstance(event, ErrorEvent):
+        return {"type": "error", "message": event.mensaje}
+    return None  # tipo desconocido → se omite
+
+
 def _extraer_mensaje(request: dict) -> str:
     return (request.get("message") or request.get("content") or "").strip()
 
 
-def _preparar_orden(body: dict) -> tuple[str, list[dict]]:
+def _preparar_orden(body: dict) -> tuple[str, list[dict], list[str]]:
     """
     Mensaje del usuario + adjuntos (imágenes/archivos) → orden final para el
     grafo. Los adjuntos pueden venir de dos formas (se mezclan):
@@ -105,28 +136,46 @@ def _preparar_orden(body: dict) -> tuple[str, list[dict]]:
       su contenido por el body (evita el bug de "adjunto vacío" y el
       doble envío de base64 pesado).
 
-    Devuelve (orden, metas).
+    Devuelve (orden, metas, imagenes_b64).
     """
     mensaje = _extraer_mensaje(body)
     adjuntos = body.get("attachments") or []
     if not isinstance(adjuntos, list) or not adjuntos:
-        return mensaje, []
+        return mensaje, [], []
     from backend.core.attachments import (
         adjuntos_ya_guardados, componer_orden, guardar_adjuntos,
+        generar_thumbnail_b64, modelo_admite_imagenes,
     )
+    from core.config.settings import MODELO
     pendientes = [a for a in adjuntos if a.get("data")]
     pre_subidos = [a for a in adjuntos if not a.get("data") and a.get("path")]
     metas_previas = adjuntos_ya_guardados(pre_subidos)
     metas_nuevas, errores = guardar_adjuntos(pendientes)
     metas = metas_previas + metas_nuevas
-    return componer_orden(mensaje, metas, errores), metas
+
+    # Verificar si el modelo soporta visión nativa
+    soporta_vision = modelo_admite_imagenes(MODELO)
+
+    # Generar thumbnails para imágenes SOLO si el modelo soporta visión
+    imagenes_b64 = []
+    if soporta_vision:
+        for m in metas:
+            if m.get("kind") == "image" and m.get("path"):
+                thumb = generar_thumbnail_b64(m["path"])
+                if thumb:
+                    imagenes_b64.append(thumb)
+
+    # inline=True saltea la descripción por visión (modelo la ve directo)
+    inline = bool(imagenes_b64)
+    orden = componer_orden(mensaje, metas, errores, describir=not inline, inline=inline)
+    return orden, metas, imagenes_b64
 
 
 @router.post("/chat")
 async def chat(request: dict):
     # La preparación puede describir imágenes con el modelo de visión
     # (segundos): nunca dentro del event loop.
-    orden, _metas = await asyncio.get_running_loop().run_in_executor(
+    orden, _metas, _imagenes = await asyncio.get_running_loop().run_in_executor(
         None, _preparar_orden, request)
     if not orden.strip():
         return JSONResponse(
@@ -141,7 +190,7 @@ async def chat(request: dict):
 async def chat_stream(raw_request: Request):
     body = await raw_request.json()
     # Igual que /chat: visión/IO fuera del event loop.
-    orden, _metas = await asyncio.get_running_loop().run_in_executor(
+    orden, _metas, _imagenes = await asyncio.get_running_loop().run_in_executor(
         None, _preparar_orden, body)
     if not orden.strip():
         return JSONResponse(
@@ -180,7 +229,17 @@ async def chat_stream(raw_request: Request):
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     async def stream_response():
-        yield f"data: {json.dumps({'type': 'start', 'busy': AetherService.ocupado()})}\n\n"
+        # Include model reasoning capability in start event so frontend knows
+        # whether to show reasoning block (only for models with native reasoning)
+        from core.config.settings import MODELO
+        from backend.core.attachments import modelo_admite_imagenes
+        # Check if model supports reasoning (native thinking models)
+        # Currently models with vision typically also support reasoning
+        # but we use a more specific check: models that emit ReasoningEvent
+        # For now, assume models with "gemma" or "qwen" or "deepseek" in name support reasoning
+        model_name = MODELO.lower()
+        has_reasoning = any(x in model_name for x in ("gemma", "qwen", "deepseek", "r1", "reasoning"))
+        yield f"data: {json.dumps({'type': 'start', 'busy': AetherService.ocupado(), 'reasoning': has_reasoning})}\n\n"
 
         gen = _consumir()
         loop = asyncio.get_running_loop()
@@ -336,4 +395,70 @@ async def transcribe_audio_stream(
     # TODO: implementar streaming de progreso real con faster-whisper
     # Por ahora, delega al endpoint simple
     return await transcribe_audio(file, model)
+
+
+@router.get("/attachments/file")
+async def get_attachment_file(
+    path: str | None = None,
+    name: str | None = None,
+    thumb: int = 0,
+):
+    """Sirve un archivo adjunto guardado (o su thumbnail) para la Web UI.
+
+    Parámetros:
+    - path: ruta absoluta del archivo en disco (prioridad 1)
+    - name: nombre del archivo original (busca en el directorio de adjuntos, prioridad 2)
+    - thumb: 1 = devolver thumbnail JPEG, 0 = archivo original
+
+    Responde 404 si el archivo no existe o está fuera del directorio permitido.
+    """
+    from backend.core.attachments import _directorio_adjuntos, generar_thumbnail_b64
+    from fastapi.responses import Response
+    from pathlib import Path
+
+    base_dir = _directorio_adjuntos()
+
+    # Resolver path del archivo
+    target_path: Path | None = None
+    if path:
+        target_path = Path(path)
+    elif name:
+        # Buscar archivo que termine con el nombre dado (maneja prefijo timestamp)
+        try:
+            for f in base_dir.iterdir():
+                if f.is_file() and f.name.endswith("_" + name) or f.name == name:
+                    target_path = f
+                    break
+        except OSError:
+            pass
+        if target_path is None:
+            return JSONResponse({"detail": "Archivo no encontrado"}, status_code=404)
+    else:
+        return JSONResponse({"detail": "Falta 'path' o 'name'"}, status_code=404)
+
+    # Seguridad: path debe estar dentro del directorio de adjuntos
+    try:
+        target_path = target_path.resolve()
+        if not target_path.is_relative_to(base_dir.resolve()):
+            return JSONResponse({"detail": "Acceso denegado"}, status_code=404)
+    except (ValueError, RuntimeError):
+        return JSONResponse({"detail": "Path inválido"}, status_code=404)
+
+    if not target_path.exists():
+        return JSONResponse({"detail": "Archivo no encontrado"}, status_code=404)
+
+    if thumb:
+        # Generar/devolver thumbnail
+        thumb_b64 = generar_thumbnail_b64(target_path)
+        if thumb_b64:
+            import base64
+            return Response(content=base64.b64decode(thumb_b64), media_type="image/jpeg")
+        # Si no se pudo generar thumbnail, servir original
+        thumb = 0
+
+    # Servir archivo original
+    return Response(
+        content=target_path.read_bytes(),
+        media_type="application/octet-stream",
+    )
 

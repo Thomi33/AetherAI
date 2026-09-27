@@ -228,7 +228,6 @@ Los valores más importantes son:
 - `AETHER_DATA_DIR`: carpeta donde se guardan memoria, notas y logs.
 - `NUM_CTX`: contexto efectivo; el instalador lo ajusta según hardware.
 - `NUM_PREDICT`: máximo de tokens generados.
-- `MAX_AGENT_STEPS`: límite de iteraciones del agente.
 - `OLLAMA_KEEP_ALIVE`, threads y batch: parámetros de latencia y memoria.
 - `STT_ENABLED`: dictado por voz opcional.
 
