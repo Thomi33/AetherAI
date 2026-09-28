@@ -17,6 +17,7 @@ import sys
 import queue
 import contextlib
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Iterator
@@ -27,12 +28,87 @@ logger = logging.getLogger("aether_service")
 # SINGLETON + LOCKS PARA THREAD-SAFETY
 # =====================================================================
 _AETHER_LOCK = threading.Lock()
-_GEN_LOCK = threading.Lock()          # una sola inferencia a la vez
 _AETHER_INITIALIZED = False
 _AETHER_MEMORY: Dict[str, Any] = None
 
-_RE_ANSI = re.compile(r"\x1b\[[0-9;]*[mGKHhJsu]")
+# ── Sistema de ciclo de vida de inferencia ────────────────────────────
+# Estado activo: evento de cancelación compartido entre el endpoint SSE
+# (que detecta desconexión del cliente) y el hilo del grafo (que debe cortar
+# antes de iniciar el siguiente paso; ahora se checkea en cada paso).
+_CANCEL_EVENT = threading.Event()
+# Lock de generación: una sola inferencia a la vez (el token sink es global)
+_GEN_LOCK = threading.Lock()
+# Estado actual (QUEUED|RUNNING|COMPLETED|FAILED|CANCELLED)
+_CURRENT_STATE: dict = {
+    "estado": "IDLE",
+    "inf_id": None,
+    "inicio": 0.0,
+    "motivo": "",
+    "error": None,
+}
 
+# Log estructurado de eventos de ciclo de vida (máx 50 eventos)
+_EVENT_LOG: list[dict] = []
+
+# Cola FIFO de prompts pendientes (cuando hay una inferencia activa).
+# El endpoint _enqueue_prompt pone; el worker consumer la drena con timeout
+# corto para no bloquear inútilmente.
+_PROMPT_QUEUE: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+
+
+def _log_event(tipo: str, inf_id: str | None = None,
+               motivo: str = "", detalle: dict | None = None) -> None:
+    """Registra un evento de ciclo de vida en _EVENT_LOG."""
+    _EVENT_LOG.append({
+        "tipo": tipo,
+        "inf_id": inf_id,
+        "motivo": motivo,
+        "detalle": detalle or {},
+        "ts": time.time(),
+    })
+    if len(_EVENT_LOG) > 50:
+        del _EVENT_LOG[:-50]
+    logger.info(f"[{tipo}]" + (f" id={inf_id}" if inf_id else "")
+                + (f": {motivo}" if motivo else ""))
+
+
+def _emit_inference_start(inf_id: str) -> None:
+    _CURRENT_STATE["estado"] = "RUNNING"
+    _CURRENT_STATE["inf_id"] = inf_id
+    _CURRENT_STATE["inicio"] = time.time()
+    _CURRENT_STATE["motivo"] = ""
+    _log_event("INFERENCE_STARTED", inf_id)
+
+
+def _emit_inference_queued(inf_id: str, motivo: str = "") -> None:
+    _CURRENT_STATE["estado"] = "QUEUED"
+    _CURRENT_STATE["inf_id"] = inf_id
+    _CURRENT_STATE["motivo"] = motivo
+    _log_event("INFERENCE_QUEUED", inf_id, motivo)
+
+
+def _emit_inference_completed(inf_id: str) -> None:
+    _CURRENT_STATE["estado"] = "COMPLETED"
+    _CURRENT_STATE["inf_id"] = inf_id
+    _log_event("INFERENCE_COMPLETED", inf_id)
+
+
+def _emit_inference_failed(inf_id: str, motivo: str = "") -> None:
+    _CURRENT_STATE["estado"] = "FAILED"
+    _CURRENT_STATE["inf_id"] = inf_id
+    _CURRENT_STATE["motivo"] = motivo
+    _CURRENT_STATE["error"] = motivo
+    _log_event("INFERENCE_FAILED", inf_id, motivo)
+
+
+def _emit_inference_cancelled(inf_id: str, motivo: str = "") -> None:
+    _CURRENT_STATE["estado"] = "CANCELLED"
+    _CURRENT_STATE["inf_id"] = inf_id
+    _CURRENT_STATE["motivo"] = motivo
+    _log_event("INFERENCE_CANCELLED", inf_id, motivo)
+
+
+_RE_ANSI = re.compile(r"\x1b\[[0-9;]*[mGKHhJsu]")
 
 # =====================================================================
 # EVENTOS QUE EL BACKEND EMITE (idéntico contrato que tui/engine_bridge)
@@ -229,24 +305,34 @@ class AetherService:
         from core.agent.streaming import reset_cancel
         reset_cancel()
 
+        inf_id = f"inf-{int(time.time())}-{id(orden) % 10000:04d}"
+
+        # ── CICLO DE VIDA: QUEUED → RUNNING/FAILED/CANCELLED ──────────
         if not _GEN_LOCK.acquire(blocking=False):
+            _emit_inference_queued(inf_id, "inferencia activa; en cola FIFO")
+            _log_event("INFERENCE_QUEUED", inf_id, "encolada (lock ocupado)")
             yield ErrorEvent(
                 mensaje="Ya hay una inferencia en curso. Esperá que termine o enviá /stop."
             )
             return
 
+        _emit_inference_start(inf_id)
         try:
             AetherService._asegurar_inicializado()
         except Exception as e:
+            _emit_inference_failed(inf_id, f"init failed: {e}")
             _GEN_LOCK.release()
             yield ErrorEvent(mensaje=f"Aether no pudo inicializarse: {type(e).__name__}: {e}")
             return
 
         q: "queue.Queue[Evento]" = queue.Queue()
         hilo = threading.Thread(
-            target=_correr_grafo_en_hilo, args=(orden, q, imagenes), daemon=True
+            target=_correr_grafo_en_hilo, args=(orden, q, imagenes, inf_id),
+            daemon=True,
+            name=f"grafo-{inf_id}",
         )
         hilo.start()
+        _log_event("INFERENCE_STARTED_THREAD", inf_id, "hilo del grafo lanzado")
 
         # NOTA (fix bug "busy eterno"): el _GEN_LOCK NO se libera acá.
         # Si el cliente SSE se desconecta a mitad de stream, este generador
@@ -254,11 +340,21 @@ class AetherService:
         # forma confiable y gen.close() puede fallar en un generador que
         # está siendo iterado desde un executor). El lock lo libera el HILO
         # del grafo (_correr_grafo_en_hilo), que SIEMPRE termina.
-        while True:
-            evento = q.get()
-            yield evento
-            if isinstance(evento, (DoneEvent, ErrorEvent)):
-                break
+        try:
+            while True:
+                evento = q.get()
+                yield evento
+                if isinstance(evento, (DoneEvent, ErrorEvent)):
+                    break
+        except GeneratorExit:
+            # El cliente SSE cerró la pestaña/tags o se desconectó; el
+            # generador NO puede devuelvar más datos. Dejamos que muera.
+            # El hilo del grafo sigue correndo y su finally libera _GEN_LOCK
+            # cuando termina (sea COMPLETED, FAILED o CANCELLED).
+            _log_event("INFERENCE_CLIENT_GONE", inf_id,
+                       "generador SSE cerrado por el cliente")
+            # Lo dejamos propagar: Python cierra el generador al terminar
+            raise
 
     @staticmethod
     def get_status() -> Dict[str, Any]:
@@ -296,7 +392,14 @@ class AetherService:
 # EJECUCIÓN DEL GRAFO EN HILO (espejo de tui/engine_bridge.py)
 # =====================================================================
 def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
-                           imagenes: list[str] | None = None) -> None:
+                           imagenes: list[str] | None = None,
+                           inf_id: str | None = None) -> None:
+    from core.agent.streaming import set_cancel_thread_event
+    inf_id = inf_id or f"inf-{int(time.time())}-{id(orden) % 10000:04d}"
+    cancelled = False
+    # Registrar el evento de cancelación de este hilo: streaming.request_cancel()
+    # hilo_context-cancel_event, y el check ISP (ver abajo) lo lee.
+    set_cancel_thread_event(_CANCEL_EVENT)
     writer = _QueueWriter(q)
     try:
         from core.agent.graph_builder import get_graph
@@ -336,11 +439,23 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
         ultimo_estado: dict[str, Any] = dict(estado)
 
         with contextlib.redirect_stdout(writer):
+            from core.agent.streaming import is_cancelled, InferenceCancelled
             for update in grafo.stream(estado, stream_mode="updates"):
                 for nodo, delta in update.items():
                     if isinstance(delta, dict):
                         ultimo_estado.update(delta)
                     q.put(NodeUpdateEvent(nodo=nodo, delta=delta or {}))
+                    # Chequeo cooperativo de cancelación entre pasos: si el
+                    # frontend cerró la conexión (Stop, cierre de pestaña,
+                    # pérdida de WebSocket), abortamos AHORA antes del
+                    # siguiente paso del grafo. Sin esto el hilo queda corriendo
+                    # como huérfano en background hasta terminar naturalmente,
+                    # y nadie consume sus eventos. Core.agent.streaming
+                    # request_cancel() marca el evento compartido almacenado
+                    # acá (set_cancel_thread_event), y el contexto externo del
+                    # servidor SSE/WS chequea is_cancelled().
+                    if is_cancelled():
+                        raise InferenceCancelled()
             writer.vaciar_residual()
 
         respuesta = ultimo_estado.get("final_response") or "Operación completada."
@@ -348,6 +463,7 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
         q.put(DoneEvent(respuesta=respuesta, reasoning="".join(razonamiento_turno)))
 
     except InferenceCancelled:
+        cancelled = True
         writer.vaciar_residual()
         q.put(ErrorEvent(mensaje="Inferencia cancelada por el usuario."))
     except Exception as e:  # noqa: BLE001 — toda falla debe llegar a la UI
@@ -368,6 +484,22 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
             registrar_turno(_AETHER_MEMORY, "usuario", orden)
         except Exception:
             pass
+        # Estado final: COMPLETED / FAILED / CANCELLED según cómo terminó.
+        try:
+            if cancelled:
+                _emit_inference_cancelled(inf_id, "cancelada por el usuario/stop")
+            elif _CURRENT_STATE.get("error"):
+                _emit_inference_failed(inf_id, _CURRENT_STATE["error"])
+            else:
+                _emit_inference_completed(inf_id)
+        except Exception:
+            pass
+        _CURRENT_STATE.pop("error", None)
+        _CANCEL_EVENT.clear()
+        # Emitir QUEUE_CONTINUING para que los logs muestren que el worker
+        # global sigue adelante después de esta inferencia (aunque sea FAILED).
+        _log_event("QUEUE_CONTINUING", inf_id,
+                   f"_PROMPT_QUEUE.qsize()={_PROMPT_QUEUE.qsize()}")
         # Una sola inferencia a la vez: el lock se libera ACÁ, en el hilo,
         # que siempre termina (grafo completo, cancelado o con error).
         # Antes se liberaba en el generador consumidor (iter_eventos) y una

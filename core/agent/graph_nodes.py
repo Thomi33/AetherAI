@@ -1505,6 +1505,25 @@ def node_agent_loop(state: AetherState) -> dict:
     if not tool_calls:
         _, texto_final = _parse_ornith_thinking(contenido)
         texto_final = _limpiar_artefactos_tool_call(texto_final or contenido)
+
+        # FIX acciones fantasma: si el modelo NUNCA llamó una herramienta
+        # en el loop completo (agent_pasos_log vacío), y aun así afirma que
+        # ejecutó algo (creó, escribió, instaló...), es una acción fantasma.
+        # La respuesta es texto puro, no evidencia de ejecución.
+        if not agent_pasos_log and any(x in texto_final.lower() for x in (
+            "creé", "guardé", "escribí", "ejecuté", "ejecuté", "generé",
+            "instalé", "corrí", "creado", "creado", "guardado", "guardado",
+            "escrito", "escrito", "ejecutado", "ejecutado", "generado",
+            "generado", "instalado", "corrido",
+        )):
+            print("   └─ ⚠️  [AGENT LOOP]: El modelo respondió SIN ejecutar "
+                  "ninguna herramienta (acción fantasma). La respuesta puede "
+                  "contener afirmaciones no verificadas del sistema.")
+            texto_final = (texto_final + "\n\n⚠️  Nota: la respuesta anterior "
+                           "indica acciones (crear archivos, ejecutar, escribir) "
+                           "pero ninguna herramienta fue llamada en este turno. "
+                           "Verificá que los archivos o acciones realmente existen.")
+
         print(f"   └─ [AGENT LOOP]: Respuesta final tras {len(agent_pasos_log)} paso(s) de tool calling.")
         return {
             "final_response": texto_final or contenido,

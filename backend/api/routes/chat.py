@@ -22,6 +22,9 @@ from backend.core.aether_service import (
     NodeUpdateEvent,
     DoneEvent,
     ErrorEvent,
+    _log_event,
+    _CURRENT_STATE,
+    _CANCEL_EVENT,
 )
 from core.utils.response_cleaner import limpiar_respuesta_chat
 from tui.status_messages import real_state_for_node
@@ -244,10 +247,34 @@ async def chat_stream(raw_request: Request):
         gen = _consumir()
         loop = asyncio.get_running_loop()
         _VACIO = itertools.chain()  # sentinel del run_in_executor
+        inf_id_global = [None]  # referencia mutable para logging
+
+        def _client_gone() -> bool:
+            """Chequea desconexión del cliente sin bloquear."""
+            try:
+                return loop.run_in_executor(
+                    None, asyncio.run, asyncio.wait_for(
+                        raw_request.is_disconnected(), timeout=0.01))
+            except Exception:
+                return raw_request.is_disconnected() is not False
 
         pending = None  # futuro del executor que corre next(gen) — uno solo
         try:
             while True:
+                # Chequeo de desconexión al inicio de cada iteración del while
+                # (antes de llamar al generador síncrono que llamaría a next()).
+                # Si el cliente cerró: no abortamos la inferencia activa, solo
+                # dejamos de consumir y el hilo del grafo libera el lock.
+                try:
+                    disconnected = await asyncio.wait_for(
+                        raw_request.is_disconnected(), timeout=0.01)
+                except asyncio.TimeoutError:
+                    disconnected = False
+                if disconnected:
+                    _log_event("BACKEND_FRONTEND_CONNECTION_ERROR", None,
+                               "cliente desconectado (detectado antes de next(gen))")
+                    break
+
                 if pending is None:
                     pending = loop.run_in_executor(None, next, gen, _VACIO)
                 try:
@@ -259,6 +286,8 @@ async def chat_stream(raw_request: Request):
                         # Cliente se fue: dejar de consumir. El lock lo
                         # libera el hilo del grafo al terminar (fix del bug
                         # "busy eterno" — ver aether_service._correr_grafo_en_hilo).
+                        _log_event("BACKEND_FRONTEND_CONNECTION_ERROR", None,
+                                   "cliente desconectado durante stream")
                         break
                     yield ": keep-alive\n\n"  # mantiene proxies/conexión vivos
                     continue

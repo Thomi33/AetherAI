@@ -298,6 +298,13 @@ def construir_prompt_agent_loop(contexto_memoria: str) -> str:
 - web: buscar información en internet.
 - text: nada que ejecutar — respondés directamente.
 
+[SEPARACIÓN ACCIÓN vs RESPUESTA — CRÍTICO]:
+- "text" SOLO para charla, reporte de resultados verificados, o cuando la tarea ya se completó.
+- NUNCA respondas con texto si la tarea implica crear/escribir/ejecutar/modificar algo: llamá la tool correspondiente.
+- Si el Creador pide "creá un archivo", "escribí código", "generá un script", "ejecutá esto" → llamá fs_write o shell ANTES de responder. No digas que lo hiciste hasta que la tool devuelva resultado.
+- Respuesta sin tool = SOLO reply de charla, no verificado. Si la tarea requiere que algo exista en el sistema (archivo, proceso, dato), eso solo corre cuando la tool devuelve éxito.
+- Si la herramienta falla, NO afirmes éxito. Decí el error real y ofrecé un siguiente paso.
+
 [REGLAS]:
 - Respondé SIEMPRE en español, breve y directo, como un amigo técnico.
 - No repitas una herramienta con los mismos argumentos si ya devolvió resultado.
