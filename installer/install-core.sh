@@ -346,6 +346,40 @@ fi
 echo "🧪 Validando instalación..."
 python -c 'import langgraph, mcp; print("   ✔ Python core OK")' 2>/dev/null || warn "Algunas dependencias Python del core faltan."
 python -c 'import whisper; print("   ✔ Whisper OK")' 2>/dev/null || warn "Whisper no está disponible."
+
+# ---------------------------------------------------------------------------
+# 7b. Estructura de datos de Aether (memoria y artefactos) — SOLO si faltan.
+#     Cada instalación arranca con SU PROPIA memoria vacía: los datos viven
+#     en AETHER_DATA_DIR (fuera del repo, ignorados por Git) y jamás se
+#     commitean ni se comparten entre instalaciones.
+# ---------------------------------------------------------------------------
+DATA_DIR="$(grep '^AETHER_DATA_DIR=' .env 2>/dev/null | cut -d= -f2-)"
+DATA_DIR="${DATA_DIR:-$HOME/Aether}"
+for sub in db notes logs screenshots embeddings backups adjuntos avatars skills; do
+  mkdir -p "$DATA_DIR/$sub"
+done
+if [ ! -f "$DATA_DIR/db/memoria.json" ]; then
+  cat > "$DATA_DIR/db/memoria.json.tmp" <<'AETHER_EOF'
+{
+ "version": 2,
+ "core": {},
+ "resumen": {
+  "texto": "",
+  "ultimo_turno_id": 0,
+  "actualizado": ""
+ },
+ "conversaciones": [],
+ "comandos": [],
+ "recuerdos": []
+}
+AETHER_EOF
+  mv "$DATA_DIR/db/memoria.json.tmp" "$DATA_DIR/db/memoria.json"
+  ok "Memoria inicializada (vacía) en $DATA_DIR/db/memoria.json"
+else
+  ok "Memoria existente preservada: $DATA_DIR/db/memoria.json"
+fi
+ok "Datos personales en: $DATA_DIR (fuera del repo, nunca se commitean)"
+
 mkdir -p "$LAUNCH_DEST"
 [ -x "$PWD/bin/aether" ] && { ln -sf "$PWD/bin/aether" "$LAUNCH_DEST/aether"; ok "aether disponible en $LAUNCH_DEST"; }
 assert_repository_integrity
@@ -386,6 +420,7 @@ cat <<EOF
    Whisper: $(python -c 'import whisper; print("OK")' 2>/dev/null || echo "pendiente")
    Config base: core/config/config.json (versionada, protegida)
    Config local: core/config/config.local.json (hardware/usuario, ignorada por Git)
+   Memoria+datos: $DATA_DIR (personales y vacíos al instalar; nunca se commitean)
 
 👉 Ejecutá: aether
 EOF

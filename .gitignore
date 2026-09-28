@@ -42,6 +42,15 @@ logs/
 *.sqlite
 *.sqlite3
 
+# Memoria/datos de Aether — viven en AETHER_DATA_DIR (~/Aether por defecto,
+# FUERA del repo). Defensa extra por si alguien apunta AETHER_DATA_DIR a una
+# carpeta dentro del repo: la memoria es personal y jamás se commitea.
+/db/
+memoria.json
+memoria.json.bak
+memoria.json.tmp
+memoria.corrupt-*.json
+
 # Aether
 embeddings/
 screenshots/
