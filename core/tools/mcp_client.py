@@ -21,15 +21,25 @@ que hay asyncio corriendo adentro.
 
 CONFIGURACIÓN
 ─────────────
-Los servers se configuran en un JSON separado (ver core/config/mcp_servers.json
-o la ruta que definas en core/config/settings.py), con esta forma:
+Dos capas, mismo patrón que config.json / config.local.json:
+
+  1. core/config/mcp_servers.json        → PLANTILLA versionada: servers
+     conocidos con placeholders "{token}" (nunca tokens reales; el runtime
+     jamás la escribe — el repo la distribuye como ejemplo editable).
+  2. core/config/mcp_servers.local.json  → capa LOCAL ignorada por Git:
+     tokens reales, servers custom, toggles de enabled y tombstones. TODO
+     lo que escribe el runtime (Web UI /mcps, TUI /mcps) vive acá.
+
+La vista que consume el manager es el MERGE por-server a nivel campo
+(local pisa campo a campo; servers solo-locales se agregan; un server de
+la plantilla con "__deleted__": true en local queda oculto):
 
     {
       "notion": {
         "transport": "stdio",
         "command": "npx",
         "args": ["-y", "@notionhq/mcp-server"],
-        "env": {"NOTION_API_KEY": "..."}
+        "env": {"NOTION_API_KEY": "..."}   ← el token REAL va en el local
       }
     }
 
@@ -69,16 +79,34 @@ class MCPToolCallError(MCPError):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# CONFIGURACIÓN
+# CONFIGURACIÓN — dos capas (mismo patrón que config.json/config.local.json)
 # ══════════════════════════════════════════════════════════════════════
+#   1. mcp_servers.json       → plantilla VERSIONADA: servers conocidos con
+#      placeholders "{token}". El runtime NUNCA la escribe; el repo la
+#      distribuye como ejemplo editable para que cada usuario ponga sus
+#      tokens en la capa local.
+#   2. mcp_servers.local.json → capa LOCAL ignorada por Git: tokens reales,
+#      servers custom agregados desde la Web UI, toggles de enabled y
+#      tombstones. TODO lo que escribe el runtime vive acá.
+#
+# Merge por-server a nivel CAMPO (como ConfigManager mezcla claves):
+#   - server en ambas capas: local pisa campo a campo (env con el token
+#     real, enabled, etc.); el resto de los campos los aporta la plantilla.
+#   - server solo en local: se agrega (custom de la Web UI).
+#   - server con "__deleted__": true en local: TOMBSTONE — la plantilla lo
+#     define pero el usuario lo borró y NO aparece en la vista mergeada.
+
+RUTA_BASE = Path(__file__).resolve().parent.parent / "config" / "mcp_servers.json"
+RUTA_LOCAL = RUTA_BASE.with_name("mcp_servers.local.json")
+
 
 def _ruta_config_default() -> Path:
-    # core/tools/mcp_client.py -> core/config/mcp_servers.json
-    return Path(__file__).resolve().parent.parent / "config" / "mcp_servers.json"
+    # Compat con llamadas viejas: la BASE es la plantilla versionada.
+    return RUTA_BASE
 
 
-def _cargar_config_servers(ruta: Path | None = None) -> dict[str, dict]:
-    ruta = ruta or _ruta_config_default()
+def _leer_json_servers(ruta: Path) -> dict:
+    """Lee un JSON de servers {nombre: cfg}; {} si falta o rompe (nunca lanza)."""
     if not ruta.exists():
         return {}
     try:
@@ -91,6 +119,68 @@ def _cargar_config_servers(ruta: Path | None = None) -> dict[str, dict]:
         print(f"⚠️  [MCP]: {ruta} debe contener un objeto JSON {{server: config}}.")
         return {}
     return data
+
+
+def cargar_local(ruta: Path | None = None) -> dict:
+    """Capa local cruda: tokens reales, servers custom y tombstones."""
+    return _leer_json_servers(ruta or RUTA_LOCAL)
+
+
+def guardar_local(data: dict, ruta: Path | None = None) -> None:
+    """Escritura atómica de la capa local. NUNCA toca la plantilla versionada."""
+    destino = ruta or RUTA_LOCAL
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destino.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(destino)
+
+
+def cargar_merge(ruta_base: Path | None = None,
+                 ruta_local: Path | None = None) -> dict:
+    """Vista combinada plantilla ← local (local gana campo a campo)."""
+    base = _leer_json_servers(ruta_base or RUTA_BASE)
+    local = _leer_json_servers(ruta_local or RUTA_LOCAL)
+
+    merged: dict = {}
+    for nombre, cfg in base.items():
+        merged[nombre] = dict(cfg) if isinstance(cfg, dict) else cfg
+
+    for nombre, cfg in local.items():
+        if isinstance(cfg, dict) and cfg.get("__deleted__"):
+            merged.pop(nombre, None)          # tombstone: borrado por el usuario
+            continue
+        if (nombre in merged and isinstance(cfg, dict)
+                and isinstance(merged[nombre], dict)):
+            merged[nombre] = {**merged[nombre], **cfg}   # override campo a campo
+        else:
+            merged[nombre] = cfg              # server custom (solo en local)
+    return merged
+
+
+def set_enabled(nombre: str, valor: bool) -> None:
+    """Persiste un toggle de enabled en la capa LOCAL sin perder config.
+
+    - Server de la plantilla: crea un override parcial {"enabled": valor};
+      el resto de los campos los sigue aportando la plantilla.
+    - Server custom (solo local): preserva su config completa y solo pisa
+      "enabled" (nunca la reemplaza por un dict sin command/args/env).
+    """
+    local = cargar_local()
+    cfg = local.get(nombre)
+    if isinstance(cfg, dict) and not cfg.get("__deleted__"):
+        local[nombre] = {**cfg, "enabled": bool(valor)}
+    else:
+        local[nombre] = {"enabled": bool(valor)}
+    guardar_local(local)
+
+
+def _cargar_config_servers(ruta: Path | None = None) -> dict[str, dict]:
+    """Config que consume el manager: merge plantilla ← local.
+
+    `ruta` (compat con MCPClientManager(config_path=...)) permite apuntar la
+    PLANTILLA a otra ruta; la capa local se mergea igual.
+    """
+    return cargar_merge(ruta_base=ruta or RUTA_BASE)
 
 
 # ══════════════════════════════════════════════════════════════════════

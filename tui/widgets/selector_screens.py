@@ -333,7 +333,7 @@ class ThemeSelectorScreen(_BaseSelectorScreen):
 # ─────────────────────────────────── MCP SELECTOR ──────────────────────────────────
 
 class McpSelectorScreen(Screen):
-    """Toggle de servidores MCP (lee mcp_servers.json)."""
+    """Toggle de servidores MCP (vista mergeada: plantilla + capa local)."""
 
     DEFAULT_CSS = _CSS_BASE + """
     .mcp-enabled  { color: $success; }
@@ -355,29 +355,21 @@ class McpSelectorScreen(Screen):
         self._load_servers()
 
     def _load_servers(self) -> None:
-        import json, pathlib
-        p = pathlib.Path(__file__).parent.parent.parent / "core" / "config" / "mcp_servers.json"
+        """Carga la vista mergeada (plantilla versionada ← overrides locales
+        con tokens reales/servers custom). El merge SIEMPRE devuelve el
+        formato {nombre: cfg}, así que los formatos legados de lista o
+        {"servers": [...]} ya no hacen falta acá."""
         try:
-            data = json.loads(p.read_text())
-            if isinstance(data, list):
-                # Formato lista: [{"name": ..., "enabled": ...}, ...]
-                for s in data:
-                    name = s.get("name", s.get("url", "unknown"))
-                    self._states[name] = s.get("enabled", True)
-                    self._names.append(name)
-            elif isinstance(data, dict) and "servers" in data:
-                # Formato envuelto: {"servers": [{"name": ..., "enabled": ...}, ...]}
-                for s in data["servers"]:
-                    name = s.get("name", s.get("url", "unknown"))
-                    self._states[name] = s.get("enabled", True)
-                    self._names.append(name)
-            elif isinstance(data, dict):
-                # Formato real de mcp_servers.json: {"nombre_server": {config...}, ...}
-                for name, cfg in data.items():
-                    self._states[name] = cfg.get("enabled", True) if isinstance(cfg, dict) else True
-                    self._names.append(name)
+            from core.tools.mcp_client import cargar_merge
+            data = cargar_merge()
         except Exception:
-            pass
+            data = {}
+        if isinstance(data, dict):
+            for name, cfg in data.items():
+                self._states[name] = (
+                    cfg.get("enabled", True) if isinstance(cfg, dict) else True
+                )
+                self._names.append(name)
         self._filtered = list(self._names)
 
     def compose(self) -> ComposeResult:

@@ -61,8 +61,12 @@ core/config/config.local.json
 core/config/config.local.json.tmp
 core/config/config.local.json.bak
 
-# MCP servers config (contiene tokens en texto plano: GitHub PAT, Notion token, etc.)
-core/config/mcp_servers.json
+# MCP servers — dos capas (mismo patrón que config.json/config.local.json):
+#   mcp_servers.json        = plantilla VERSIONADA con placeholders "{token}".
+#   mcp_servers.local.json  = tokens REALES + servers custom: JAMÁS se commitea.
+core/config/mcp_servers.local.json
+core/config/mcp_servers.local.json.tmp
+core/config/mcp_servers.local.json.bak
 
 # Build
 dist/

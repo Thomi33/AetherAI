@@ -380,6 +380,23 @@ else
 fi
 ok "Datos personales en: $DATA_DIR (fuera del repo, nunca se commitean)"
 
+# ---------------------------------------------------------------------------
+# 7c. MCP local — tokens REALES de servers MCP (GitHub PAT, Notion, etc.).
+#     La plantilla versionada (core/config/mcp_servers.json) se distribuye por
+#     el repo con placeholders "{token}"; los tokens de cada usuario viven en
+#     mcp_servers.local.json (ignorado por Git). Se crea VACÍO si falta: el
+#     usuario completa sus tokens ahí y jamás se commitean.
+# ---------------------------------------------------------------------------
+MCP_LOCAL="core/config/mcp_servers.local.json"
+if [ -d core/config ]; then
+  if [ ! -f "$MCP_LOCAL" ]; then
+    printf '{}\n' > "$MCP_LOCAL.tmp" && mv "$MCP_LOCAL.tmp" "$MCP_LOCAL"
+    ok "MCP local creado (vacío): $MCP_LOCAL — completá tus tokens ahí"
+  else
+    ok "MCP local existente preservado: $MCP_LOCAL"
+  fi
+fi
+
 mkdir -p "$LAUNCH_DEST"
 [ -x "$PWD/bin/aether" ] && { ln -sf "$PWD/bin/aether" "$LAUNCH_DEST/aether"; ok "aether disponible en $LAUNCH_DEST"; }
 assert_repository_integrity
