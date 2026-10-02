@@ -5,10 +5,14 @@ Filosofía:
 - La memoria NO pertenece a un runtime. Vive en un directorio propio
   (default ``~/.aether/memory/``, override con ``AETHER_CENTRAL_MEMORY_PATH``)
   y cualquier runtime (Web, Roblox, terminal, futuros) la comparte.
-- Tres tipos de memoria:
+- Cuatro tipos de memoria:
     * conversación  — contexto temporal por sesión (compactable).
     * usuario       — hechos estables del usuario (sin sobrescritura silenciosa).
     * aprendizaje   — "diario" de Aether: recuerdos con importancia y fuerza.
+    * intentos      — outcomes operativos: qué tool ya se probó y NO dio
+                      resultado ("si no dio resultado, no dio resultado").
+                      Efímeros por diseño: TTL corto, decaimiento diario y
+                      barrido automático. No son aprendizajes.
 - "Olvidar" NO es borrar: los recuerdos se debilitan (``strength`` baja) y
   dejan de aparecer en las búsquedas normales, pero siguen en disco y pueden
   reforzarse si vuelven a utilizarse.
@@ -20,6 +24,7 @@ Solo stdlib: este módulo lo importan runtimes con entornos distintos
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -33,8 +38,26 @@ _STRENGTH_FLOOR = 0.01      # un recuerdo nunca llega a 0: olvidar != borrar
 _REINFORCE_RECALL = 0.15    # refuerzo por recall() explícito
 _REINFORCE_SEARCH = 0.05    # refuerzo leve por aparecer en un search()
 _DECAY_PER_WEEK = 0.85      # factor de decaimiento por semana sin uso
+_REINFORCE_DUP = 0.15       # refuerzo por re-aprender lo mismo (dedup de learn)
 
 _ID_PAD = 6                 # mem_000001
+
+# ── Memoria de intentos (outcomes) — "si no dio resultado, no dio resultado" ──
+# Los outcomes son memoria OPERATIVA y efímera: registran que una tool
+# (una búsqueda web, una lectura de archivo) ya se intentó y NO dio
+# resultado, para que el modelo no repita lo que ya falló. No son
+# aprendizajes: viven poco, decaen por día y se barren solos.
+_OUTCOME_KIND = "outcome"
+_OUTCOME_NAMESPACE = "intentos"
+_OUTCOME_IMPORTANCE = 2     # importancia fija: no compiten con aprendizajes
+_OUTCOME_TTL_HOURS = 48     # vigencia de un intento fallido
+_OUTCOME_DECAY_PER_DAY = 0.55   # outcomes decaen por DÍA (no por semana)
+_OUTCOME_MAX = 200          # cap: el store de outcomes no crece infinito
+
+_CLASES_OUTCOME_LEGIBLES = {
+    "sin_resultados": "SIN RESULTADOS",
+    "error": "ERROR",
+}
 
 
 def default_root() -> str:
@@ -52,6 +75,53 @@ def _today() -> str:
 def _tokens(text: str) -> set[str]:
     return {w for w in re.findall(r"[A-Za-z0-9_]+", (text or "").lower())
             if len(w) > 2}
+
+
+def _norm_key(text: str) -> str:
+    """Clave de dedup: minúsculas y espacios colapsados."""
+    return " ".join((text or "").lower().split())
+
+
+def _fingerprint(tool: str, args) -> str:
+    """Fingerprint estable de (tool + args normalizados) para dedup de
+    intentos: reintentar 'lo mismo' debe encontrar el outcome previo."""
+    canon: dict[str, str] = {}
+    if isinstance(args, dict):
+        for k, v in sorted(args.items()):
+            canon[str(k).strip().lower()] = str(v).strip().lower()
+    raw = (f"{(tool or '').strip().lower()}|"
+           f"{json.dumps(canon, sort_keys=True, ensure_ascii=False)}")
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _resumen_args(args) -> str:
+    """El argumento 'principal' de una tool para el summary del outcome."""
+    if not isinstance(args, dict):
+        return ""
+    for clave in ("instruccion", "query", "command", "app", "path"):
+        val = args.get(clave)
+        if isinstance(val, str) and val.strip():
+            return val.strip()[:120]
+    return " ".join(str(v) for v in args.values()
+                    if str(v).strip())[:120]
+
+
+def _outcome_vivo(mem: dict, hoy: date) -> bool:
+    """TTL de un outcome: caduca a las _OUTCOME_TTL_HOURS de su último uso."""
+    try:
+        ref = date.fromisoformat(str(mem.get("last_used") or mem.get("date")))
+    except ValueError:
+        return True
+    return (hoy - ref).days * 24 < _OUTCOME_TTL_HOURS
+
+
+def _recencia(last_used: str, hoy: date) -> float:
+    """Factor de recencia 0-1 (1 = hoy; se halva cada ~2 semanas sin uso)."""
+    try:
+        days = (hoy - date.fromisoformat(str(last_used))).days
+    except ValueError:
+        days = 0
+    return 1.0 / (1.0 + max(0, days) / 14.0)
 
 
 class CentralMemory:
@@ -156,7 +226,22 @@ class CentralMemory:
         importance = max(1, min(10, int(importance)))
         with self._lock:
             store = self._load_learning()
+            # Dedup: re-aprender lo MISMO (summary normalizado idéntico en el
+            # mismo kind/namespace) refuerza el recuerdo existente en vez de
+            # crear un duplicado. Los debilitados quedan afuera (un forget()
+            # explícito no se revierte solo por re-aprender) y los outcomes
+            # tienen su propio dedup por fingerprint (register_outcome).
             if memory_id is None:
+                clave = _norm_key(summary)
+                for prev in store["memories"].values():
+                    if (prev.get("kind") != _OUTCOME_KIND
+                            and prev.get("kind", "") == kind
+                            and prev.get("namespace", "") == namespace
+                            and not prev.get("weakened")
+                            and _norm_key(prev.get("summary", "")) == clave):
+                        self._touch(prev, _REINFORCE_DUP)
+                        self._save_learning()
+                        return dict(prev)
                 memory_id = f"mem_{store['next_id']:0{_ID_PAD}d}"
                 store["next_id"] += 1
             mem = {
@@ -169,7 +254,10 @@ class CentralMemory:
                 "kind": str(kind),
                 "tags": [str(t) for t in tags][:12],
                 "importance": importance,
-                "strength": min(1.0, 0.3 + 0.07 * importance),
+                # Fuerza inicial recalibrada: antes 0.3 + 0.07*imp nacía todo
+                # casi fuerte (rango 0.37-1.0) y discriminaba poco; ahora la
+                # importancia importa de verdad (imp 1 → 0.235, imp 10 → 1.0).
+                "strength": min(1.0, 0.15 + 0.085 * importance),
                 "uses": 0,
                 "last_used": _today(),
                 "weakened": False,
@@ -194,15 +282,20 @@ class CentralMemory:
     def search(self, query: str = "", *, tags=None, namespace: str | None = None,
                kind: str | None = None, runtime: str | None = None,
                limit: int = 10, include_weak: bool = False,
-               touch: bool = True) -> list[dict]:
+               include_outcomes: bool = False, touch: bool = True) -> list[dict]:
         """Busca recuerdos relevantes accesibles (fuerza >= umbral).
 
         include_weak=True permite recuperar también recuerdos debilitados
         (siguen existiendo; solo son menos accesibles). touch=False evita
-        el refuerzo (útil para inspección/carga masiva sin alterar fuerzas).
+        el refuerzo: obligatorio para la inyección de contexto — aparecer
+        en el prompt NO es "uso" (antes el solo inyectarlos los reforzaba
+        en un bucle ricos-más-ricos). include_outcomes=True incluye la
+        memoria de intentos (por defecto queda afuera: es operativa, no
+        aprendizaje; para eso existe recent_outcomes()).
         """
         q_tokens = _tokens(query)
         tag_set = {str(t).lower() for t in tags} if tags else None
+        today_d = date.today()
         scored: list[tuple[float, dict]] = []
         with self._lock:
             store = self._load_learning()
@@ -218,6 +311,8 @@ class CentralMemory:
                 strength = float(mem.get("strength", 0.0))
                 if not include_weak and (mem.get("weakened") or strength < _WEAK_THRESHOLD):
                     continue
+                if not include_outcomes and mem.get("kind") == _OUTCOME_KIND:
+                    continue
                 if q_tokens:
                     haystack = (_tokens(mem.get("summary", ""))
                                 | _tokens(mem.get("detail", ""))
@@ -225,11 +320,18 @@ class CentralMemory:
                     overlap = len(q_tokens & haystack)
                     if overlap == 0:
                         continue
-                    relevance = float(overlap)
+                    # Normalizado 0-1: cobertura de la query. Antes era el
+                    # overlap crudo, que favorecía a los textos largos.
+                    relevance = overlap / len(q_tokens)
                 else:
                     relevance = 1.0
-                score = (relevance * (0.6 + 0.4 * strength)
-                         * (0.7 + 0.03 * float(mem.get("importance", 5))))
+                # Ranking consistente: relevancia (0-1) × fuerza (0.6-1.0) ×
+                # importancia (0.55-1.0) × recencia (0-1). Todas las señales
+                # en escalas comparables, sin una dominando a las demás.
+                score = (relevance
+                         * (0.6 + 0.4 * strength)
+                         * (0.5 + 0.05 * float(mem.get("importance", 5)))
+                         * _recencia(mem.get("last_used") or mem.get("date"), today_d))
                 scored.append((score, mem))
             scored.sort(key=lambda item: (item[0], item[1].get("last_used", "")),
                         reverse=True)
@@ -240,12 +342,6 @@ class CentralMemory:
                 if results:
                     self._save_learning()
             return [dict(m) for m in results]
-
-            self._write_json_atomic(self._learning_path, self._learning)
-            try:
-                self._learning_mtime = os.path.getmtime(self._learning_path)
-            except OSError:
-                self._learning_mtime = 0.0
 
     def update(self, memory_id: str, *, summary=None, detail=None,
                importance=None, tags=None, data=None) -> bool:
@@ -291,16 +387,39 @@ class CentralMemory:
             return True
 
     def consolidate(self, *, today: str | None = None) -> dict:
-        """Decaimiento por desuso. Nunca borra recuerdos.
+        """Decaimiento por desuso. Nunca borra APRENDIZAJES.
 
         Recuerdos no usados pierden fuerza con el tiempo (factor semanal);
-        si caen muy bajo quedan marcados como debilitados. Devuelve stats.
+        si caen muy bajo quedan marcados como debilitados. Los outcomes
+        (memoria de intentos) son la excepción: efímeros por diseño,
+        decaen por DÍA y los vencidos por TTL se barren (son la única
+        cosa que consolidate elimina físicamente). Devuelve stats.
         """
         today_d = date.fromisoformat(today) if today else date.today()
-        decayed = weakened = 0
+        decayed = weakened = outcomes_removed = 0
         with self._lock:
             store = self._load_learning()
-            for mem in store["memories"].values():
+            for mem in list(store["memories"].values()):
+                if mem.get("kind") == _OUTCOME_KIND:
+                    if not _outcome_vivo(mem, today_d):
+                        store["memories"].pop(mem.get("id"), None)
+                        outcomes_removed += 1
+                        continue
+                    try:
+                        last = date.fromisoformat(
+                            str(mem.get("last_used") or mem.get("date")))
+                    except ValueError:
+                        continue
+                    days = (today_d - last).days
+                    if days > 0:
+                        factor = _OUTCOME_DECAY_PER_DAY ** days
+                        mem["strength"] = round(
+                            max(_STRENGTH_FLOOR,
+                                float(mem.get("strength", 0.0)) * factor), 4)
+                        if (mem["strength"] < _WEAK_THRESHOLD
+                                and not mem.get("weakened")):
+                            mem["weakened"] = True
+                    continue
                 try:
                     last = date.fromisoformat(str(mem.get("last_used") or mem.get("date")))
                 except ValueError:
@@ -319,6 +438,7 @@ class CentralMemory:
                     weakened += 1
             self._save_learning()
             return {"decayed": decayed, "newly_weakened": weakened,
+                    "outcomes_removed": outcomes_removed,
                     "total": len(store["memories"])}
 
     def get(self, memory_id: str) -> dict | None:
@@ -326,6 +446,109 @@ class CentralMemory:
         with self._lock:
             mem = self._load_learning()["memories"].get(memory_id)
             return dict(mem) if mem else None
+
+    # ── Memoria de intentos (outcomes) ──────────────────────────────────
+
+    def register_outcome(self, tool: str, args, clase: str, *,
+                         resultado: str = "", runtime: str = "") -> dict | None:
+        """Registra que un intento de tool NO dio resultado.
+
+        "Si no dio resultado, no dio resultado": queda asentado para que el
+        model no repita lo mismo en este turno ni en los próximos. Es
+        kind='outcome' + namespace='intentos': memoria OPERATIVA y efímera
+        (importancia fija baja, excluida de search()/personality_signals,
+        decae por día y consolidate() barre los vencidos por TTL).
+
+        Dedup por fingerprint (tool + args normalizados): reintentar lo
+        mismo incrementa el contador del outcome existente en vez de
+        duplicar la entrada.
+        """
+        tool = str(tool or "").strip()
+        clase = str(clase or "error").strip()
+        fp = _fingerprint(tool, args)
+        hoy = date.today()
+        with self._lock:
+            store = self._load_learning()
+            for prev in store["memories"].values():
+                if prev.get("kind") != _OUTCOME_KIND:
+                    continue
+                if (prev.get("data") or {}).get("fingerprint") != fp:
+                    continue
+                if not _outcome_vivo(prev, hoy):
+                    continue
+                data = prev.setdefault("data", {})
+                data["count"] = int(data.get("count", 1)) + 1
+                data["clase"] = clase
+                prev["last_used"] = _today()
+                self._save_learning()
+                return dict(prev)
+
+            clase_legible = _CLASES_OUTCOME_LEGIBLES.get(clase, clase.upper())
+            summary = f"{tool} '{_resumen_args(args)}' → {clase_legible}".strip()
+            nuevo = self.learn(summary,
+                              detail=(resultado or "")[:300],
+                              importance=_OUTCOME_IMPORTANCE,
+                              kind=_OUTCOME_KIND,
+                              namespace=_OUTCOME_NAMESPACE,
+                              runtime=runtime,
+                              data={"tool": tool, "fingerprint": fp,
+                                    "clase": clase, "count": 1})
+            self._barrer_outcomes()
+            return nuevo
+
+    def recent_outcomes(self, query: str = "", *, limit: int = 5) -> list[dict]:
+        """Outcomes VIVOS (TTL vigente), relevantes al query primero y
+        después por recencia.
+
+        Para el slot [INTENTOS RECIENTES] del context builder. No filtra
+        por strength: el TTL y el decaimiento diario ya hacen desaparecer
+        los outcomes solos; acá manda la recencia.
+        """
+        q_tokens = _tokens(query)
+        hoy = date.today()
+        scored: list[tuple[tuple[int, str, str], dict]] = []
+        with self._lock:
+            store = self._load_learning()
+            for mem in store["memories"].values():
+                if mem.get("kind") != _OUTCOME_KIND:
+                    continue
+                if not _outcome_vivo(mem, hoy):
+                    continue
+                data = mem.get("data") or {}
+                hay = (_tokens(mem.get("summary", ""))
+                       | _tokens(str(data.get("tool", ""))))
+                overlap = len(q_tokens & hay) if q_tokens else 0
+                scored.append(((overlap, str(mem.get("last_used") or ""),
+                                str(mem.get("id") or "")), mem))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            resultados = [mem for _, mem in scored[:max(0, limit)]]
+            return [dict(m) for m in resultados]
+
+    def _barrer_outcomes(self) -> None:
+        """Cap de crecimiento: sobre _OUTCOME_MAX outcomes se eliminan los
+        vencidos por TTL primero, después los más viejos.
+
+        Solo aplica a outcomes (efímeros por diseño): los aprendizajes
+        NUNCA se borran acá — olvidar != borrar sigue intacto para ellos.
+        Recarga el store fresco: entre el learn() del caller y esta pasada
+        pudo haber otra escritura (multi-runtime).
+        """
+        with self._lock:
+            store = self._load_learning()
+            outcomes = [m for m in store["memories"].values()
+                        if m.get("kind") == _OUTCOME_KIND]
+            if len(outcomes) <= _OUTCOME_MAX:
+                return
+            hoy = date.today()
+            ordenados = sorted(
+                outcomes,
+                key=lambda m: (not _outcome_vivo(m, hoy),   # vencidos primero
+                               str(m.get("last_used") or m.get("date") or "")),
+            )
+            excedente = len(outcomes) - _OUTCOME_MAX
+            for m in ordenados[:excedente]:
+                store["memories"].pop(m.get("id"), None)
+            self._save_learning()
 
     # ── Memoria del usuario ──────────────────────────────────────────────
 
@@ -401,9 +624,15 @@ class CentralMemory:
             return True
 
     def _touch(self, mem: dict, amount: float) -> None:
+        """Refuerzo asintótico: la fuerza se acerca a 1.0 sin saturarlo.
+
+        Antes el refuerzo era lineal (+amount fijo) y una memoria llegaba a
+        1.0 tras ~14 usos, perdiendo todo poder discriminante.
+        """
         mem["uses"] = int(mem.get("uses", 0)) + 1
         mem["last_used"] = _today()
-        mem["strength"] = round(min(1.0, float(mem.get("strength", 0.0)) + amount), 4)
+        strength = float(mem.get("strength", 0.0))
+        mem["strength"] = round(min(1.0, strength + amount * (1.0 - strength)), 4)
         if mem["strength"] >= _WEAK_THRESHOLD:
             mem["weakened"] = False
 
@@ -420,6 +649,7 @@ class CentralMemory:
             store = self._load_learning()
             accesibles = [m for m in store["memories"].values()
                           if not m.get("weakened")
+                          and m.get("kind") != _OUTCOME_KIND
                           and float(m.get("strength", 0)) >= _WEAK_THRESHOLD]
         accesibles.sort(key=lambda m: float(m.get("strength", 0))
                         * float(m.get("importance", 5)), reverse=True)
@@ -487,6 +717,7 @@ class CentralMemory:
             "accessible": len(memories) - weak,
             "weak": weak,
             "by_kind": by_kind,
+            "outcomes": by_kind.get(_OUTCOME_KIND, 0),
             "user_facts": len(self._load_user()["profile"]),
         }
 

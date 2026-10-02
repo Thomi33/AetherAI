@@ -61,7 +61,7 @@ async def set_summary(body: SummaryBody):
 @router.post("/memory/consolidate")
 async def consolidate():
     """Fuerza la consolidación del resumen con los turnos pendientes."""
-    from core.memory.consolidator import consolidar_resumen
+    from core.memory.memory_manager import consolidar_resumen
     from backend.core.aether_service import AetherService
 
     try:

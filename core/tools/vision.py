@@ -9,11 +9,9 @@ import subprocess
 import os
 import base64
 import json
-import time
 import requests
 
 from core.config.settings import OLLAMA_HOST
-from core.agent.model_policy import ModelDecisionContext, choose_model, record_model_latency
 
 
 def capturar_pantalla() -> bytes:
@@ -94,26 +92,8 @@ def ver_pantalla(
 
         from core.config.config_manager import get_config_manager
         modelo_principal = get_config_manager().get("MODELO", "ornith:9b")
-        decision_modelo = choose_model(ModelDecisionContext(
-            task_kind="vision",
-            requested_model=modelo_principal,
-            prompt_chars=len(prompt_ajustado),
-            context_size=8192,
-        ))
 
-        payload = {
-            "model":  decision_modelo.model,
-            "prompt": prompt_ajustado,
-            "images": [imagen_b64],
-            "stream": False,   # ← antes era True
-            "options": {"temperature": 0.1, "num_ctx": 8192},
-                }
-    
-        policy_start = time.time()
-        try:
-            r = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=120)
-        finally:
-            record_model_latency(decision_modelo, int((time.time() - policy_start) * 1000))
+        r = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=120)
 
         if r.status_code == 200:
             data = r.json()

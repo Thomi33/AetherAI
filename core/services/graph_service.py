@@ -9,8 +9,7 @@ Función principal:
     procesar_orden_grafo(orden, mem, modo_autonomo) -> str
 """
 
-from core.memory.memory_manager import registrar_turno
-from core.memory.consolidator import programar_consolidacion
+from core.memory.memory_manager import registrar_turno, programar_consolidacion
 
 
 def procesar_orden_grafo(orden: str, mem: dict, modo_autonomo: bool = True,

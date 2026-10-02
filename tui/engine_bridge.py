@@ -263,9 +263,8 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
             writer.vaciar_residual()
 
         respuesta = ultimo_estado.get("final_response") or "Operación completada."
-        # Comparte el scheduler con API/CLI: coalesce de llamadas, una sola
-        # consolidación LLM a la vez y refresco del resumen RAM al completarse.
-        from core.memory.consolidator import programar_consolidacion
+        # Consolidación síncrona (sin scheduler): actualiza _motor.mem['resumen'] si hay turnos pendientes.
+        from core.memory.memory_manager import programar_consolidacion
         programar_consolidacion(_motor.mem)
         q.put(DoneEvent(respuesta=respuesta))
 

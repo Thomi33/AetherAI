@@ -225,15 +225,7 @@ class ConfigManager:
             isinstance(x, str)
             and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", x) is not None
         ),
-        # ── SEMANTIC ROUTER (OPT-IN; ver core/agent/semantic_router.py) ──
-        # default = comportamiento actual (agent loop). semantic = atajo por
-        # embeddings (embeddinggemma + prototipos) con fallback automático.
-        "PLANNER_ROUTER": lambda x: x in ("default", "semantic"),
-        "PLANNER_ROUTER_SEMANTIC_MODEL": ConfigValidator.validate_model,
-        "PLANNER_ROUTER_SEMANTIC_MARGIN": lambda x: (
-            isinstance(x, (int, float)) and 0.0 <= float(x) <= 1.0
-        ),
-    }
+        }
 
     DEFAULTS: Dict[str, Any] = {
         "MODELO": "ornith:9b",
@@ -260,9 +252,6 @@ class ConfigManager:
         "MAX_TOKENS": 2048,
         "NUM_PREDICT": 2048,
         "NUM_PREDICT_PLANNER": 3072,
-        "PLANNER_ROUTER": "default",
-        "PLANNER_ROUTER_SEMANTIC_MODEL": "embeddinggemma:latest",
-        "PLANNER_ROUTER_SEMANTIC_MARGIN": 0.03,
         "VERBOSE": False,
         "DEBUG": False,
         "THEME": "default",

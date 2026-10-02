@@ -9,13 +9,13 @@ from pathlib import Path
 # =====================================================================
 # ⚙️ CONFIGURACIÓN BASE
 # =====================================================================
-from core.config.config_manager import get_config_manager
+from core.config.settings_v2 import get_settings
 
-_CONFIG = get_config_manager()
+_CONFIG = get_settings()
 
 
 def _config_value(nombre: str, default):
-    """Lee valores configurables desde config.json mediante ConfigManager."""
+    """Lee valores configurables desde config.json mediante Settings."""
     return _CONFIG.get(nombre, default)
 
 

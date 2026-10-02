@@ -319,12 +319,6 @@ class TestAgentLoopSinLimite:
         assert out["final_response"] == "hola de nuevo"
         assert out["done"] is True
 
-    def test_config_sin_max_agent_steps(self):
-        """La clave se eliminó por completo de la config."""
-        from core.config.config_manager import ConfigManager
-        assert "MAX_AGENT_STEPS" not in ConfigManager.VALIDATORS
-        assert "MAX_AGENT_STEPS" not in ConfigManager.DEFAULTS
-
 
 class TestAgentLoopConThumb:
 

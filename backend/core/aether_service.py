@@ -412,7 +412,7 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
             clear_token_sink,
             clear_reasoning_sink,
         )
-        from core.memory.consolidator import programar_consolidacion
+        from core.memory.memory_manager import programar_consolidacion
 
         set_token_sink(lambda frag: q.put(TokenEvent(fragmento=frag)))
 

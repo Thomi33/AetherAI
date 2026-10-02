@@ -919,7 +919,7 @@ class AetherApp(App):
         self.push_screen(MemoryEditorScreen(texto_actual=texto_actual, on_save=_on_save), _on_save)
 
     def _forzar_consolidacion_memoria(self) -> None:
-        from core.memory.consolidator import consolidar_resumen
+        from core.memory.memory_manager import consolidar_resumen
         chat_panel = self.query_one("#chat_panel", ChatPanel)
         nuevo = consolidar_resumen(forzar=True)
         if nuevo is None:

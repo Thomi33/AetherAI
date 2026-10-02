@@ -61,13 +61,15 @@ from core.tools.shell_executor import ejecutar_comando
 from core.tools.web_search import buscar_web
 from core.tools.url_reader import leer_url
 from core.tools.vision import ver_pantalla
-from core.tools.computer_control import (
-    cambiar_workspace,
-    click_en,
+from core.tools.ydotool_wrapper import (
+    buscar_ventana,
     enfocar_ventana,
+    click_en,
     escribir_texto,
-    iniciar_secuencia,
     mover_mouse,
+    iniciar_secuencia,
+    mantener_tecla,
+    cambiar_workspace,
 )
 from core.tools.flatpak_manager import actualizar_flatpaks
 from core.parser.shell_parser import extraer_comando_shell
@@ -80,7 +82,6 @@ from core.tools.filesystem_tool import (
     listar_directorio_fs,
 )
 from core.config import get_config_manager
-from core.agent.model_policy import ModelDecisionContext, choose_model, record_model_latency
 
 from core.agent.graph_state import AetherState
 
@@ -199,12 +200,6 @@ def _llm_chat(system: str = None, user: str = None, messages: list = None, on_to
     config = get_config_manager()
     opts.update(config.get("OLLAMA_GEN_OPTIONS", {}))
     modelo_actual = config.get("MODELO", MODELO)
-    decision_modelo = choose_model(ModelDecisionContext(
-        task_kind="unknown",
-        requested_model=modelo_actual,
-        prompt_chars=sum(len(str(m.get("content", ""))) for m in messages),
-        context_size=config.get("NUM_CTX", NUM_CTX),
-    ))
     opts["num_ctx"] = config.get("NUM_CTX", NUM_CTX)
     opts["num_predict"] = config.get("NUM_PREDICT", opts["num_predict"])
     opts["temperature"] = config.get("TEMPERATURE", opts.get("temperature", 0.6))
@@ -217,7 +212,7 @@ def _llm_chat(system: str = None, user: str = None, messages: list = None, on_to
         opts["num_predict"] = max(opts["num_predict"], min_predict)
 
     call_kwargs = {
-        "model": decision_modelo.model,
+        "model": modelo_actual,
         "messages": messages,
         "stream": True,
         "options": opts,
@@ -270,27 +265,31 @@ def _llm_chat(system: str = None, user: str = None, messages: list = None, on_to
             if on_token:
                 on_token(content_delta)
             respuesta += content_delta
+    except InferenceCancelled:
+        # Cancelación solicitada: salir limpio sin loggear error
+        pass
+    except Exception as e:
+        # Log error but don't crash - return what we have
+        print(f"[LLM] Error durante streaming: {e}")
     finally:
-        record_model_latency(decision_modelo, int((time.time() - policy_start) * 1000))
-
-    if BENCH_INSTRUMENT:
-        duration_ms = int((time.time() - start_time) * 1000)
-        output_chars = len(respuesta)
-        has_think = "<think>" in respuesta
-        try:
-            with open(BENCH_LOG_PATH, "a") as f:
-                import json as _json
-                f.write(_json.dumps({
-                    "ts": time.time(),
-                    "mode": "ornith-native",
-                    "prompt_chars": prompt_chars,
-                    "output_chars": output_chars,
-                    "duration_ms": duration_ms,
-                    "has_think": has_think,
-                    "num_messages": len(messages),
-                }) + "\n")
-        except Exception:
-            pass  # never break normal operation
+        if BENCH_INSTRUMENT:
+            duration_ms = int((time.time() - start_time) * 1000)
+            output_chars = len(respuesta)
+            has_think = "<think>" in respuesta
+            try:
+                with open(BENCH_LOG_PATH, "a") as f:
+                    import json as _json
+                    f.write(_json.dumps({
+                                "ts": time.time(),
+                                "mode": "ornith-native",
+                                "prompt_chars": prompt_chars,
+                                "output_chars": output_chars,
+                                "duration_ms": duration_ms,
+                                "has_think": has_think,
+                                "num_messages": len(messages),
+                    }) + "\n")
+            except Exception:
+                pass  # never break normal operation
 
     return respuesta
 
@@ -881,33 +880,6 @@ def _plan_activado(plan: list[dict], orden: str, mem: dict | None = None) -> dic
     return update
 
 
-def _intentar_ruta_semantica(orden: str, mem: dict) -> dict | None:
-    """
-    Adaptador del semantic router OPT-IN (core/agent/semantic_router.py).
-
-    Devuelve la actualización de estado de un plan de 1 paso hacia la tool
-    predicha por embeddings (embeddinggemma + prototipos), o None para que
-    node_planner siga su camino actual (agent loop). Nunca lanza: cualquier
-    error del router semántico degrada silenciosamente a fallback. Con
-    PLANNER_ROUTER=default es un no-op (ruta_semantica corta antes de tocar
-    Ollama).
-    """
-    try:
-        from core.agent.semantic_router import ruta_semantica
-        resultado = ruta_semantica(orden)
-    except Exception as exc:  # noqa: BLE001 — el router nunca debe romper un turno
-        print(f"   └─ ⚠️  [SEMANTIC]: error inesperado ({type(exc).__name__}); fallback al agent loop.")
-        return None
-    if resultado is None:
-        return None
-    print(f"   └─ 🧭 [SEMANTIC]: '{orden[:40]}' → {resultado.tool} "
-          f"(score {resultado.top_score:.3f}, margin {resultado.margin:.3f} ≥ {resultado.margin_threshold})")
-    return _plan_activado(
-        [{"tool": resultado.tool, "instruccion": orden, "args": {}}],
-        orden, mem,
-    )
-
-
 def node_planner(state: AetherState) -> dict:
     """
     ÚNICA puerta de decisión del grafo.
@@ -1121,18 +1093,6 @@ def node_planner(state: AetherState) -> dict:
     # Se deja sin borrar por ahora para no tocar más código del necesario en
     # este cambio; es candidato a limpieza en un próximo pase una vez que el
     # agent loop esté validado en uso real.
-    # ══════════════════════════════════════════════════════════════════════
-    # SEMANTIC ROUTER (OPT-IN: PLANNER_ROUTER=semantic, ver
-    # core/agent/semantic_router.py). Atajo de baja latencia por embeddings.
-    # SOLO decide la intención (tool): la ejecución pasa por el nodo real de
-    # la tool con TODAS sus validaciones y confirmaciones (el runtime sigue
-    # siendo la autoridad). Margin < umbral, tools fs_* (requieren args
-    # estructurados) o errores de Ollama → None → fallback al agent loop.
-    # Con PLANNER_ROUTER=default (default del repo) esto es costo cero.
-    # ══════════════════════════════════════════════════════════════════════
-    update_semantic = _intentar_ruta_semantica(orden, mem)
-    if update_semantic is not None:
-        return update_semantic
 
     print("   └─ Sin atajo determinista aplicable → agent loop (razonamiento + tool calling nativo).")
     return _agent_loop_activado(orden, mem)
@@ -1184,12 +1144,6 @@ def _llm_chat_agente(messages: list, tools: list, min_predict: int | None = None
     config = get_config_manager()
     opts.update(config.get("OLLAMA_GEN_OPTIONS", {}))
     modelo_actual = config.get("MODELO", MODELO)
-    decision_modelo = choose_model(ModelDecisionContext(
-        task_kind="agent_loop",
-        requested_model=modelo_actual,
-        prompt_chars=sum(len(str(m.get("content", ""))) for m in messages),
-        context_size=config.get("NUM_CTX", NUM_CTX),
-    ))
     opts["num_ctx"] = config.get("NUM_CTX", NUM_CTX)
     opts["num_predict"] = config.get("NUM_PREDICT", opts["num_predict"])
     opts["temperature"] = config.get("TEMPERATURE", opts.get("temperature", 0.6))
@@ -1230,7 +1184,7 @@ def _llm_chat_agente(messages: list, tools: list, min_predict: int | None = None
     policy_start = time.time()
     try:
         for chunk in ollama.chat(
-            model=decision_modelo.model,
+            model=modelo_actual,
             messages=messages,
             tools=tools,
             stream=True,
@@ -1267,8 +1221,12 @@ def _llm_chat_agente(messages: list, tools: list, min_predict: int | None = None
         if _razon_delta:
             emit_reasoning(_razon_delta)
         _emitir_content_delta(_content_delta)
+    except InferenceCancelled:
+        pass
+    except Exception as e:
+        print(f"[LLM] Error durante streaming (tools): {e}")
     finally:
-        record_model_latency(decision_modelo, int((time.time() - policy_start) * 1000))
+        pass
 
     tool_calls: list[dict] = []
     for idx in sorted(tool_calls_brutos):
@@ -1420,6 +1378,100 @@ def _firma_call(tool: str, args: dict) -> str:
         return f"{tool}|{args}"
 
 
+# ══════════════════════════════════════════════════════════════════════
+# MEMORIA DE INTENTOS — "si no dio resultado, no dio resultado"
+# ══════════════════════════════════════════════════════════════════════
+# El agent loop no tiene límite de pasos por diseño (quién corta es el
+# usuario). El problema: ante una búsqueda sin resultados el modelo podía
+# seguir variando la query para siempre, convirtiendo algo simple en una
+# tarea larga. Tres capas de defensa:
+#   1. Clasificación: un resultado negativo recibe guía de cierre en el
+#      mensaje de tool (el modelo ve que "sin resultados" es un final
+#      válido, no un error a reparar).
+#   2. Registro: el intento fallido se persiste en la memoria central
+#      (kind='outcome') y el context builder lo reinyecta como
+#      [INTENTOS RECIENTES] en este turno y en los próximos.
+#   3. Tope duro: herramientas de búsqueda/lectura con N fallos en el
+#      turno NO se ejecutan de nuevo — el loop cierra forzado.
+# ══════════════════════════════════════════════════════════════════════
+
+# Tools de búsqueda/lectura: reintentarlas rara vez aporta algo nuevo.
+# El tope duro aplica SOLO acá — shell/codigo/fs_write siguen pudiendo
+# reintentar con variantes, que es legítimo al depurar código.
+_TOOLS_BUSQUEDA = frozenset({"web", "fs_read", "fs_list", "vision"})
+
+# Fallos totales permitidos por tool de búsqueda en un turno antes del
+# cierre forzado del loop.
+_MAX_FALLOS_BUSQUEDA = 3
+
+_PATRONES_SIN_RESULTADOS = (
+    "sin resultados",          # web_search: "Sin resultados disponibles..."
+    "no se encontr",           # "no se encontraron resultados"
+    "no hay resultados",
+    "imposible conectar",      # web_search: ningún motor disponible
+    "error en todos los sistemas",
+)
+
+
+def _clasificar_resultado_tool(resultado: str) -> str:
+    """Clasifica el texto que devolvió una tool.
+
+    'sin_resultados' | 'error' | 'ok'. Heurística sobre patrones conocidos
+    de las tools (web_search en particular). Un resultado vacío cuenta
+    como 'ok': no es fallo, solo no hay nada que registrar.
+    """
+    texto = (resultado or "").strip().lower()
+    if not texto:
+        return "ok"
+    if texto.startswith("[error]"):
+        return "error"
+    if any(p in texto for p in _PATRONES_SIN_RESULTADOS):
+        return "sin_resultados"
+    return "ok"
+
+
+def _guia_resultado_terminal(clase: str, tool: str) -> str:
+    """Guía que se le agrega al resultado negativo de una tool para que
+    el modelo cierre en vez de reintentar sin fin."""
+    if clase == "sin_resultados":
+        return (
+            "[SISTEMA] Esto no dio resultados y ES un resultado válido, no "
+            "un error a reparar: NO reintentes con la misma consulta ni con "
+            "variantes triviales (cambiar una palabra no es un enfoque "
+            "nuevo). Respondé ahora al Creador con lo que ya tenés, "
+            "aclarando que no hay resultados."
+        )
+    return (
+        f"[SISTEMA] La tool '{tool}' falló. Usá el error real para decidir "
+        "un PRÓXIMO paso distinto; si ya probaste una alternativa real y "
+        "también falló, no sigas insistiendo: reportá el error y cerrá."
+    )
+
+
+def _registrar_intento_fallido(tool: str, args, resultado: str, clase: str) -> None:
+    """Persiste el intento fallido en la memoria central (outcomes).
+
+    Fail-open y opt-out (AETHER_CENTRAL_MEMORY=0): la memoria nunca puede
+    romper la ejecución del loop.
+    """
+    if os.environ.get("AETHER_CENTRAL_MEMORY", "1") == "0":
+        return
+    try:
+        from core.memory.central_store_v2 import get_central_memory
+        get_central_memory().register_outcome(
+            tool, args or {}, clase,
+            runtime="core")
+    except Exception as e:  # noqa: BLE001 — fail-open por diseño
+        print(f"   └─ ⚠️  [AGENT LOOP]: no pude registrar el intento fallido: {e}")
+
+
+def _fallos_de_tool(agent_pasos_log: list, tool: str) -> int:
+    """Total de resultados negativos de una tool en el turno actual."""
+    return sum(1 for p in (agent_pasos_log or [])
+               if isinstance(p, dict) and p.get("tool") == tool
+               and p.get("cls") in ("sin_resultados", "error"))
+
+
 def node_agent_loop(state: AetherState) -> dict:
     """
     Un paso del agent loop: el modelo ve el objetivo + todas las tools
@@ -1431,8 +1483,11 @@ def node_agent_loop(state: AetherState) -> dict:
     calls que haya, y vuelve a entrar mientras agent_activo=True. Termina
     cuando el modelo devuelve texto sin tool_calls (respuesta final), si
     ocurre un error irrecuperable llamando al modelo, o si el USUARIO
-    cancela (Stop → InferenceCancelled). NO hay límite de pasos: quién
-    decide cuándo detenerlo es el usuario.
+    cancela (Stop → InferenceCancelled). NO hay límite general de pasos:
+    quién decide cuándo detenerlo es el usuario. ÚNICA excepción: las
+    tools de búsqueda/lectura tienen un tope de fallos por turno
+    (_MAX_FALLOS_BUSQUEDA) — "si no dio resultado, no dio resultado", el
+    loop cierra forzado en vez de insistir para siempre.
 
     Si el turno trae adjuntos de imagen (state["agent_images"], thumbnails
     b64), van incrustados en el primer mensaje del usuario: el modelo con
@@ -1540,6 +1595,11 @@ def node_agent_loop(state: AetherState) -> dict:
 
     resultados_previos = [p["resultado"] for p in agent_pasos_log]
 
+    # "Si no dio resultado, no dio resultado": cuando una tool de búsqueda
+    # acumula demasiados fallos en el turno, el loop cierra forzado con lo
+    # que hay (ver _TOOLS_BUSQUEDA / _MAX_FALLOS_BUSQUEDA más arriba).
+    forzar_cierre = None
+
     for call in tool_calls:
         fn   = call.get("function", {})
         tool = fn.get("name", "")
@@ -1609,6 +1669,31 @@ def node_agent_loop(state: AetherState) -> dict:
             })
             continue
 
+        # ── Tope duro (solo tools de búsqueda/lectura) ─────────────────
+        # Si la tool ya acumuló demasiados resultados negativos en este
+        # turno, NO se ejecuta otra vez: el loop cierra con lo que hay.
+        # El modelo no decide esto solo — es red de seguridad contra
+        # convertir "no dio resultado" en una tarea infinita.
+        if (tool in _TOOLS_BUSQUEDA
+                and _fallos_de_tool(agent_pasos_log, tool) >= _MAX_FALLOS_BUSQUEDA):
+            print(f"   └─ 🛑 [AGENT LOOP]: '{tool}' ya acumuló "
+                  f"{_MAX_FALLOS_BUSQUEDA} intentos sin resultado en este "
+                  f"turno; no se ejecuta de nuevo y cierro con lo que hay.")
+            resultado = (
+                f"[SISTEMA] '{tool}' ya se intentó {_MAX_FALLOS_BUSQUEDA} veces "
+                "en este turno sin resultado. No se va a ejecutar de nuevo: "
+                "es hora de responder al usuario con lo que ya tenés."
+            )
+            agent_pasos_log.append({"tool": tool, "args": args,
+                                    "resultado": resultado, "cls": "error"})
+            agent_messages.append({
+                "role": "tool",
+                "content": resultado[:4000],
+                "name": tool,
+            })
+            forzar_cierre = forzar_cierre or tool
+            continue
+
         ok, motivo = validar_tool_call(tool, args)
         if not ok:
             print(f"   └─ ⚠️  [AGENT LOOP]: Sanity-check rechazó tool call '{tool}': {motivo}")
@@ -1644,8 +1729,29 @@ def node_agent_loop(state: AetherState) -> dict:
                 print(f"   └─ ❌ Excepción ejecutando tool '{tool}': {e}")
                 resultado = f"[ERROR] Excepción ejecutando '{tool}': {e}"
 
-        agent_pasos_log.append({"tool": tool, "args": args, "resultado": resultado})
+        # ── Clasificación del resultado + memoria de intentos ──────────
+        # Un "sin resultados" es un RESULTADO, no un error a reparar: se
+        # registra (para este turno y los próximos, vía [INTENTOS
+        # RECIENTES]) y se le agrega al mensaje de tool la guía para
+        # cerrar en vez de reintentar.
+        cls = _clasificar_resultado_tool(resultado)
+        if cls in ("sin_resultados", "error"):
+            _registrar_intento_fallido(tool, args, resultado, cls)
+            resultado = ((resultado or "") + "\n\n"
+                         + _guia_resultado_terminal(cls, tool)).strip()
+
+        agent_pasos_log.append({"tool": tool, "args": args,
+                                "resultado": resultado, "cls": cls})
         resultados_previos.append(resultado)
+
+        if (forzar_cierre is None and cls in ("sin_resultados", "error")
+                and tool in _TOOLS_BUSQUEDA
+                and _fallos_de_tool(agent_pasos_log, tool) >= _MAX_FALLOS_BUSQUEDA):
+            forzar_cierre = tool
+            print(f"   └─ 🛑 [AGENT LOOP]: '{tool}' acumuló "
+                  f"{_MAX_FALLOS_BUSQUEDA} intentos sin resultado; "
+                  f"el loop cerrará con lo que hay.")
+
         # role="tool" es el formato que Ollama espera para devolverle al
         # modelo el resultado de una tool call en el siguiente turno.
         agent_messages.append({
@@ -1653,6 +1759,21 @@ def node_agent_loop(state: AetherState) -> dict:
             "content": (resultado or "")[:4000],
             "name":    tool,
         })
+
+    if forzar_cierre:
+        mensaje_cierre = (
+            f"No pude conseguir resultados para esto: intenté con "
+            f"'{forzar_cierre}' varias veces y no dio resultado (sin "
+            "resultados o errores). No insisto más por ahora — si querés, "
+            "lo pruebo con otro enfoque distinto o más tarde."
+        )
+        return {
+            "final_response":  mensaje_cierre,
+            "done":            True,
+            "agent_activo":    False,
+            "agent_messages":  agent_messages,
+            "agent_pasos_log": agent_pasos_log,
+        }
 
     return {
         "agent_messages":  agent_messages,

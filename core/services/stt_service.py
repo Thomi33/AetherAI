@@ -1,6 +1,6 @@
 """
 stt_service.py — Puente hacia el worker de STT (faster-whisper) que corre
-aislado en ~/whisper_aether_test/venv-stt (ver stt_worker.py).
+aislado en ~/Whisper_TTS/venv (ver stt_worker.py).
 
 Responsabilidades:
   1. SttWorker: mantiene vivo el subproceso del worker (stdin/stdout JSON-lines)
@@ -43,7 +43,7 @@ from core.services.audio_input import AudioInputNoDisponible, resolver_fuente_pu
 # ─────────────────────────────────────────────────────────────────────
 # Configuración por defecto (puede pisarse vía ConfigManager, ver abajo)
 # ─────────────────────────────────────────────────────────────────────
-_STT_VENV_PYTHON_DEFAULT = Path.home() / "whisper_aether_test" / "venv-stt" / "bin" / "python"
+_STT_VENV_PYTHON_DEFAULT = Path.home() / "Whisper_TTS" / "venv" / "bin" / "python"
 STT_WORKER_SCRIPT = Path(__file__).parent / "stt_worker.py"
 STT_MODEL_SIZE = "medium"
 STT_DEVICE = "cpu"
@@ -96,7 +96,7 @@ class SttWorker:
         if not python_bin.exists():
             raise SttNoDisponible(
                 f"No se encontró el intérprete de STT en {python_bin}. "
-                f"¿Existe el venv ~/whisper_aether_test/venv-stt? "
+                f"¿Existe el venv ~/Whisper_TTS/venv? "
                 f"(podés apuntar a otro con /set STT_VENV_PYTHON <ruta>)"
             )
 
