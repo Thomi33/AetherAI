@@ -1,29 +1,38 @@
-# AetherAI — Arquitectura actual
+# AetherAI — Current Architecture
 
-> Documento técnico basado en el estado de `main` inspeccionado el 2026-09-09.
-> Describe la arquitectura implementada en el repositorio, no una arquitectura futura.
+> Technical document based on the state of `main` inspected on 2026-10-03
+> (after PR #4: v2 migration + agent-loop web-search fix).
+> It describes the architecture implemented in the repository, not a future
+> architecture. English docs live here; the Spanish originals are kept in
+> [`docs/es/`](./es/).
 
-## 1. Resumen
+## 1. Overview
 
-AetherAI es un agente local, terminal-first, orientado a Arch Linux. El motor activo utiliza **LangGraph** para orquestación y **Ollama** como runtime local de modelos. El repositorio conserva componentes históricos y una superficie `backend/`, pero el flujo soportado documentado por el proyecto es el CLI.
+AetherAI is a local, terminal-first agent oriented to Arch Linux. The active
+engine uses **LangGraph** for orchestration and **Ollama** as the local model
+runtime. The repository keeps historical components and a `backend/` surface,
+but the project's documented supported flow is the CLI/TUI.
 
-La arquitectura actual combina dos estrategias de ejecución:
+The current architecture combines two execution strategies:
 
-1. **Fast-path / Tool Planning:** `node_planner` puede construir planes deterministas, especialmente para operaciones simples.
-2. **Agent Loop:** para tareas abiertas, el modelo recibe el catálogo estructurado de tools y realiza tool calling incremental; el grafo vuelve al loop mientras `agent_activo` siga activo.
+1. **Fast-path / Tool Planning:** `node_planner` can build deterministic plans,
+   especially for simple operations.
+2. **Agent Loop:** for open-ended tasks, the model receives the structured tool
+catalog and performs incremental tool calling; the graph returns to the loop
+   while `agent_activo` stays active.
 
-El punto de entrada lógico del motor es `procesar_orden_grafo()`.
+The engine's logical entry point is `procesar_orden_grafo()`.
 
-## 2. Flujo de alto nivel
+## 2. High-level flow
 
 ```text
-Usuario / CLI
+User / CLI
     │
     ▼
 procesar_orden_grafo()
     │
-    ├── registrar turno del usuario
-    ├── crear_estado_inicial()
+    ├── register user turn
+    ├── create_estado_inicial()
     │
     ▼
 ┌─────────────────────────────────────────────────────────┐
@@ -48,41 +57,50 @@ procesar_orden_grafo()
 │                                                    ▼   │
 │                                                   END   │
 │                                                         │
-│  Errores: executor/agent → diagnose → confirm → retry │
-│                         ↘ fallback                     │
+│  Errors: executor/agent → diagnose → confirm → retry    │
+│                         ↘ fallback                      │
 └─────────────────────────────────────────────────────────┘
     │
     ▼
-Respuesta final + consolidación de memoria
+Final response + memory consolidation
 ```
 
-`core/agent/graph_builder.py` define explícitamente estos nodos y sus rutas condicionales. El grafo se compila una sola vez y se reutiliza mediante `get_graph()`; `reset_graph()` permite invalidar esa instancia en procesos que lo necesiten.
+`core/agent/graph_builder.py` explicitly defines these nodes and their
+conditional routes. The graph is compiled once and reused through
+`get_graph()`; `reset_graph()` lets processes that need it invalidate that
+instance.
 
-## 3. Entrada única al motor
+## 3. Single engine entry point
 
-`core/agent/graph_service.py` y la fachada compatible `core/services/graph_service.py` exponen `procesar_orden_grafo(orden, mem, modo_autonomo=True)`.
+`core/agent/graph_service.py` and the compatible facade
+`core/services/graph_service.py` expose
+`procesar_orden_grafo(orden, mem, modo_autonomo=True)`.
 
-La función:
+The function:
 
-1. registra el turno del usuario;
-2. obtiene el grafo compilado;
-3. crea un `AetherState` completo mediante `crear_estado_inicial()`;
-4. ejecuta `grafo.invoke()`;
-5. devuelve `final_response`;
-6. programa la consolidación de memoria después de completar el intercambio.
+1. registers the user's turn;
+2. gets the compiled graph;
+3. creates a complete `AetherState` through `crear_estado_inicial()`;
+4. runs `grafo.invoke()`;
+5. returns `final_response`;
+6. schedules memory consolidation after the exchange completes.
 
-La existencia de ambas rutas de `graph_service` es deliberada: `core/agent/graph_service.py` es la implementación del motor y `core/services/graph_service.py` actúa como fachada compatible para callers existentes.
+The existence of both `graph_service` paths is deliberate:
+`core/agent/graph_service.py` is the engine implementation and
+`core/services/graph_service.py` acts as a compatible facade for existing
+callers.
 
-## 4. Estado: `AetherState`
+## 4. State: `AetherState`
 
-`core/agent/graph_state.py` define el contrato central de estado mediante `TypedDict`.
+`core/agent/graph_state.py` defines the central state contract via
+`TypedDict`.
 
-### Entrada y control
+### Input and control
 
-- `orden`: solicitud original del usuario.
-- `mem`: memoria normalizada.
-- `modo_autonomo`: modo de ejecución.
-- `intent`, `done`, `terminado`, `tokens`, `ruta`: control y compatibilidad.
+- `orden`: the user's original request.
+- `mem`: normalized memory.
+- `modo_autonomo`: execution mode.
+- `intent`, `done`, `terminado`, `tokens`, `ruta`: control and compatibility.
 
 ### Tool Planning
 
@@ -91,19 +109,25 @@ La existencia de ambas rutas de `graph_service` es deliberada: `core/agent/graph
 - `plan_index`
 - `plan_resultados`
 
-Estos campos sostienen el camino de planificación/fast-path.
+These fields sustain the planning/fast-path route.
 
 ### Agent Loop
 
 - `agent_activo`
 - `agent_messages`
 - `agent_pasos_log`
+- `agent_images` (b64 thumbnails of this turn's image attachments,
+  embedded into the user message when the model supports vision)
 
-El transcript sigue el formato de mensajes que utiliza Ollama (`system/user/assistant/tool`) y el log conserva tool, argumentos y resultado para diagnóstico.
+The transcript follows the message format Ollama uses
+(`system/user/assistant/tool`), and the log keeps tool, arguments and result
+for diagnostics.
 
-### Resultados de tools
+### Tool results
 
-El estado reserva campos separados para web, shell, MCP, visión, filesystem y computer use. También conserva `_tool_args` para los argumentos estructurados de la llamada actual.
+The state reserves separate fields for web, shell, MCP, vision, filesystem
+and computer use. It also keeps `_tool_args` for the structured arguments of
+the current call.
 
 ### Context Manager
 
@@ -115,178 +139,275 @@ El estado reserva campos separados para web, shell, MCP, visión, filesystem y c
 
 ### Error Handler
 
-El estado mantiene el contexto del error, número máximo de intentos, autorización y el fix propuesto/diff/fuente, además de aliases legacy para compatibilidad.
+The state keeps the error context, maximum attempt count, authorization and
+the proposed fix/diff/source, plus legacy aliases for compatibility.
 
-La factory `crear_estado_inicial()` es la fuente central para inicializar el estado y normaliza la memoria antes de construirlo.
+The `crear_estado_inicial()` factory is the central source for initializing
+state and normalizes memory before building it.
 
-## 5. Orquestación LangGraph
+## 5. LangGraph orchestration
 
-`core/agent/graph_builder.py` construye el `StateGraph`.
+`core/agent/graph_builder.py` builds the `StateGraph`.
 
-### Ruta principal
+### Main route
 
 ```text
 START
   → planner
   → context_manager
   → plan_executor | agent_loop
-  → plan_synthesizer (cuando corresponde)
+  → plan_synthesizer (when applicable)
   → finalize
   → END
 ```
 
 ### `planner`
 
-El planner conserva fast-paths deterministas y decide si la orden necesita el camino de planificación o el agent loop. El estado producido por esta fase es utilizado por `context_manager` para identificar el tema inicial.
+The planner keeps deterministic fast-paths and decides whether the request
+needs the planning route or the agent loop. The state produced by this phase
+is used by `context_manager` to identify the initial topic.
 
 ### `context_manager`
 
-Se ejecuta siempre después del planner y antes de la inferencia. Su responsabilidad es seleccionar el contexto relevante, actualizar el tema activo y producir `context_dump` para diagnóstico.
+Always runs after the planner and before inference. Its responsibility is to
+select the relevant context, update the active topic and produce
+`context_dump` for diagnostics.
 
-La implementación usa `construir_contexto_memoria()` y `construir_context_dump()` y propaga el resultado mediante `context_slots`.
+The implementation uses `construir_contexto_memoria()` and
+`construir_context_dump()` and propagates the result via `context_slots`.
 
 ### `plan_executor`
 
-Ejecuta los pasos de un plan mediante los nodos reales registrados en `TOOL_REGISTRY`. Después de cada ejecución, el router decide si debe continuar el plan, sintetizar el resultado, finalizar o entrar al manejador de errores.
+Executes a plan's steps through the real nodes registered in
+`TOOL_REGISTRY`. After each execution the router decides whether to continue
+the plan, synthesize the result, finish or enter the error handler.
 
 ### `agent_loop`
 
-Es el camino de tool calling nativo. El modelo recibe las tools estructuradas y decide incrementalmente qué hacer. El nodo puede volver a sí mismo mientras `agent_activo=True`; cuando el objetivo termina, la ruta continúa hacia `finalize`.
+This is the native tool-calling route. The model receives the structured
+tools and incrementally decides what to do. The node can loop back to
+itself while `agent_activo=True`; when the goal is done the route continues
+to `finalize`.
 
-Este diseño evita obligar a las tareas abiertas a producir un plan completo de antemano.
+This design avoids forcing open-ended tasks to produce a complete plan up
+front.
+
+**Step limit and loop defenses.** The loop has **no fixed step limit by
+design** — the user decides when to stop (Stop button / `/api/stop` /
+Ctrl+C; cancellation is checked at the start of every step). The safety nets
+that keep it from spinning forever:
+
+1. **Exact-duplicate block:** a tool call already executed twice with
+   identical arguments is not run again; the model gets closing guidance.
+2. **Attempt memory ("if it didn't return a result, it didn't return a
+   result"):** negative tool results (`sin_resultados` / `error`) are
+   classified, given terminal guidance in the tool message, and persisted
+   as outcomes in the shared central memory, so the same dead end isn't
+   retried in later turns.
+3. **Hard cap:** search/reading tools (`web`, `fs_read`, `fs_list`,
+   `vision`) that accumulate 3 failed attempts in the turn are no longer
+   executed; the loop closes with whatever it has.
+4. **Per-step instruction:** the instruction the model writes in the tool
+   call arguments is the step's base text (falling back to the original
+   request), so a refined instruction really changes what the step does —
+   the fix for the "4 steps searching the same thing" bug.
+5. **Web dedup:** `node_web` never re-reads a URL already read in the turn;
+   a repeated search reads the first new result URL, and when everything
+   has been read it returns `[SIN RESULTADOS NUEVOS]`, which classifies as
+   `sin_resultados` and feeds the hard cap. The model can also pass an
+   explicit `query` (searched as-is) or `url` (read directly) via the
+   tool schema.
 
 ### `plan_synthesizer`
 
-Convierte resultados crudos de herramientas en una respuesta útil cuando todavía es necesario pasar por una etapa de síntesis. El builder evita esta etapa cuando una tool ya produjo una respuesta determinista y no existen datos crudos nuevos que sintetizar.
+Turns raw tool results into a useful answer when a synthesis stage is still
+needed. The builder skips this stage when a tool already produced a
+deterministic answer and there is no new raw data to synthesize.
 
 ### `finalize`
 
-Es el cierre del grafo y deja la respuesta final disponible en `final_response`. También participa en el registro del turno de Aether.
+Closes the graph and leaves the final answer available in `final_response`.
+It also takes part in registering Aether's turn.
 
-## 6. Registro de herramientas
+## 6. Tool registry
 
-`core/agent/tool_registry.py` es la fuente central de verdad para las tools conocidas por el agente.
+`core/agent/tool_registry.py` is the central source of truth for the tools
+known to the agent.
 
-Cada entrada vincula:
+Each entry links:
 
 ```text
-nombre de tool
+tool name
     ├── node
     ├── instruccion_requerida
     └── descripcion
 ```
 
-Además, `TOOL_PARAMETROS` define los schemas de argumentos utilizados por el tool calling nativo.
+In addition, `TOOL_PARAMETROS` defines the argument schemas used by native
+tool calling.
 
-Actualmente el registro contiene:
+The registry currently contains:
 
-| Tool | Función conceptual |
+| Tool | Conceptual function |
 |---|---|
-| `text` | conversación/respuesta directa |
-| `web` | búsqueda web |
-| `shell` | generación y ejecución de comandos |
-| `launch` | lanzamiento de aplicaciones |
-| `vision` | captura y análisis de pantalla |
-| `codigo` | generación/ejecución de código |
-| `memory` | gestión de memoria |
-| `file_write` | escritura legacy basada en resultado/instrucción |
-| `extract` | extracción/limpieza de resultados anteriores |
-| `mcp` | invocación de tools MCP |
-| `computer_use` | percepción + acción sobre la interfaz |
-| `fs_write` | escritura estructurada de uno o varios archivos |
-| `fs_read` | lectura de archivo |
-| `fs_mkdir` | creación de directorios |
-| `fs_list` | listado de directorios |
+| `text` | conversation/direct answer |
+| `web` | web search (optional structured args: `query`, `url`) |
+| `shell` | command generation and execution |
+| `launch` | application launching |
+| `vision` | screen capture and analysis |
+| `codigo` | code generation/execution |
+| `memory` | memory management |
+| `file_write` | legacy result/instruction-based writing |
+| `extract` | extraction/cleaning of previous results |
+| `mcp` | invocation of MCP tools |
+| `computer_use` | perception + action over the interface |
+| `subagent` | isolated sub-agents for parallel tasks |
+| `fs_write` | structured writing of one or several files |
+| `fs_read` | file reading |
+| `fs_mkdir` | directory creation |
+| `fs_list` | directory listing |
 
-`validar_tool_call()` realiza una validación rápida de existencia, tipo de argumentos, instrucciones requeridas y, en MCP, `server` + `name`. No sustituye la validación completa de un JSON Schema.
+`validar_tool_call()` performs a quick validation of existence, argument
+type, required instructions and, for MCP, `server` + `name`. It does not
+replace full JSON Schema validation.
 
-## 7. Herramientas y capas de ejecución
+## 7. Tools and execution layers
 
-La implementación concreta de las herramientas se encuentra principalmente en `core/tools/`:
+The concrete tool implementations live mostly in `core/tools/`:
 
-- `web_search.py`: búsqueda web.
-- `url_reader.py`: lectura de URLs.
-- `shell_executor.py`: ejecución de shell.
-- `flatpak_manager.py`: lanzamiento de aplicaciones.
-- `vision.py`: captura/análisis visual.
-- `computer_control.py`: control de interfaz.
-- `mcp_client.py`: cliente MCP.
-- `file_writer.py`: writer legacy.
-- `filesystem_tool.py`: operaciones estructuradas de filesystem.
+- `web_search.py`: web search (SearXNG with DuckDuckGo fallback).
+- `url_reader.py`: URL reading.
+- `shell_executor.py`: shell execution.
+- `flatpak_manager.py`: application launching.
+- `vision.py`: capture/visual analysis.
+- `ydotool_wrapper.py`: interface control (v2 — `hyprctl` + `ydotool`,
+  without VLM fallback or complex verification; replaces the removed
+  `computer_control.py`).
+- `mcp_client.py`: MCP client.
+- `file_writer.py`: legacy writer.
+- `filesystem_tool.py`: structured filesystem operations.
 
-Los nodos del grafo funcionan como capa de orquestación; las implementaciones de `core/tools/` encapsulan las operaciones concretas.
+The graph nodes act as the orchestration layer; the `core/tools/`
+implementations encapsulate the concrete operations.
 
-## 8. Directorio de trabajo y separación de datos
+## 8. Working directory and data separation
 
-Aether distingue entre:
+Aether distinguishes between:
 
-- **Proyecto:** código fuente y comportamiento versionado.
-- **Home de runtime:** `~/Aether`, utilizado para DB, logs, screenshots y otros datos persistentes.
-- **Directorio de trabajo:** la ruta sobre la que el usuario abrió Aether o la especificada mediante `--workdir`.
+- **Project:** source code and versioned behavior.
+- **Runtime home:** `~/Aether`, used for DB, logs, screenshots and other
+  persistent data.
+- **Working directory:** the path where the user opened Aether, or the one
+  given via `--workdir`.
 
-`bin/aether` conserva el `$PWD` original en `AETHER_CWD` antes de entrar al directorio del proyecto. `core/config/settings.py` resuelve `RUTA_TRABAJO` dinámicamente a partir de esa variable o del cwd actual.
+`bin/aether` preserves the original `$PWD` in `AETHER_CWD` before entering
+the project directory. `core/config/settings.py` resolves `RUTA_TRABAJO`
+dynamically from that variable or from the current cwd.
 
-Esto permite ejecutar Aether desde un proyecto externo sin mover la instalación del agente.
+This lets you run Aether over an external project without moving the
+agent's installation.
 
-Los directorios de trabajo nuevos pasan por autorización explícita mediante `core/config/dir_authorization.py`, mientras que rutas sensibles del sistema tienen controles adicionales.
+New working directories go through explicit authorization via
+`core/config/dir_authorization.py`, and sensitive system paths have
+additional controls.
 
-## 9. Configuración y runtime local
+## 9. Configuration and local runtime
 
-`core/config/settings.py` centraliza los valores principales:
+Configuration is **two-layered**:
+
+- `core/config/config.json` — versioned defaults (shipped with the repo,
+  read-only).
+- `core/config/config.local.json` — local overrides, ignored by Git.
+
+`core/config/settings.py` centralizes the main values as a compatibility
+adapter, while `core/config/settings_v2.py` provides the simplified loader
+(JSON load + shallow merge, ~80 lines, no watchers/validators/locks).
+
+Key values:
 
 - `OLLAMA_HOST`: `http://localhost:11434`.
 - `SEARXNG_URL`: `http://localhost:8081`.
-- `MODELO`: modelo de texto configurado actualmente.
-- `MODELO_VISION`: modelo multimodal configurado actualmente.
+- `MODELO`: currently configured text model.
+- `MODELO_VISION`: currently configured multimodal model.
 - `TOOL_CALLING_NATIVO=True`.
-- `NUM_CTX=8192`.
+- `NUM_CTX=32768` (installer profiles adjust it to the hardware).
 - `OLLAMA_KEEP_ALIVE=-1`.
-- opciones de generación y límites de contexto.
-- rutas de DB, logs, screenshots, embeddings, backups y skills.
+- generation options and context limits.
+- paths for DB, logs, screenshots, embeddings, backups and skills.
 
-La configuración de modelo de `model_policy.py` actualmente funciona en **modo observación/passthrough**: registra decisiones y métricas, pero devuelve el modelo solicitado por el caller y no realiza switching efectivo. Esto deja preparado el punto de decisión para políticas adaptativas futuras.
+## 10. Memory
 
-## 10. Memoria
+The memory subsystem lives in `core/memory/`.
 
-El subsistema de memoria vive en `core/memory/`.
-
-### Capas
+### Layers
 
 ```text
-Memoria RAM
+RAM memory
     │
     ├── core
-    ├── resumen
-    ├── conversación
-    └── historial de comandos
+    ├── summary
+    ├── conversation
+    └── command history
           │
           ▼
      current.db
           │
-          ├── conversaciones
-          ├── comandos
-          ├── recuerdos
+          ├── conversations
+          ├── commands
+          ├── memories
           ├── core_memory
-          └── resumen_memoria
+          └── summary_memory
 ```
 
-`memory_manager.py` utiliza `~/Aether/db/current.db` como DB de producción. La estructura RAM se normaliza mediante `normalizar_mem()`.
+`memory_manager.py` uses `~/Aether/db/current.db` as the production DB. The
+RAM structure is normalized through `normalizar_mem()`.
 
-El contexto conversacional no se inyecta sin límite: `settings.py` define presupuestos de turnos y caracteres. Para planes multi-tool, el historial conversacional puede recortarse a cero turnos para evitar contaminación entre pasos; los resultados de pasos anteriores constituyen el contexto operativo relevante.
+Conversational context is not injected without limits: `settings.py` defines
+per-turn and character budgets. For multi-tool plans, conversational history
+can be trimmed to zero turns to avoid contamination between steps; previous
+step results are the relevant operating context.
 
-`consolidator.py` programa la actualización del resumen acumulativo después de completar una orden.
+Consolidation of the accumulated summary is scheduled after completing an
+order (v2 moved this into `memory_manager`; the old `consolidator.py` was
+removed).
 
-El repositorio también contiene un subsistema `core/memory/store/` destinado a controlar esquema, migraciones, snapshots, staging y escritura persistente.
+### Shared central memory (v2: SQLite)
 
-## 11. MCP y extensibilidad
+`core/memory/central_store_v2.py` implements the shared central memory on
+stdlib SQLite — same API surface as the previous JSON store, without the
+complex dedup/fingerprint/TTL-thread machinery. Tables:
 
-MCP está integrado como una tool del registro (`mcp`) y se ejecuta a través de `core/tools/mcp_client.py`. El contrato de tool calling requiere identificar `server`, `name` y, cuando corresponda, `arguments`.
+- `learnings`: memories with `importance` and `strength`; use reinforces,
+  disuse decays, `forget()` hides without deleting.
+- `outcomes`: operational memory of failed attempts (namespace `intentos`,
+  ~48 h TTL, daily decay, 200-entry cap) — "if it didn't return a result,
+  it didn't return a result".
+- `user_facts`: stable user facts (`user_set()` never silently
+  overwrites; corrections via `user_update()` with history).
+- `conversations`: per-runtime session summaries.
 
-Esto permite que servidores MCP conectados extiendan las capacidades de Aether sin convertir cada integración externa en un nodo hardcodeado independiente.
+It lives outside any runtime (default `~/.aether/memory/`, override with
+`AETHER_CENTRAL_MEMORY_PATH`, opt-out with `AETHER_CENTRAL_MEMORY=0`) and is
+shared by every surface: TUI, Web UI, Roblox Player and future runtimes.
+The context builder injects learnings into the `[APRENDIZAJES]` slot and
+recent failed attempts into the `[INTENTOS RECIENTES]` slot.
+
+## 11. MCP and extensibility
+
+MCP is integrated as a registry tool (`mcp`) and runs through
+`core/tools/mcp_client.py`. The tool-calling contract requires `server`,
+`name` and, when applicable, `arguments`.
+
+Server configuration is two-layered: `mcp_servers.json` (versioned template)
+and `mcp_servers.local.json` (tokens/secrets, ignored by Git) — the same
+scheme as `config.json`/`config.local.json`.
+
+This lets connected MCP servers extend Aether's capabilities without turning
+every external integration into an independent hardcoded node.
 
 ## 12. Error handling
 
-Los errores de ejecución tienen una ruta explícita:
+Execution errors have an explicit route:
 
 ```text
 error
@@ -294,99 +415,123 @@ error
   ▼
 error_diagnose
   │
-  ├── fix propuesto → error_confirm → error_retry ──► ejecución
+  ├── proposed fix → error_confirm → error_retry ──► execution
   │
-  └── sin fix / límite → error_fallback
+  └── no fix / limit → error_fallback
 ```
 
-El estado distingue el contexto (`shell`, `launch`, `codigo`), mantiene el intento actual y limita los reintentos. `graph_builder.py` usa un máximo general de 3 intentos y permite límites específicos por contexto definidos en `graph_state.py`.
+The state distinguishes the context (`shell`, `launch`, `codigo`), keeps the
+current attempt and limits retries. `graph_builder.py` uses a general
+maximum of 3 attempts and allows specific per-context limits defined in
+`graph_state.py`.
 
-## 13. Modelos
+## 13. Models
 
-La configuración actual separa modelo de texto y modelo de visión. El registro de política de modelos permite clasificar tareas como `chat`, `planner`, `synthesis`, `shell`, `code`, `vision`, `mcp` y `error`.
+The current configuration separates the text model (`MODELO`) from the
+vision model (`MODELO_VISION`); when the main model is multimodal, vision
+runs on it and no second model is needed.
 
-La política actualmente no cambia el modelo activo: su función es observacional y registra recomendaciones, posible cambio y latencia para futuras estrategias.
+The v2 migration removed the old observational model policy
+(`model_policy.py`): the configured model is used directly. The decision
+point for future adaptive policies now lives in the plain config layer.
 
-## 14. CLI y launcher
+## 14. CLI and launcher
 
-Los entrypoints relevantes del repositorio son:
+The relevant entry points are:
 
 ```text
 bin/aether
     └── bin/aether_run.py
-          └── runtime CLI
+          └── CLI runtime (subcommands: version, task, doctor)
 
 run.py
-    └── CLI/TUI
+    └── TUI
           └── core.services.graph_service
-
-jarvis_new.py
-    └── entrada alternativa al motor
 ```
 
-El launcher `bin/aether` soporta ejecución desde cualquier directorio y comandos como `task`, `doctor`, `cli`, `--version` y `--help`.
+The `bin/aether` launcher supports running from any directory plus commands
+like `task`, `doctor`, `--version` and `--help`. The old deprecated
+interactive loop in `cli/` was removed by the v2 migration.
 
-La carpeta `cli/` contiene un loop interactivo marcado como deprecated en el README; el launcher moderno es la superficie recomendada.
+## 15. Historical / unsupported components
 
-## 15. Componentes históricos / no soportados
+The repository contains components that must not be confused with the
+current engine:
 
-El repositorio contiene componentes que no deben confundirse con el motor actual:
+- `core/services/aether_service.py`: historical CrewAI-based implementation.
+- `backend/`: FastAPI API and existing web pieces, but the README declares
+  them outside the supported CLI flow. (The backend does run inferences
+  with an explicit `QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED` lifecycle.)
+- legacy aliases/fields inside state and memory: kept for compatibility.
+- `_legacy/`: retired artifacts (old databases/dumps) preserved outside the
+  main tree.
 
-- `core/services/aether_service.py`: implementación histórica basada en CrewAI.
-- `backend/`: API FastAPI y piezas web existentes, pero el README actual declara que no forman parte del flujo CLI soportado.
-- `frontend.tar.gz`: frontend empaquetado asociado a esa superficie web.
-- aliases/campos legacy dentro del estado y memoria: se mantienen para compatibilidad.
+The active architecture is **LangGraph + Ollama + tools/MCP + local
+memory**, not CrewAI.
 
-La arquitectura activa es **LangGraph + Ollama + tools/MCP + memoria local**, no CrewAI.
-
-## 16. Estructura lógica
+## 16. Logical structure
 
 ```text
 AetherAI/
-├── bin/                         # launcher global y runtime CLI
+├── bin/                         # global launcher and CLI runtime
 ├── core/
-│   ├── agent/                   # grafo, estado, planner, loop, registry
-│   ├── config/                  # configuración y autorización de directorios
-│   ├── connectors/              # conectores del sistema
-│   ├── memory/                  # memoria + store persistente
-│   ├── parser/                  # parsing de shell/respuestas
-│   ├── services/                # fachadas/servicios compatibles
-│   ├── skills/                  # comportamiento reutilizable
-│   ├── tools/                   # operaciones concretas
-│   ├── utils/                   # utilidades
-│   ├── events.py                # eventos/runtime
-│   └── state_manager.py         # gestión de estado auxiliar
-├── cli/                         # loop legacy/deprecated
-├── backend/                     # superficie web fuera del flujo CLI soportado
-├── tests/                       # suite de pruebas
-└── documentación/               # README, changelog, planes e informes
+│   ├── agent/                   # graph, state, planner, loop, registry
+│   ├── config/                  # two-layer config and directory authorization
+│   ├── memory/                  # memory + SQLite stores (session + central v2)
+│   ├── parser/                  # shell/response parsing
+│   ├── services/                # compatible facades/services
+│   ├── skills/                  # reusable behavior
+│   ├── tools/                   # concrete operations (incl. ydotool_wrapper)
+│   └── utils/                   # utilities
+├── tui/                         # Textual terminal UI
+├── skills/                      # operational SKILL.md files
+├── scripts/                     # utilities and QA verification harnesses
+├── tests/                       # test suite
+├── docs/                        # docs (English) + docs/es (Spanish originals)
+├── backend/                     # experimental web surface, outside the CLI flow
+└── _legacy/                     # retired artifacts
 ```
 
-## 17. Principios arquitectónicos observables
+## 17. Observable architectural principles
 
-1. **Local-first:** el runtime de inferencia principal está en Ollama local.
-2. **Orquestación explícita:** LangGraph controla estados y transiciones.
-3. **Tool registry único:** las tools se describen y validan desde un registro central.
-4. **Tool calling estructurado:** el agent loop usa schemas de argumentos, no depende exclusivamente de texto libre.
-5. **Contexto antes de inferencia:** `context_manager` selecciona información antes de los nodos downstream.
-6. **Filesystem contextual:** el directorio de trabajo puede ser externo a la carpeta del proyecto.
-7. **Memoria persistente separada:** los datos de runtime viven fuera del código versionado.
-8. **Compatibilidad gradual:** existen aliases y fachadas legacy mientras se consolida la arquitectura nueva.
-9. **Recuperación ante errores:** las ejecuciones pueden diagnosticar, proponer correcciones, reintentar y hacer fallback.
-10. **Observabilidad preparada:** el sistema contiene `context_dump`, logs de pasos del agent loop y una política de modelos en modo observación.
+1. **Local-first:** the main inference runtime is local Ollama.
+2. **Explicit orchestration:** LangGraph controls states and transitions.
+3. **Single tool registry:** tools are described and validated from a
+   central registry.
+4. **Structured tool calling:** the agent loop uses argument schemas, not
+   exclusively free text.
+5. **Context before inference:** `context_manager` selects information
+   before the downstream nodes.
+6. **Contextual filesystem:** the working directory can be external to the
+   project folder.
+7. **Separate persistent memory:** runtime data lives outside versioned
+   code.
+8. **Gradual compatibility:** legacy aliases and facades exist while the
+   new architecture settles.
+9. **Error recovery:** executions can diagnose, propose fixes, retry and
+   fall back.
+10. **Prepared observability:** the system ships `context_dump`, agent-loop
+    step logs, and an explicit inference lifecycle
+    (QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED) in the web backend.
+11. **Bounded loops:** the agent loop has no step limit by design (the user
+    decides), but duplicate calls, failed-search caps, per-turn URL dedup
+    and attempt memory keep it from repeating itself forever.
 
-## 18. Fuentes de implementación
+## 18. Implementation sources
 
-Este documento se contrastó directamente con los componentes principales de `main`, especialmente:
+This document was checked directly against the main components of `main`,
+especially:
 
 - `core/agent/graph_builder.py`
 - `core/agent/graph_state.py`
+- `core/agent/graph_nodes.py`
 - `core/agent/tool_registry.py`
 - `core/agent/node_context_manager.py`
-- `core/agent/model_policy.py`
 - `core/agent/graph_service.py`
+- `core/agent/streaming.py`
 - `core/services/graph_service.py`
-- `core/config/settings.py`
+- `core/config/settings.py` / `core/config/settings_v2.py`
 - `core/memory/memory_manager.py`
-- `core/tools/*`
+- `core/memory/central_store_v2.py`
+- `core/tools/*` (incl. `ydotool_wrapper.py`)
 - `README.md`

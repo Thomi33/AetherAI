@@ -1,350 +1,372 @@
 # Aether
 
-> Agente local, terminal-first y en español (por temas de seguridad).
-> **LangGraph + Ollama + herramientas reales + memoria persistente.**
+> Local, terminal-first agent. It converses in Spanish (by design); these docs
+> are in English — the Spanish originals live in [`docs/es/`](./docs/es/).
+> **LangGraph + Ollama + real tools + persistent memory.**
 
-Aether es un asistente local que conversa, analiza proyectos, busca información
-actualizada, lee y escribe archivos, ejecuta comandos, genera código, observa
-la pantalla y encadena varias acciones sin enviar el proyecto a servicios
-externos. El modelo corre en tu máquina mediante Ollama.
+Aether is a local assistant that chats, analyzes projects, searches for fresh
+information, reads and writes files, runs commands, generates code, watches
+the screen and chains multiple actions without sending your project to
+external services. The model runs on your own machine through Ollama.
 
-## Índice
+## Table of contents
 
-- [Instalación](#instalación)
-- [Uso](#uso)
-- [Cómo funciona](#cómo-funciona)
-- [Herramientas](#herramientas)
-- [Configuración y rendimiento](#configuración-y-rendimiento)
-- [Memoria y datos](#memoria-y-datos)
-- [Arquitectura del proyecto](#arquitectura-del-proyecto)
-- [Desarrollo y pruebas](#desarrollo-y-pruebas)
-- [Solución de problemas](#solución-de-problemas)
+- [Installation](#installation)
+- [Usage](#usage)
+- [How it works](#how-it-works)
+- [Tools](#tools)
+- [Configuration and performance](#configuration-and-performance)
+- [Memory and data](#memory-and-data)
+- [Project architecture](#project-architecture)
+- [Development and tests](#development-and-tests)
+- [Troubleshooting](#troubleshooting)
 
-## Instalación
+## Installation
 
-### Descargar Aether
+### Download Aether
 
-No necesitás instalar manualmente Python, pip, Ollama ni las dependencias de
-Aether antes de empezar. El instalador se encarga de preparar el entorno.
+You don't need to manually install Python, pip, Ollama or Aether's
+ dependencies before starting. The installer takes care of preparing the
+ environment.
 
-Podés descargar el repositorio de dos formas:
+You can download the repository in two ways:
 
-**Con Git:**
+**With Git:**
 
 ```bash
 git clone https://github.com/Thomi33/AetherAI.git
 cd AetherAI
 ```
 
-**Sin Git:** abrí el repositorio en GitHub, elegí **Code → Download ZIP**,
-descomprimí el archivo y abrí una terminal dentro de la carpeta `AetherAI`.
+**Without Git:** open the repository on GitHub, choose **Code → Download
+ZIP**, unzip the file and open a terminal inside the `AetherAI` folder.
 
-### Instalar
+### Install
 
-Desde la raíz del repositorio:
+From the repository root:
 
 ```bash
 chmod +x install.sh
 ./install.sh
 ```
 
-**Eso es todo.** El instalador se encarga automáticamente de:
+**That's it.** The installer automatically takes care of:
 
-1. Detectar CPU, RAM, VRAM y espacio disponible.
-2. Elegir el tier de hardware (`POTATO`, `LOW`, `MID`, `HIGH` o `ULTRA`).
-3. Seleccionar el modelo y los parámetros apropiados para ese equipo.
-4. Instalar las dependencias Python del core de Aether.
-5. Preparar el entorno virtual de Aether.
-6. Instalar/verificar Ollama cuando corresponde.
-7. Descargar el modelo seleccionado, con tu autorización.
-8. Configurar memoria, SQLite y los parámetros de ejecución.
-9. Instalar el comando global `aether` en `~/.local/bin` y dejarlo disponible en
-   el `PATH`.
-10. Ejecutar una validación final del entorno y del modelo.
+1. Detecting CPU, RAM, VRAM and available disk space.
+2. Choosing the hardware tier (`POTATO`, `LOW`, `MID`, `HIGH` or `ULTRA`).
+3. Selecting the model and parameters appropriate for that machine.
+4. Installing Aether's core Python dependencies.
+5. Preparing Aether's virtual environment.
+6. Installing/verifying Ollama when applicable.
+7. Downloading the selected model, with your authorization.
+8. Setting up memory, SQLite and runtime parameters.
+9. Installing the global `aether` command into `~/.local/bin` and making it
+   available on the `PATH`.
+10. Running a final validation of the environment and the model.
 
-Durante la instalación solo se te pueden pedir algunas decisiones normales,
-como la contraseña de `sudo`, si querés guardar los datos en `~/Aether` y si
-querés descargar el modelo seleccionado.
+During installation you may only be asked a few normal decisions, such as
+the `sudo` password, whether you want to keep data in `~/Aether` and whether
+you want to download the selected model.
 
-No hace falta ejecutar después comandos de `pip`, crear otro virtualenv ni
-instalar las dependencias de Aether a mano.
+There is no need to run `pip` commands afterwards, create another virtualenv
+or install Aether's dependencies by hand.
 
-### Hardware y perfiles
+### Hardware and profiles
 
-El instalador adapta el modelo y los parámetros al equipo detectado. Por
-ejemplo, una máquina muy limitada puede terminar como `POTATO` y usar
-`qwen2.5:1.5b`, mientras un equipo más potente recibe un perfil superior.
+The installer adapts the model and parameters to the detected machine. For
+example, a very limited machine may end up as `POTATO` and use
+`qwen2.5:1.5b`, while a more powerful machine gets a higher profile.
 
-El contexto recomendado se ajusta automáticamente según el hardware, con un
-límite de `65536`.
+The recommended context is adjusted automatically according to the hardware,
+with a limit of `65536`.
 
-La visión usa el mismo modelo principal configurado cuando ese modelo soporta
-entrada multimodal; no se descarga un segundo modelo de visión.
+Vision uses the same configured main model when that model supports
+multimodal input; no second vision model is downloaded.
 
-## Uso
+## Usage
 
-### TUI principal
+### Main TUI
 
-Después de instalar:
+After installing:
 
 ```bash
 aether
 ```
 
-También funciona directamente desde el proyecto:
+It also works directly from the project:
 
 ```bash
 python run.py
 ```
 
-### Lanzador global
+### Global launcher
 
-El instalador crea el comando `aether` en `~/.local/bin`, por lo que podés
-abrir Aether desde cualquier directorio:
+The installer creates the `aether` command in `~/.local/bin`, so you can open
+Aether from any directory:
 
 ```bash
 aether
-aether task "listá los archivos del proyecto"
-aether cli
+aether task "list the project files"
 aether doctor
 aether --version
 ```
 
-También podés ejecutar Aether sobre un directorio específico:
+You can also run Aether over a specific directory:
 
 ```bash
-cd ~/Proyecto
+cd ~/Project
 aether
-aether task "creá un README para este proyecto"
-aether --workdir ~/Proyecto task "ejecutá los tests"
+aether task "create a README for this project"
+aether --workdir ~/Project task "run the tests"
 ```
 
-Antes de operar en un directorio nuevo, Aether solicita autorización. Las
-denegaciones no se guardan: si volvés a iniciar Aether, volverá a preguntar.
+Before operating on a new directory, Aether asks for authorization. Denials
+are not persisted: if you start Aether again, it will ask again.
 
-### Detener una inferencia
+### Stopping an inference
 
-Durante una operación podés usar cualquiera de estas opciones:
+During an operation you can use any of these options:
 
-- Botón **Detener** en la TUI.
+- The **Stop** button in the TUI (or the Web UI's `/api/stop`).
 - `Ctrl+C`.
-- Comando `/stop`.
+- The `/stop` command.
 
-La cancelación es cooperativa: detiene el flujo cuando Ollama entrega el
-siguiente evento disponible.
+Cancellation is cooperative: the flow stops when Ollama delivers the next
+available event.
 
-## Cómo funciona
+## How it works
 
-Cada pedido se convierte en un estado `AetherState` y atraviesa un grafo
-LangGraph:
+Every request becomes an `AetherState` and flows through a LangGraph graph:
 
 ```text
 START
   -> planner
   -> context_manager
-  -> plan_executor o agent_loop
+  -> plan_executor or agent_loop
   -> plan_synthesizer/finalize
   -> END
 ```
 
-- **Planner:** resuelve fast-paths simples y prepara planes de uno o varios
-  pasos.
-- **Agent loop:** usa tool calling nativo de Ollama para tareas abiertas.
-- **Executor:** despacha cada paso a la implementación real de la herramienta.
-- **Synthesizer:** combina resultados cuando hay varias acciones.
-- **Error handler:** diagnostica errores, puede buscar una solución, reintenta
-  dentro de límites y deja el error explícito si no se resuelve.
-- **Context manager:** poda y compacta contexto para evitar consumo innecesario
-  de VRAM.
+- **Planner:** resolves simple fast-paths and prepares single or multi-step
+  plans.
+- **Agent loop:** uses Ollama's native tool calling for open-ended tasks. It
+  has no fixed step limit — you decide when to stop. Several safety nets keep
+  it from spinning forever:
+  - the same tool call with identical arguments is never repeated;
+  - negative results ("no results", errors) are classified, given closing
+    guidance, and persisted as outcomes so they aren't retried in later turns;
+  - search/reading tools that accumulate 3 failed attempts in a turn force
+    the loop to close ("if it didn't return a result, it didn't return a
+    result");
+  - the instruction the model writes for each step is what that step
+    actually does, so refining the instruction really changes the search;
+  - `web` never re-reads a URL already read in the same turn: repeated
+    searches read the next new source, and when there's nothing new they
+    return `[SIN RESULTADOS NUEVOS]` and count toward the hard cap.
+- **Executor:** dispatches each plan step to the tool's real implementation.
+- **Synthesizer:** combines results when there are multiple actions.
+- **Error handler:** diagnoses errors, can search for a fix, retries within
+  limits and leaves the error explicit if it can't be resolved.
+- **Context manager:** prunes and compacts context to avoid unnecessary VRAM
+  consumption.
 
-Si Aether no tiene certeza, el prompt le indica buscar primero en internet
-mediante `web` cuando el dato sea actual, versionado o verificable externamente.
-Para hechos locales debe preferir archivos, shell y herramientas del sistema.
+When Aether isn't certain, its prompt tells it to search the internet first
+via `web` when the fact is current, versioned or externally verifiable. For
+local facts it should prefer files, shell and system tools.
 
-La TUI muestra estados reales de ejecución, por ejemplo:
+The TUI shows real execution states, for example:
 
 ```text
-[•] Analizando solicitud...
-[•] Preparando plan...
-[•] Ejecutando herramienta: shell
-aptretando contexto pa salvar tu VRAM...
-[✓] Operación completada
+[•] Analyzing request...
+[•] Preparing plan...
+[•] Running tool: shell
+compacting context to save your VRAM...
+[✓] Operation completed
 ```
 
-Los mensajes de personalidad son opcionales, breves y secundarios; no
-reemplazan estados reales ni inventan acciones.
+Personality messages are optional, brief and secondary; they never replace
+real states or invent actions.
 
-## Herramientas
+## Tools
 
-| Herramienta | Función |
+| Tool | Function |
 |---|---|
-| `text` | Conversación directa con streaming. |
-| `web` | Búsqueda y lectura de información actual. |
-| `shell` | Ejecuta comandos `zsh` con barreras y timeout. |
-| `launch` | Abre aplicaciones y paquetes Flatpak. |
-| `vision` | Captura y analiza la pantalla con el modelo principal multimodal. |
-| `codigo` | Genera, guarda y ejecuta Python, Bash o Java. |
-| `memory` | Consulta, guarda o elimina recuerdos. |
-| `file_write` | Guarda el resultado de un paso en un archivo. |
-| `fs_read` / `fs_write` | Lee y escribe archivos con rutas explícitas. |
-| `fs_mkdir` / `fs_list` | Crea directorios y lista contenido. |
-| `computer_use` | Controla mouse/teclado cuando está disponible. |
-| `mcp` | Invoca servidores MCP configurados. |
+| `text` | Direct conversation with streaming. |
+| `web` | Web search and reading. Optional args: `query` (exact search, not rewritten) and `url` (read that specific source). |
+| `shell` | Runs `zsh` commands with barriers and timeout. |
+| `launch` | Opens applications and Flatpak packages. |
+| `vision` | Captures and analyzes the screen with the multimodal main model. |
+| `codigo` | Generates, saves and runs Python, Bash or Java. |
+| `memory` | Queries, stores or deletes memories. |
+| `file_write` | Saves a step's result to a file. |
+| `extract` | Extracts/cleans content from a previous step's raw result. |
+| `fs_read` / `fs_write` | Reads and writes files with explicit paths (`fs_write` supports multi-file atomic writes). |
+| `fs_mkdir` / `fs_list` | Creates directories and lists contents. |
+| `subagent` | Spawns isolated sub-agents for parallel tasks. |
+| `computer_use` | Controls mouse/keyboard via `ydotool` + `hyprctl`. |
+| `mcp` | Invokes configured MCP servers. |
 
-Las rutas relativas se resuelven en el directorio de trabajo autorizado, no en
-la carpeta del repositorio. Por defecto la memoria, notas y logs viven aparte
-en `~/Aether`; si durante el onboarding se elige no usar un home separado,
-viven en `<proyecto>/.aether-data/`.
+Relative paths resolve inside the authorized working directory, not inside
+the repository folder. By default memory, notes and logs live separately in
+`~/Aether`; if you choose not to use a separate home during onboarding, they
+live in `<project>/.aether-data/`.
 
-`computer_use` consulta directamente a Hyprland (`hyprctl`) o Sway
-(`swaymsg`) para resolver monitor, workspace, foco y cursor. Ese contexto se
-cachea durante la secuencia y se invalida solo después de acciones que pueden
-cambiarlo. Las acciones de mouse se reintentan con backoff corto y se verifican
-sin VLM; el diagnóstico visual queda reservado para un fallback explícito.
-Cada acción registra tipo, contexto, resultado y reintentos en el logger de
-`core.tools.computer_control`.
+### computer_use (v2: ydotool wrapper)
 
-Las órdenes con coordenadas o workspace explícitos usan un fast-path
-determinista y registran `duracion_ms`; no invocan el VLM. Cuando una acción
-requiere visión, `ver_pantalla` admite un recorte `x,y,ancho,alto` para evitar
-capturas mayores a la región relevante. La rama Sway tiene cobertura con mocks
-del formato de `swaymsg`, pero no fue validada en vivo en este entorno.
+Interface control lives in `core/tools/ydotool_wrapper.py`. Window search,
+focus and workspace switching go straight to Hyprland (`hyprctl`); clicks,
+typing, mouse movement and key holds go through `ydotool`. The v2 wrapper is
+deliberately simple: the old implementation's VLM fallback, verification
+dataclasses, complex retries and context caching were removed — an action
+either runs or fails fast, and visual diagnosis is left to the explicit
+`vision` tool when you ask for it.
 
-En una medición local de referencia, mover el cursor a otro monitor y verificarlo
-con Hyprland tomó `9.36 ms` end-to-end (incluyendo la consulta posterior).
-Como comparación concreta, una captura completa más una inferencia real con
-`ornith-1.5:9b` tomó `32794.47 ms`; esa es la latencia que el fast-path evita
-para una orden con coordenadas explícitas.
+## Configuration and performance
 
-## Configuración y rendimiento
+Configuration follows a **two-layer** scheme:
 
-La configuración principal está en [`core/config/config.json`](./core/config/config.json).
-Ese JSON es la fuente única de valores configurables. `settings.py` se conserva
-como adaptador de compatibilidad para rutas calculadas y módulos antiguos; no
-debe contener valores alternativos de configuración.
-Los valores más importantes son:
+- [`core/config/config.json`](./core/config/config.json) — versioned defaults
+  (read-only; ships with the repo).
+- `core/config/config.local.json` — your local overrides, ignored by Git.
 
-- `MODELO`: modelo principal para texto, tool calling y visión.
-- `AETHER_DATA_DIR`: carpeta donde se guardan memoria, notas y logs.
-- `NUM_CTX`: contexto efectivo; el instalador lo ajusta según hardware.
-- `NUM_PREDICT`: máximo de tokens generados.
-- `OLLAMA_KEEP_ALIVE`, threads y batch: parámetros de latencia y memoria.
-- `STT_ENABLED`: dictado por voz opcional.
+Manually edited values always take priority over the program defaults. MCP
+servers follow the same pattern: `mcp_servers.json` (versioned template) plus
+`mcp_servers.local.json` for tokens and secrets, which never get committed.
 
-Los valores editados manualmente tienen prioridad sobre los defaults del
-programa. Un contexto más grande no siempre es más rápido: depende de la RAM,
-VRAM, cuantización y modelo elegido.
+The most important values are:
 
-## Memoria y datos
+- `MODELO`: main model for text, tool calling and vision.
+- `AETHER_DATA_DIR`: folder where memory, notes and logs are kept.
+- `NUM_CTX`: effective context; the installer adjusts it to the hardware.
+- `NUM_PREDICT`: maximum generated tokens.
+- `OLLAMA_KEEP_ALIVE`, threads and batch: latency and memory parameters.
+- `STT_ENABLED`: optional voice dictation.
 
-Aether mantiene memoria temporal en RAM y persistente mediante el subsistema
-controlado de [`core/memory/store`](./core/memory/store):
+A bigger context is not always faster: it depends on RAM, VRAM,
+quantization and the chosen model.
 
-- Producción: `$AETHER_DATA_DIR/db/current.db`.
-- Pruebas: `$AETHER_DATA_DIR/db/staging.db`.
+## Memory and data
+
+Aether keeps temporary memory in RAM and persistent memory through the
+controlled subsystem in [`core/memory/store`](./core/memory/store):
+
+- Production: `$AETHER_DATA_DIR/db/current.db`.
+- Tests: `$AETHER_DATA_DIR/db/staging.db`.
 - Snapshots: `$AETHER_DATA_DIR/db/snapshots/`.
 - Backups: `$AETHER_DATA_DIR/db/backups/`.
 
-Las escrituras pasan por `MemoryStore`, migraciones versionadas y un guard de
-integridad. La base `memoria.db` que estaba en la raíz era un artefacto legacy
-sin uso por el runtime actual; fue conservada fuera del árbol principal en
-`_legacy/data/` junto con el dump antiguo para no perder datos históricos.
+Writes go through `MemoryStore`, versioned migrations and an integrity guard.
+The old `memoria.db` at the repository root was a legacy artifact unused by
+the current runtime; it was preserved outside the main tree in `_legacy/data/`
+together with the old dump so no historical data is lost.
 
-Durante inferencias largas, el resumen consolidado también se guarda en
-`notes/contexto_importante.md` antes de compactar el contexto. Así los datos
-importantes sobreviven aunque el prompt se reduzca. Durante el onboarding, el
-instalador pregunta si Aether debe tener su propia carpeta. Si elegís que no,
-usa `<proyecto>/.aether-data/` para la base y sus notas.
+During long inferences, the consolidated summary is also saved to
+`notes/contexto_importante.md` before compacting the context. That way
+important data survives even when the prompt shrinks. During onboarding, the
+installer asks whether Aether should have its own folder. If you choose no,
+it uses `<project>/.aether-data/` for the database and its notes.
 
-### Memoria central compartida
+### Shared central memory
 
-Además del almacenamiento de sesión anterior, Aether tiene una **memoria
-central compartida** en JSON (`core/memory/central/`) que vive fuera de
-cualquier runtime (default `~/.aether/memory/`, override con
-`AETHER_CENTRAL_MEMORY_PATH`) y es la misma para todos: terminal, Web UI,
-Roblox Player y futuros runtimes. Tiene tres capas:
+On top of the per-session storage above, Aether has a **shared central
+memory** (`core/memory/central_store_v2.py`) implemented on stdlib SQLite
+that lives outside any runtime (default `~/.aether/memory/`, override with
+`AETHER_CENTRAL_MEMORY_PATH`) and is the same for everyone: terminal, Web
+UI, Roblox Player and future runtimes. Four tables back its layers:
 
-- **Conversación**: contexto temporal por sesión, compactable.
-- **Usuario**: hechos estables del usuario; `user_set()` nunca sobrescribe
-  silenciosamente, las correcciones pasan por `user_update()` con historial.
-- **Aprendizaje**: recuerdos con `importance` (1–10) y `strength` (0–1).
-  El uso los refuerza (asintóticamente: nunca satura), el desuso los
-  debilita (`consolidate()`, agendada tras cada turno), y `forget()` los
-  hace inaccesibles **sin borrarlos** (solo `hard=True` elimina). La
-  personalidad es acumulativa: `personality_signals()` agrega patrones,
-  nunca reemplaza nada.
-- **Intentos (outcomes)**: memoria operativa y efímera (`kind="outcome"`,
-  TTL ~48 h, decaimiento diario, cap de 200 entradas). Registra qué tools
-  ya se intentaron y no dieron resultado — "si no dio resultado, no dio
-  resultado". El agent loop clasifica los resultados negativos, les agrega
-  guía de cierre al mensaje de tool y fuerza el cierre del loop tras 3
-  fallos de una tool de búsqueda en el turno; el registro queda persistido
-  para no repetirlo en próximos turnos.
+- **Conversations** (`conversations`): per-session temporal context,
+  compactable.
+- **User** (`user_facts`): stable facts about the user; `user_set()` never
+  silently overwrites, corrections go through `user_update()` with history.
+- **Learnings** (`learnings`): memories with `importance` (1–10) and
+  `strength` (0–1). Use reinforces them (asymptotically: never saturates),
+  disuse weakens them (`consolidate()`, scheduled after every turn), and
+  `forget()` makes them inaccessible **without deleting** (only `hard=True`
+  deletes). Personality is cumulative: `personality_signals()` adds patterns,
+  never replaces anything.
+- **Outcomes** (`outcomes`): operational, ephemeral memory of what was
+  already tried and gave no result — "if it didn't return a result, it
+  didn't return a result". Entries have a ~48 h TTL, daily decay and a cap
+  of 200. The agent loop classifies negative tool results, appends closing
+guidance to the tool message, and force-closes the loop after 3 failed
+attempts of a search/reading tool in the turn; the outcome is persisted so
+  the same dead end isn't retried in later turns.
 
-El context builder inyecta los aprendizajes relevantes en el slot
-`[APRENDIZAJES]` y los intentos fallidos en el slot `[INTENTOS RECIENTES]`
-(ambos desactivables con `AETHER_CENTRAL_MEMORY=0`; la inyección no
-refuerza memorias — solo el uso real lo hace).
+The context builder injects relevant learnings into the `[APRENDIZAJES]`
+slot and recent failed attempts into the `[INTENTOS RECIENTES]` slot (both
+disableable with `AETHER_CENTRAL_MEMORY=0`; injection never reinforces
+memories — only real use does).
 
-## Arquitectura del proyecto
+## Project architecture
 
 ```text
 .
-├── run.py                    # Entrada principal
-├── install.sh                # Instalador y perfilado de hardware
-├── install-core.sh           # Implementación interna del instalador
-├── bin/                      # Lanzador global aether
+├── run.py                    # Main entry point
+├── install.sh                # Installer and hardware profiling
+├── installer/                # Installer internals (install-core.sh)
+├── bin/                      # Global aether launcher
 ├── core/
-│   ├── agent/                # Grafo, planner, loop y tools
-│   ├── config/               # Configuración y autorización de directorios
-│   ├── memory/               # Memoria, compactación y SQLite
-│   ├── services/             # Entrada única al grafo
-│   └── tools/                # Shell, web, visión y filesystem
-├── tui/                      # Interfaz Textual y estados
-├── skills/                   # Instrucciones reutilizables
-├── tests/                    # Tests automatizados
-└── backend/                  # API FastAPI experimental, no instalada por defecto
+│   ├── agent/                # Graph, planner, loop and tool registry
+│   ├── config/               # Config (two-layer) and directory authorization
+│   ├── memory/               # Memory: RAM, SQLite store, central memory v2
+│   ├── services/             # Single entry point to the graph
+│   ├── skills/               # Reusable behavior
+│   ├── tools/                # Shell, web, vision, filesystem, ydotool
+│   ├── parser/               # Shell/response parsing
+│   └── utils/                # Utilities
+├── tui/                      # Textual interface and execution states
+├── skills/                   # Reusable instructions (SKILL.md)
+├── scripts/                  # Utility and QA verification scripts
+├── tests/                    # Automated tests
+├── docs/                     # English docs + Spanish originals (docs/es/)
+├── backend/                  # Experimental FastAPI backend, not installed by default
+└── _legacy/                  # Retired artifacts kept for reference
 ```
 
-Las skills operativas viven en `skills/<nombre>/SKILL.md`. Se mantienen como
-archivos separados porque Aether los descubre y carga dinámicamente; no son
-documentación redundante.
+Operational skills live in `skills/<name>/SKILL.md`. They stay as separate
+files because Aether discovers and loads them dynamically; they are not
+redundant documentation.
 
-## Backend opcional
+## Optional backend
 
-El backend FastAPI es experimental y **no forma parte de la instalación normal
-de la TUI**. Está separado para evitar que sus dependencias antiguas interfieran
-con el runtime actual. La futura WebUI se desarrollará en un repositorio aparte.
+The FastAPI backend is experimental and **not part of the normal TUI
+installation**. It is kept separate so its older dependencies don't
+interfere with the current runtime. The future WebUI will be developed in a
+separate repository.
 
-Si necesitás trabajar con el backend experimental manualmente, levantalo
-**desde la raíz del repo** (los imports del paquete son absolutos,
-`backend.api…`):
+The backend runs inferences with an explicit lifecycle —
+`QUEUED → RUNNING → COMPLETED/FAILED/CANCELLED` — with per-inference logs and
+no orphan threads, so the Web UI can always show and stop what is actually
+running.
+
+If you need to work with the experimental backend manually, start it **from
+the repository root** (package imports are absolute, `backend.api…`):
 
 ```bash
 crewai-env/bin/python -m pip install -r backend/requirements.txt
 .venv/bin/python -m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-> Nota: el comando viejo (`cd backend && uvicorn api.main:app`) falla con
+> Note: the old command (`cd backend && uvicorn api.main:app`) fails with
 > `ModuleNotFoundError: No module named 'backend'`.
 
-## Desarrollo y pruebas
+## Development and tests
 
-El instalador normal ya crea y configura el entorno virtual. Para desarrollo:
+The normal installer already creates and configures the virtual environment
+(`.venv`). For development:
 
 ```bash
-source crewai-env/bin/activate
-python -m pytest tests
-python -m py_compile run.py tui/app.py core/agent/graph_nodes.py
+.venv/bin/python -m pytest tests
+.venv/bin/python -m py_compile run.py tui/app.py core/agent/graph_nodes.py
 ```
 
-### Runtime de Roblox
+### Roblox runtime
 
-La automatización específica de Roblox vive en el repositorio separado
-`~/aether-roblox`. Aether conserva las primitivas genéricas de control y se
-conecta al runtime mediante `core.tools.roblox_bridge`.
+Roblox-specific automation lives in the separate repository
+`~/aether-roblox`. Aether keeps the generic control primitives and connects
+to the runtime through `core.tools.roblox_bridge`.
 
-Desde la TUI se controla todo con un único comando:
+From the TUI everything is controlled with a single command:
 
 ```text
 /play-roblox
@@ -353,75 +375,76 @@ Desde la TUI se controla todo con un único comando:
 /play-roblox stop
 ```
 
-El arranque busca y enfoca `org.vinegarhq.Sober` antes de lanzar el runtime.
-Por defecto usa Ollama; `/play-roblox google` selecciona Google Cloud Vision
-para ese arranque. La credencial debe existir en el entorno, sin guardarla en
-`config.json`:
+Startup looks for and focuses `org.vinegarhq.Sober` before launching the
+runtime. It uses Ollama by default; `/play-roblox google` selects Google
+Cloud Vision for that run. The credential must exist in the environment,
+never stored in `config.json`:
 
 ```bash
 export GOOGLE_APPLICATION_CREDENTIALS="$HOME/.config/gcloud/application_default_credentials.json"
-# o: export GOOGLE_API_KEY="..."
+# or: export GOOGLE_API_KEY="..."
 ```
 
-Instalá el extra del runtime una vez:
+Install the runtime extra once:
 
 ```bash
 cd ~/aether-roblox
 venv/bin/pip install -e '.[google]'
 ```
 
-El runtime coordina percepción, reacción, movimiento WASD y cámara para evitar
-que varios loops compitan por el foco o los dispositivos de entrada.
+The runtime coordinates perception, reaction, WASD movement and camera so
+several loops never fight over focus or input devices.
 
-Para comprobar que el grafo compila:
+To check that the graph compiles:
 
 ```bash
-python -c "from core.agent.graph_builder import build_graph; build_graph(); print('ok')"
+.venv/bin/python -c "from core.agent.graph_builder import build_graph; build_graph(); print('ok')"
 ```
 
-El script de auditoría está en [`tools/audit_project.py`](./tools/audit_project.py)
-y sirve como diagnóstico manual; no forma parte del arranque normal.
+The audit script lives in [`tools/audit_project.py`](./tools/audit_project.py)
+and serves as manual diagnostics; it is not part of normal startup.
 
-## Solución de problemas
+## Troubleshooting
 
-### `aether` no aparece después de instalar
+### `aether` doesn't show up after installing
 
-El instalador agrega `~/.local/bin` al `PATH`. Si ya había una terminal abierta
-durante la instalación, reiniciá esa terminal para que herede el entorno nuevo.
+The installer adds `~/.local/bin` to the `PATH`. If a terminal was already
+open during installation, restart that terminal so it inherits the new
+environment.
 
-### Ollama no responde
+### Ollama doesn't respond
 
 ```bash
 ollama serve
 ollama list
 ```
 
-En una instalación normal, el instalador ya verifica Ollama y descarga el modelo
-seleccionado cuando lo autorizás.
+In a normal installation the installer already verifies Ollama and downloads
+the selected model when you authorize it.
 
-### El modelo responde lento
+### The model responds slowly
 
-Reducí `NUM_CTX` o `NUM_PREDICT`, comprobá la VRAM disponible y verificá que
-Ollama esté usando GPU. El hardware y el modelo son los límites principales;
-Aether evita trabajo redundante, compacta contexto y limita loops, pero no
-puede acelerar la generación intrínseca del modelo.
+Lower `NUM_CTX` or `NUM_PREDICT`, check available VRAM and verify Ollama is
+using the GPU. Hardware and model are the main limits; Aether avoids
+redundant work, compacts context and caps loops, but it can't speed up the
+model's intrinsic generation.
 
-### Directorio rechazado
+### Directory rejected
 
-El rechazo cierra esa ejecución y no queda persistido. Iniciá Aether nuevamente
-para autorizarlo cuando quieras.
+A rejection closes that run and is not persisted. Start Aether again to
+authorize it whenever you want.
 
-### Visión no funciona
+### Vision doesn't work
 
-Verificá `grim`, Wayland/Hyprland y que el modelo configurado soporte imágenes:
+Check `grim`, Wayland/Hyprland and that the configured model supports images:
 
 ```bash
 command -v grim
-ollama show "$(python -c 'import json; print(json.load(open("core/config/config.json"))["MODELO"])')"
+ollama show "$(.venv/bin/python -c 'import json; print(json.load(open("core/config/config.json"))["MODELO"])')"
 ```
 
-## Licencia y estado
+## License and status
 
-Proyecto en desarrollo activo. Revisá los cambios directamente en Git y no
-comprometas credenciales, archivos `.env`, bases de datos personales ni
-configuraciones locales.
+Project under active development. Review changes directly in Git and never
+commit credentials, `.env` files, personal databases or local
+configurations.
