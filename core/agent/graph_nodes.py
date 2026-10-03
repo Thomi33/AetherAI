@@ -1498,7 +1498,12 @@ def node_agent_loop(state: AetherState) -> dict:
     de tools duplicada entre el camino viejo (fast-paths deterministas) y
     el nuevo (agent loop).
     """
-    from core.agent.tool_registry import construir_tools_ollama, validar_tool_call, get_node_func
+    from core.agent.tool_registry import (
+        construir_tools_ollama,
+        validar_tool_call,
+        get_node_func,
+        _instruccion_de_paso,
+    )
 
     mem   = state.get("mem", {})
     orden = state["orden"]
@@ -1700,13 +1705,22 @@ def node_agent_loop(state: AetherState) -> dict:
             resultado = f"[ERROR] Llamada inválida a '{tool}': {motivo}"
         else:
             print(f"\n🔧 [AGENT LOOP]: Paso {len(agent_pasos_log) + 1} → tool={tool} args={args}")
-            # Nota: en el agent loop no hay plan_pasos, así que la
-            # instrucción base es siempre la orden original; los args
-            # estructurados se inyectan vía _construir_orden_paso y
-            # _tool_args más abajo.
-            instruccion = orden
+            # F-1 (bug "4 pasos buscando lo mismo"): la instrucción que el
+            # modelo escribió en los args es LO QUE ESTE PASO DEBE HACER.
+            # Antes la base era siempre la orden original del usuario, así
+            # que todos los pasos web condensaban la MISMA pregunta y la
+            # búsqueda nunca cambiaba pese a instrucciones cada vez más
+            # refinadas (bug real: ley 18331 × 4 pasos idénticos). Mismo
+            # criterio que node_plan_executor: _instruccion_de_paso o la
+            # orden original como fallback. Los args estructurados siguen
+            # viajando por _tool_args.
+            instruccion = _instruccion_de_paso({"args": args}) or orden
             sub_estado = dict(state)
             sub_estado["orden"]           = _construir_orden_paso(instruccion, args, resultados_previos)
+            # Pasos log EN VIVO (no la copia pre-ronda del state): node_web
+            # deduplica URLs ya leídas también entre tool calls paralelas
+            # emitidas en una misma ronda.
+            sub_estado["agent_pasos_log"] = agent_pasos_log
             sub_estado["error_activo"]    = False
             sub_estado["error_mensaje"]   = ""
             sub_estado["final_response"]  = None
@@ -1787,6 +1801,47 @@ def node_agent_loop(state: AetherState) -> dict:
 # NODO: WEB — proveedor de datos puro
 # ══════════════════════════════════════════════════════════════════════
 
+# ── Saneamiento de queries de búsqueda (F-5) ─────────────────────────────
+# Bug real (ley 18331 × 4 pasos): el condensador recibía como "mensaje" la
+# orden base + [CONTEXTO DE PASOS PREVIOS] (1500 chars por paso previo) y
+# devolvía queries degeneradas — eco de la pregunta original con la wake
+# word ('aether, que dice ley numero 18331 uruguay?') o un fragmento de
+# marcador cortado a mitad de token ('...uruguay? [contexto'). Tres
+# higienes: (1) el input del condensador NO incluye el bloque de contexto
+# previo, (2) wake words fuera siempre, (3) el output se valida antes de
+# usarse: sin artefactos de marcadores, sin wake words, mínimo 2 palabras.
+
+_MARCADOR_CTX_PREVIO = "[CONTEXTO DE PASOS PREVIOS]"
+_WAKE_WORDS_N = frozenset({"aether"})
+
+
+def _sacar_wake_words(texto: str) -> str:
+    """Saca wake words iniciales (incluso pegadas a puntuación: 'Aether,')."""
+    palabras = (texto or "").split()
+    while palabras and _normalizar(palabras[0].strip(",.?!¡¿:;\"'")) in _WAKE_WORDS_N:
+        palabras.pop(0)
+    return " ".join(palabras)
+
+
+def _sanear_query_llm(query: str) -> str:
+    """Valida/sanea la query que devolvió el condensador LLM.
+
+    Devuelve '' si es un artefacto degenerado (fragmento de marcador del
+    prompt, wake word sola, una sola palabra): el caller cae al fallback
+    local de keywords en vez de buscar basura.
+    """
+    q = (query or "").strip().strip('"').strip("'").strip()
+    # Artefacto de marcador del prompt: '[contexto', '[CONTEXTO...'. Una
+    # query de búsqueda legítima no lleva corchetes.
+    if "[" in q or "]" in q:
+        return ""
+    q = _sacar_wake_words(q).strip().strip('"').strip("'").strip()
+    # Una palabra sola es demasiado vaga para gastar una búsqueda.
+    if len(q.split()) < 2:
+        return ""
+    return q
+
+
 def _generar_query_busqueda(orden: str) -> str:
     """
     Convierte una orden conversacional en una query de búsqueda corta.
@@ -1799,8 +1854,17 @@ def _generar_query_busqueda(orden: str) -> str:
     totalmente ajenos (el bug real: terminó trayendo la letra de una
     canción). Si la orden es corta ya es una query razonable; si es larga,
     se le pide al LLM que la condense a keywords de búsqueda.
+
+    F-5: la higiene de input/output (helpers de arriba) evita las queries
+    degeneradas del bug de la búsqueda repetida (eco con wake word y
+    fragmentos de marcador del contexto).
     """
     texto = (orden or "").strip()
+    # El bloque de pasos previos es CONTEXTO, no tema de búsqueda: afuera
+    # del input del condensador (era la fuente del '[contexto' truncado).
+    if _MARCADOR_CTX_PREVIO in texto:
+        texto = texto.split(_MARCADOR_CTX_PREVIO)[0].strip()
+    texto = _sacar_wake_words(texto)
     if not texto:
         return texto
     # Antes: <=8 palabras pasaban directo sin razonar. Bajado a 3 — con el
@@ -1824,14 +1888,33 @@ def _generar_query_busqueda(orden: str) -> str:
             min_predict=64,
         ).strip()
         _, query = _parse_ornith_thinking(raw)
-        query = query.strip().strip('"').strip("'")
+        query = _sanear_query_llm(query)
         if query and len(query.split()) <= 12:
             return query
     except Exception as e:
         print(f"   └─ ⚠️  [WEB]: no se pudo generar query corta ({e}), usando fallback local.")
 
-    palabras = [w for w in _normalizar(texto).split() if w not in _STOP_WORDS and len(w) > 2]
+    palabras = [w for w in _normalizar(texto).split()
+                if w not in _STOP_WORDS and len(w) > 2 and w not in _WAKE_WORDS_N]
     return " ".join(palabras[:8]) or texto
+
+
+def _urls_ya_leidas_del_turno(state: AetherState) -> set:
+    """URLs que pasos web anteriores de ESTE turno ya leyeron.
+
+    Solo activo durante el agent loop (agent_activo): en el camino de
+    plan_executor no hay deduplicación (comportamiento previo). La URL se
+    recupera del propio resultado del paso ('[CONTENIDO DE <url>]', el
+    formato con el que leer_url reporta lo que leyó).
+    """
+    if not state.get("agent_activo"):
+        return set()
+    urls = set()
+    for p in state.get("agent_pasos_log") or []:
+        if p.get("tool") == "web":
+            urls.update(re.findall(r"\[CONTENIDO DE (\S+?)\]",
+                                   p.get("resultado") or ""))
+    return urls
 
 
 def node_web(state: AetherState) -> dict:
@@ -1839,24 +1922,92 @@ def node_web(state: AetherState) -> dict:
     Búsqueda web + lectura de URL.
     REFACTOR: NO sintetiza con LLM. Devuelve datos crudos en web_results
     para que Ornith (plan_synthesizer) los procese.
+
+    F-2 (args estructurados del agent loop, vía _tool_args):
+      - url:   lee ESA URL directamente, sin buscar (el modelo puede pedir
+        una fuente concreta que vio en resultados previos).
+      - query: busca ESA query tal cual, sin re-condensarla.
+      - sin ninguno: condensa la instrucción a query (comportamiento
+        previo, también usado por plan_executor).
+
+    F-3 (deduplicación por turno, solo agent loop): no se relee una URL
+    ya leída. La misma búsqueda parafraseada lee la primera URL NUEVA de
+    los resultados; si TODAS ya se leyeron, devuelve [SIN RESULTADOS
+    NUEVOS] — que la clasificación del loop trata como 'sin_resultados',
+    así el intento se registra y el tope duro (_MAX_FALLOS_BUSQUEDA)
+    cierra el loop en vez de repetirlo para siempre (bug real: ley
+    18331 × 4 pasos leyendo la misma portada de IMPO).
     """
-    orden = state["orden"]
-    query = _generar_query_busqueda(orden)
+    orden     = state["orden"]
+    tool_args = state.get("_tool_args") or {}
+
+    query_explicita = str(tool_args.get("query") or "").strip()
+    url_explicita   = str(tool_args.get("url") or "").strip()
+    urls_ya_leidas  = _urls_ya_leidas_del_turno(state)
 
     print("\n🔍 [WEB]: Buscando...")
-    if query != orden:
-        print(f"   └─ [WEB]: Query generada: '{query}'")
+
+    # ── URL explícita: leer esa fuente directamente, sin buscar ─────────
+    if url_explicita:
+        if url_explicita in urls_ya_leidas:
+            print(f"   └─ [WEB]: '{url_explicita}' ya se leyó en este turno; "
+                  "no se relee.")
+            return {
+                "web_results": (
+                    f"[SIN RESULTADOS NUEVOS] La URL {url_explicita} ya se "
+                    "leyó en este turno y su contenido ya está en el "
+                    "historial de herramientas de arriba. NO la releas ni "
+                    "repitas la búsqueda: respondé al Creador con lo que ya "
+                    "tenés o buscá una fuente distinta."
+                ),
+                "llm_response":   None,
+                "final_response": None,
+                "messages":       [HumanMessage(content=orden)],
+            }
+        print(f"📖 [WEB]: Leyendo {url_explicita} (URL explícita del modelo)...")
+        contenido = leer_url.invoke(url_explicita)
+        contexto_web = f"[CONTENIDO LEÍDO]\n{contenido}"
+        print(f"   └─ [WEB]: {len(contexto_web)} caracteres de datos obtenidos.")
+        return {
+            "web_results":    contexto_web,
+            "llm_response":   None,
+            "final_response": None,
+            "messages":       [HumanMessage(content=orden)],
+        }
+
+    # ── Búsqueda (query explícita o condensada) ──────────────────────────
+    if query_explicita:
+        query = query_explicita
+        print(f"   └─ [WEB]: Query explícita del modelo: '{query}'")
+    else:
+        query = _generar_query_busqueda(orden)
+        if query != orden:
+            print(f"   └─ [WEB]: Query generada: '{query}'")
     resultados = buscar_web.invoke(query)
 
     urls = re.findall(r"URL:\s*(https?://\S+)", resultados)
+
+    # F-3: la primera URL que NO se leyó ya en este turno.
+    url_a_leer = next((u for u in urls if u not in urls_ya_leidas), None)
+
     contenido_url = ""
-    if urls:
-        print(f"📖 [WEB]: Leyendo {urls[0]}...")
-        contenido_url = leer_url.invoke(urls[0])
+    if url_a_leer:
+        print(f"📖 [WEB]: Leyendo {url_a_leer}...")
+        contenido_url = leer_url.invoke(url_a_leer)
 
     contexto_web = resultados
     if contenido_url:
         contexto_web += f"\n\n[CONTENIDO LEÍDO]\n{contenido_url[:3000]}"
+    elif urls and urls_ya_leidas:
+        # Todos los resultados ya fueron leídos: nada nuevo bajo el sol.
+        contexto_web = (
+            "[SIN RESULTADOS NUEVOS] Esta búsqueda no aportó nada nuevo: "
+            "TODAS las URLs de los resultados ya fueron leídas en este turno "
+            "(el contenido está arriba en el historial de herramientas). NO "
+            "repitas esta búsqueda con variantes triviales: respondé al "
+            "Creador con lo que ya tenés, o pedí una fuente distinta con la "
+            "tool web y el argumento 'url'.\n\n" + resultados
+        )
 
     print(f"   └─ [WEB]: {len(contexto_web)} caracteres de datos obtenidos.")
 
@@ -1864,7 +2015,7 @@ def node_web(state: AetherState) -> dict:
         "web_results":    contexto_web,
         "llm_response":   None,
         "final_response": None,
-        "messages":       [HumanMessage(content=orden)],
+        "messages":      [HumanMessage(content=orden)],
     }
 
 
@@ -4062,7 +4213,7 @@ def _construir_orden_paso(instruccion: str, args: dict, plan_resultados: list[st
     partes = [instruccion]
 
     if isinstance(args, dict):
-        for clave in ("query", "command", "app", "filename", "path"):
+        for clave in ("query", "command", "app", "filename", "path", "url"):
             val = args.get(clave)
             if isinstance(val, str) and val.strip() and val.strip() not in instruccion:
                 partes.append(f"[{clave}] {val.strip()}")
