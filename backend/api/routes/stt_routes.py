@@ -6,7 +6,7 @@ acá; el backend lo transcribe con faster-whisper. Motores, en orden de
 preferencia:
 
   1. Worker STT persistente (core/services/stt_service.py): faster-whisper
-     en su venv aislado (~/whisper_aether_test/venv-stt o el path de config
+     en su venv aislado (~/Whisper_TTS/venv o el path de config
      STT_VENV_PYTHON), con el modelo ya cargado en RAM. Es el mismo motor
      que el push-to-talk de la TUI.
   2. faster-whisper in-proceso (backend/core/attachments._transcribir_audio)

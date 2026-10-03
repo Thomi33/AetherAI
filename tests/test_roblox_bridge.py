@@ -10,11 +10,11 @@ def test_roblox_runtime_focuses_sober_before_start(monkeypatch, tmp_path):
     calls = []
 
     monkeypatch.setattr(
-        "core.tools.roblox_bridge.computer_control.buscar_ventana",
+        "core.tools.roblox_bridge.buscar_ventana",
         lambda name: calls.append(("find", name)) or ("0x1", None),
     )
     monkeypatch.setattr(
-        "core.tools.roblox_bridge.computer_control.enfocar_ventana",
+        "core.tools.roblox_bridge.enfocar_ventana",
         lambda window: calls.append(("focus", window)) or ("OK", False),
     )
 
@@ -53,11 +53,11 @@ def test_roblox_runtime_injects_config_as_env_vars(monkeypatch, tmp_path):
     captured_env: dict = {}
 
     monkeypatch.setattr(
-        "core.tools.roblox_bridge.computer_control.buscar_ventana",
+        "core.tools.roblox_bridge.buscar_ventana",
         lambda name: ("0x1", None),
     )
     monkeypatch.setattr(
-        "core.tools.roblox_bridge.computer_control.enfocar_ventana",
+        "core.tools.roblox_bridge.enfocar_ventana",
         lambda window: ("OK", False),
     )
 
@@ -93,11 +93,11 @@ def test_roblox_runtime_no_hardcoded_sys_path_in_subprocess_command(monkeypatch,
     captured_cmd: list = []
 
     monkeypatch.setattr(
-        "core.tools.roblox_bridge.computer_control.buscar_ventana",
+        "core.tools.roblox_bridge.buscar_ventana",
         lambda name: ("0x1", None),
     )
     monkeypatch.setattr(
-        "core.tools.roblox_bridge.computer_control.enfocar_ventana",
+        "core.tools.roblox_bridge.enfocar_ventana",
         lambda window: ("OK", False),
     )
 
@@ -130,11 +130,11 @@ def test_roblox_runtime_forwards_google_credentials(monkeypatch, tmp_path):
     captured_env: dict = {}
 
     monkeypatch.setattr(
-        "core.tools.roblox_bridge.computer_control.buscar_ventana",
+        "core.tools.roblox_bridge.buscar_ventana",
         lambda name: ("0x1", None),
     )
     monkeypatch.setattr(
-        "core.tools.roblox_bridge.computer_control.enfocar_ventana",
+        "core.tools.roblox_bridge.enfocar_ventana",
         lambda window: ("OK", False),
     )
 

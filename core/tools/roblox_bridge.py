@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from core.tools import computer_control
+from core.tools.ydotool_wrapper import buscar_ventana, enfocar_ventana
 
 logger = logging.getLogger(__name__)
 
@@ -64,10 +64,10 @@ class RobloxRuntime:
         if not self.runtime_dir.is_dir():
             return False, f"No existe el runtime Roblox: {self.runtime_dir}"
 
-        window_id, lookup_error = computer_control.buscar_ventana("org.vinegarhq.Sober")
+        window_id, lookup_error = buscar_ventana("org.vinegarhq.Sober")
         if lookup_error or window_id is None:
             return False, lookup_error or "No se encontró la ventana de Sober."
-        focus_message, focus_error = computer_control.enfocar_ventana(window_id)
+        focus_message, focus_error = enfocar_ventana(window_id)
         if focus_error:
             return False, f"No se pudo enfocar Sober: {focus_message}"
 

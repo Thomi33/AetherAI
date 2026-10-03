@@ -17,7 +17,7 @@ Aether API — Backend revivido.
 - Sirve la Web UI (carpeta estática autodetectada, ver backend/core/config.py).
 """
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
@@ -88,6 +88,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# =====================================================================
+# CACHE DE ESTÁTICOS (dev): la Web UI se sirve directo del repo local.
+# Sin esto el navegador puede quedarse con un app.js VIEJO tras un cambio
+# (bug real: "el thumbnail no aparece" con el backend ya actualizado).
+# no-cache = revalidar siempre (ETag/Last-Modified → 304 barato, el
+# contenido igual viaja solo si cambió). Solo aplica a js/html/css.
+# =====================================================================
+@app.middleware("http")
+async def _revalidar_estaticos_dev(request: Request, call_next):
+    respuesta = await call_next(request)
+    # "/" y "/dir/" son index.html en StaticFiles(html=True).
+    ruta = request.url.path.lower()
+    if ruta.endswith((".js", ".html", ".css")) or ruta.endswith("/"):
+        respuesta.headers["Cache-Control"] = "no-cache"
+    return respuesta
+
 
 # =====================================================================
 # ROUTERS

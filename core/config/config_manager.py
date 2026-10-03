@@ -186,7 +186,6 @@ class ConfigManager:
         "OLLAMA_GEN_OPTIONS": lambda x: isinstance(x, dict),
         "OLLAMA_NUM_PARALLEL": lambda x: isinstance(x, int) and x > 0,
         "OLLAMA_MAX_LOADED_MODELS": lambda x: isinstance(x, int) and x > 0,
-        "MAX_AGENT_STEPS": lambda x: isinstance(x, int) and 1 <= x <= 32,
         "MAX_STEPS_COMPUTER_USE": lambda x: isinstance(x, int) and 1 <= x <= 64,
         "MAX_HISTORIAL": lambda x: isinstance(x, int) and x > 0,
         "CONTEXTO_CONV_MAX_CHARS": lambda x: isinstance(x, int) and x > 0,
@@ -226,7 +225,7 @@ class ConfigManager:
             isinstance(x, str)
             and re.fullmatch(r"[a-z][a-z0-9-]{0,63}", x) is not None
         ),
-    }
+        }
 
     DEFAULTS: Dict[str, Any] = {
         "MODELO": "ornith:9b",
@@ -244,7 +243,6 @@ class ConfigManager:
         "OLLAMA_GEN_OPTIONS": {"num_batch": 512, "num_gpu": 8, "num_thread": 8},
         "OLLAMA_NUM_PARALLEL": 4,
         "OLLAMA_MAX_LOADED_MODELS": 2,
-        "MAX_AGENT_STEPS": 6,
         "MAX_STEPS_COMPUTER_USE": 8,
         "MAX_HISTORIAL": 100000,
         "CONTEXTO_CONV_MAX_CHARS": 16000,

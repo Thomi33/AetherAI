@@ -32,13 +32,19 @@ def _preparar_orden():
     return prep
 
 
-def test_meta_de_upload_sin_data_no_se_descarta(adjuntos_dir):
+def test_meta_de_upload_sin_data_no_se_descarta(adjuntos_dir, monkeypatch):
     """Bug: /attachments/upload devuelve metas SIN data; al reenviarlas al
     chat con data=undefined el backend las descartaba como 'vino vacío'."""
     img = adjuntos_dir / "20260916-000000_0_foto.png"
     img.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 100)
 
-    orden, metas = _preparar_orden()({
+    # Hermético: sin tocar Ollama real (ni /api/show ni el modelo de visión).
+    monkeypatch.setattr(attachments, "modelo_admite_imagenes", lambda m: True)
+    monkeypatch.setattr(attachments, "generar_thumbnail_b64",
+                        lambda ruta, max_lado=1024: "VEVTVE8=")
+    attachments._THUMB_CACHE.clear()
+
+    orden, metas, imagenes = _preparar_orden()({
         "message": "qué es esto",
         "attachments": [{"name": "foto.png", "mime": "image/png",
                          "path": str(img)}],  # sin data: como vienen de upload
@@ -47,11 +53,14 @@ def test_meta_de_upload_sin_data_no_se_descarta(adjuntos_dir):
     assert metas[0]["kind"] == "image"
     assert "vino vacío" not in orden
     assert str(img) in orden
+    # El thumbnail de la imagen viaja con el mensaje para el modelo.
+    assert imagenes == ["VEVTVE8="]
+    assert "thumbnail adjunto" in orden
 
 
 def test_adjunto_con_data_sigue_funcionando(adjuntos_dir):
     data = base64.b64encode(b"contenido de texto").decode()
-    orden, metas = _preparar_orden()({
+    orden, metas, imagenes = _preparar_orden()({
         "message": "mirá",
         "attachments": [{"name": "nota.txt", "mime": "text/plain",
                          "data": data}],
@@ -59,6 +68,7 @@ def test_adjunto_con_data_sigue_funcionando(adjuntos_dir):
     assert len(metas) == 1
     assert metas[0]["size"] == len(b"contenido de texto")
     assert "nota.txt" in orden
+    assert imagenes == []  # sin imágenes adjuntas → nada inline
 
 
 # ── adjuntos_ya_guardados: validación de paths ───────────────────────────────

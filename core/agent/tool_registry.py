@@ -53,8 +53,16 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "web": {
         "node": "node_web",
-        "instruccion_requerida": True,
-        "descripcion": "Buscar información en internet y sintetizarla.",
+        # F-2: un call legítimo puede ser solo {'url': ...} o {'query': ...}
+        # — no exigir instruccion de texto libre si el modelo ya mandó un
+        # objetivo estructurado.
+        "instruccion_requerida": False,
+        "descripcion": (
+            "Buscar información en internet y leer la fuente principal. "
+            "Args opcionales: 'query' = query de búsqueda EXACTA (se busca "
+            "tal cual); 'url' = leer ESA URL directamente sin buscar. Sin "
+            "args, se condensa la instrucción a una query."
+        ),
     },
     "shell": {
         "node": "node_shell",
@@ -205,9 +213,11 @@ TOOL_PARAMETROS: dict[str, dict] = {
     "web": {
         "type": "object",
         "properties": {
-            "instruccion": {"type": "string", "description": "Qué buscar en internet."},
+            "instruccion": {"type": "string", "description": "Qué buscar en internet (texto libre; se condensa a una query de búsqueda)."},
+            "query": {"type": "string", "description": "Query de búsqueda EXACTA (3 a 8 palabras clave). Si la mandás, se busca tal cual sin reescribirla."},
+            "url": {"type": "string", "description": "URL específica a leer directamente, sin buscar (ej: un PDF o página vista en resultados previos)."},
         },
-        "required": ["instruccion"],
+        "required": [],
     },
     "shell": {
         "type": "object",

@@ -61,13 +61,15 @@ from core.tools.shell_executor import ejecutar_comando
 from core.tools.web_search import buscar_web
 from core.tools.url_reader import leer_url
 from core.tools.vision import ver_pantalla
-from core.tools.computer_control import (
-    cambiar_workspace,
-    click_en,
+from core.tools.ydotool_wrapper import (
+    buscar_ventana,
     enfocar_ventana,
+    click_en,
     escribir_texto,
-    iniciar_secuencia,
     mover_mouse,
+    iniciar_secuencia,
+    mantener_tecla,
+    cambiar_workspace,
 )
 from core.tools.flatpak_manager import actualizar_flatpaks
 from core.parser.shell_parser import extraer_comando_shell
@@ -80,7 +82,6 @@ from core.tools.filesystem_tool import (
     listar_directorio_fs,
 )
 from core.config import get_config_manager
-from core.agent.model_policy import ModelDecisionContext, choose_model, record_model_latency
 
 from core.agent.graph_state import AetherState
 
@@ -89,7 +90,72 @@ from core.agent.graph_state import AetherState
 # ══════════════════════════════════════════════════════════════════════
 
 
-def _llm_chat(system: str = None, user: str = None, messages: list = None, on_token=None, tools: list = None, min_predict: int | None = None) -> str:
+class _ThinkingStreamSplitter:
+    """
+    Separador stateful de razonamiento para el stream de content de Ollama.
+
+    El BACKEND separa el thinking del content A MEDIDA QUE LLEGA (no es un
+    parseo post-hoc del texto final, y mucho menos un parseo del lado del
+    cliente): cada token se enruta a su canal en el momento en que se genera.
+
+    - Marcadores inline de razonamiento (apertura/cierre del tag "think",
+      formato Ornith/QwQ): lo previo al cierre va al canal de reasoning;
+      el resto, a la respuesta.
+    - Tolerante a marcadores partidos entre chunks: retiene el prefijo
+      parcial posible-tag y lo resuelve con el chunk siguiente.
+
+    feed(token) -> (razonamiento_delta, content_delta)
+    flush()     -> drena el buffer residual al terminar el stream.
+    """
+
+    # Se construyen por partes para que el texto exacto quede visible y
+    # auditable en el diff (equivale a los marcadores de
+    # _parse_ornith_thinking: apertura y cierre del tag "think".
+    OPEN = "<" + "think" + ">"
+    CLOSE = "<" + "/think" + ">"
+
+    def __init__(self) -> None:
+        self._carry = ""
+        self._in_think = False
+
+    def feed(self, token: str) -> tuple[str, str]:
+        buf = self._carry + (token or "")
+        self._carry = ""
+        razonamiento: list[str] = []
+        contenido: list[str] = []
+        while buf:
+            tag = self.CLOSE if self._in_think else self.OPEN
+            idx = buf.find(tag)
+            if idx == -1:
+                k = self._prefijo_parcial(buf, tag)
+                seguro = buf[:len(buf) - k]
+                self._carry = buf[len(buf) - k:]
+                (razonamiento if self._in_think else contenido).append(seguro)
+                break
+            (razonamiento if self._in_think else contenido).append(buf[:idx])
+            self._in_think = not self._in_think
+            buf = buf[idx + len(tag):]
+        return "".join(razonamiento), "".join(contenido)
+
+    def flush(self) -> tuple[str, str]:
+        resto, self._carry = self._carry, ""
+        if not resto:
+            return "", ""
+        # Stream cortado a mitad de marcador: lo retenido es texto normal
+        # (razonamiento solo si YA estábamos dentro de un bloque).
+        return (resto, "") if self._in_think else ("", resto)
+
+    @classmethod
+    def _prefijo_parcial(cls, buf: str, tag: str) -> int:
+        """Mayor k tal que buf termina con tag[:k] (posible tag partido)."""
+        maximo = min(len(buf), len(tag) - 1)
+        for k in range(maximo, 0, -1):
+            if buf.endswith(tag[:k]):
+                return k
+        return 0
+
+
+def _llm_chat(system: str = None, user: str = None, messages: list = None, on_token=None, tools: list = None, min_predict: int | None = None, imagenes: list[str] | None = None, on_reasoning=None) -> str:
     """
     Llamada directa a ollama con streaming opcional.
 
@@ -108,9 +174,14 @@ def _llm_chat(system: str = None, user: str = None, messages: list = None, on_to
     if messages is None:
         if system is None or user is None:
             raise ValueError("_llm_chat requiere o 'messages' o (system + user)")
+        msg_user: dict = {"role": "user", "content": user}
+        if imagenes:
+            # Thumbnails (b64) de adjuntos: Ollama los procesa como imágenes
+            # del mensaje → el modelo con visión nativa las ve directo.
+            msg_user["images"] = list(imagenes)
         messages = [
             {"role": "system", "content": system},
-            {"role": "user", "content": user},
+            msg_user,
         ]
 
     opts = {
@@ -129,12 +200,6 @@ def _llm_chat(system: str = None, user: str = None, messages: list = None, on_to
     config = get_config_manager()
     opts.update(config.get("OLLAMA_GEN_OPTIONS", {}))
     modelo_actual = config.get("MODELO", MODELO)
-    decision_modelo = choose_model(ModelDecisionContext(
-        task_kind="unknown",
-        requested_model=modelo_actual,
-        prompt_chars=sum(len(str(m.get("content", ""))) for m in messages),
-        context_size=config.get("NUM_CTX", NUM_CTX),
-    ))
     opts["num_ctx"] = config.get("NUM_CTX", NUM_CTX)
     opts["num_predict"] = config.get("NUM_PREDICT", opts["num_predict"])
     opts["temperature"] = config.get("TEMPERATURE", opts.get("temperature", 0.6))
@@ -147,7 +212,7 @@ def _llm_chat(system: str = None, user: str = None, messages: list = None, on_to
         opts["num_predict"] = max(opts["num_predict"], min_predict)
 
     call_kwargs = {
-        "model": decision_modelo.model,
+        "model": modelo_actual,
         "messages": messages,
         "stream": True,
         "options": opts,
@@ -160,38 +225,71 @@ def _llm_chat(system: str = None, user: str = None, messages: list = None, on_to
     prompt_chars = sum(len(str(m.get("content", ""))) for m in messages) if BENCH_INSTRUMENT else 0
 
     respuesta = ""
+    hubo_reasoning = False
+    splitter = _ThinkingStreamSplitter()
     policy_start = time.time()
     try:
-        from core.agent.streaming import InferenceCancelled, is_cancelled
+        from core.agent.streaming import InferenceCancelled, is_cancelled, emit_reasoning
+
+        def _emitir_reasoning(delta: str) -> None:
+            nonlocal hubo_reasoning
+            if not delta:
+                return
+            hubo_reasoning = True
+            emit_reasoning(delta)       # canal global (TUI / Web UI / SSE)
+            if on_reasoning:
+                on_reasoning(delta)     # collector del nodo (delta._ornith_reasoning)
+
         for chunk in ollama.chat(**call_kwargs):
             if is_cancelled():
                 raise InferenceCancelled()
             msg = chunk.get("message", {})
-            token = msg.get("content", "")
-            if token and on_token:
-                on_token(token)
-            respuesta += token
+            # (1) Canal NATIVO de razonamiento de Ollama (campo "thinking"
+            # separado del content, modelos con thinking soportado).
+            _emitir_reasoning(msg.get("thinking") or "")
+            # (2) Content: el splitter enruta el razonamiento inline en vivo;
+            # la respuesta acumula SOLO content limpio.
+            token = msg.get("content", "") or ""
+            if not token:
+                continue
+            razonamiento_delta, content_delta = splitter.feed(token)
+            _emitir_reasoning(razonamiento_delta)
+            if content_delta:
+                if on_token:
+                    on_token(content_delta)
+                respuesta += content_delta
+        # Prefijo retenido a mitad de marcador (stream cortado): drenar.
+        razonamiento_delta, content_delta = splitter.flush()
+        _emitir_reasoning(razonamiento_delta)
+        if content_delta:
+            if on_token:
+                on_token(content_delta)
+            respuesta += content_delta
+    except InferenceCancelled:
+        # Cancelación solicitada: salir limpio sin loggear error
+        pass
+    except Exception as e:
+        # Log error but don't crash - return what we have
+        print(f"[LLM] Error durante streaming: {e}")
     finally:
-        record_model_latency(decision_modelo, int((time.time() - policy_start) * 1000))
-
-    if BENCH_INSTRUMENT:
-        duration_ms = int((time.time() - start_time) * 1000)
-        output_chars = len(respuesta)
-        has_think = "<think>" in respuesta
-        try:
-            with open(BENCH_LOG_PATH, "a") as f:
-                import json as _json
-                f.write(_json.dumps({
-                    "ts": time.time(),
-                    "mode": "ornith-native",
-                    "prompt_chars": prompt_chars,
-                    "output_chars": output_chars,
-                    "duration_ms": duration_ms,
-                    "has_think": has_think,
-                    "num_messages": len(messages),
-                }) + "\n")
-        except Exception:
-            pass  # never break normal operation
+        if BENCH_INSTRUMENT:
+            duration_ms = int((time.time() - start_time) * 1000)
+            output_chars = len(respuesta)
+            has_think = "<think>" in respuesta
+            try:
+                with open(BENCH_LOG_PATH, "a") as f:
+                    import json as _json
+                    f.write(_json.dumps({
+                                "ts": time.time(),
+                                "mode": "ornith-native",
+                                "prompt_chars": prompt_chars,
+                                "output_chars": output_chars,
+                                "duration_ms": duration_ms,
+                                "has_think": has_think,
+                                "num_messages": len(messages),
+                    }) + "\n")
+            except Exception:
+                pass  # never break normal operation
 
     return respuesta
 
@@ -983,15 +1081,19 @@ def node_planner(state: AetherState) -> dict:
     # qué usar -- incluyendo si hacía falta más de una, en qué orden, y qué
     # hacer si una falla. node_agent_loop es un self-loop en el grafo (ver
     # graph_builder.py) que corre hasta que el modelo devuelve una
-    # respuesta de texto en vez de una tool call, o hasta llegar a
-    # MAX_AGENT_STEPS (configurable, default 6) — ese límite existe y es
-    # intencional: evita bucles infinitos de tool calling.
+    # respuesta de texto en vez de una tool call. SIN límite de pasos:
+    # quién decide cuándo detenerlo es el usuario (Stop de la Web UI →
+    # POST /api/stop, o el stop de la TUI → request_cancel());
+    # node_agent_loop chequea la cancelación al inicio de cada paso. La red
+    # de seguridad anti-bucle (misma tool+args repetida dos veces) sigue
+    # activa.
     #
     # NOTA: todo el bloque de abajo (detección por keywords, casos MCP/
     # single-tool/multi-tool/fallback) quedó inalcanzable tras este return.
     # Se deja sin borrar por ahora para no tocar más código del necesario en
     # este cambio; es candidato a limpieza en un próximo pase una vez que el
     # agent loop esté validado en uso real.
+
     print("   └─ Sin atajo determinista aplicable → agent loop (razonamiento + tool calling nativo).")
     return _agent_loop_activado(orden, mem)
 
@@ -1013,77 +1115,133 @@ def _agent_loop_activado(orden: str, mem: dict) -> dict:
 
 def _llm_chat_agente(messages: list, tools: list, min_predict: int | None = None) -> dict:
     """
-    Variante de _llm_chat para el agent loop (tool calling nativo).
+    Variante de _llm_chat para el agent loop (tool calling nativo) CON STREAMING.
 
-    _llm_chat() acumula solo texto del stream y DESCARTA cualquier
-    tool_calls que Ollama devuelva -- nadie lo necesitaba hasta ahora
-    porque nada consumía tool calling real. Esta función corre sin
-    streaming (más simple y confiable para extraer tool_calls que
-    reensamblarlos token a token) y devuelve tanto el texto como las
-    tool calls que el modelo haya decidido invocar, normalizadas a:
+    Comportamiento estilo Open WebUI — el reasoning es OPCIONAL y la respuesta
+    JAMÁS lo espera:
 
-        {"content": str, "tool_calls": [{"function": {"name": str, "arguments": dict}}, ...]}
+    - El content se emite EN VIVO (emit_token → TokenEvent): un modelo sin
+      reasoning (p. ej. Gemma-4) muestra su respuesta apenas empieza a
+      generar; no hay estado bloqueado esperando tags.
+    - El razonamiento, si existe, viaja por su canal DEDICADO (emit_reasoning
+      → ReasoningEvent): campo nativo "thinking" de Ollama y/o marcadores
+      inline separados por _ThinkingStreamSplitter (tolerante a tags
+      partidos entre chunks).
+    - Las tool_calls se REENSAMBLAN del stream: merge por índice con
+      arguments como dict completo (chunk único) o como string JSON
+      acumulada a lo largo de varios chunks.
+
+    Devuelve {"content": str, "tool_calls": [{"function": {"name": str,
+    "arguments": dict}}, ...]} — mismo contrato que siempre.
     """
+    from core.agent.streaming import (
+        InferenceCancelled, is_cancelled, emit_reasoning, emit_token,
+    )
+
     opts = {"num_ctx": NUM_CTX, "num_predict": 2048}
     opts.update(OLLAMA_GEN_OPTIONS)
 
     config = get_config_manager()
     opts.update(config.get("OLLAMA_GEN_OPTIONS", {}))
     modelo_actual = config.get("MODELO", MODELO)
-    decision_modelo = choose_model(ModelDecisionContext(
-        task_kind="agent_loop",
-        requested_model=modelo_actual,
-        prompt_chars=sum(len(str(m.get("content", ""))) for m in messages),
-        context_size=config.get("NUM_CTX", NUM_CTX),
-    ))
     opts["num_ctx"] = config.get("NUM_CTX", NUM_CTX)
     opts["num_predict"] = config.get("NUM_PREDICT", opts["num_predict"])
     opts["temperature"] = config.get("TEMPERATURE", opts.get("temperature", 0.6))
     if min_predict:
         opts["num_predict"] = max(opts["num_predict"], min_predict)
 
+    splitter = _ThinkingStreamSplitter()
+    contenido: list[str] = []
+    # índice de tool call → slot {"name": str, "args_dict": dict, "args_str": str}
+    tool_calls_brutos: dict[int, dict] = {}
+
+    def _acumular_tool_call(tc, pos_en_chunk: int) -> None:
+        fn = tc.get("function") or {} if isinstance(tc, dict) else getattr(tc, "function", {}) or {}
+        if isinstance(fn, dict):
+            nombre = fn.get("name") or ""
+            args = fn.get("arguments")
+        else:
+            nombre = getattr(fn, "name", "") or ""
+            args = getattr(fn, "arguments", None)
+        idx = tc.get("index") if isinstance(tc, dict) else getattr(tc, "index", None)
+        if not isinstance(idx, int):
+            # Sin "index" (formato completo en un solo chunk): la primera call
+            # va al slot 0 si está libre; las siguientes se apendean.
+            idx = 0 if 0 not in tool_calls_brutos else len(tool_calls_brutos)
+        slot = tool_calls_brutos.setdefault(idx, {"name": "", "args_dict": None, "args_str": ""})
+        if nombre:
+            slot["name"] = nombre
+        if isinstance(args, dict):
+            slot["args_dict"] = {**(slot["args_dict"] or {}), **args}
+        elif isinstance(args, str):
+            slot["args_str"] += args  # JSON partida entre chunks: concatenar
+
+    def _emitir_content_delta(delta: str) -> None:
+        if delta:
+            emit_token(delta)     # respuesta EN VIVO (canal de tokens)
+            contenido.append(delta)
+
     policy_start = time.time()
     try:
-        resp = ollama.chat(
-            model=decision_modelo.model,
+        for chunk in ollama.chat(
+            model=modelo_actual,
             messages=messages,
             tools=tools,
-            stream=False,
+            stream=True,
             options=opts,
             keep_alive=OLLAMA_KEEP_ALIVE,
-        )
+        ):
+            if is_cancelled():
+                raise InferenceCancelled()
+            if isinstance(chunk, dict):
+                msg = chunk.get("message", {}) or {}
+            else:
+                msg = getattr(chunk, "message", None) or {}
+            if not isinstance(msg, dict):
+                msg = {"content": getattr(msg, "content", "") or "",
+                       "tool_calls": getattr(msg, "tool_calls", None) or [],
+                       "thinking": getattr(msg, "thinking", "") or ""}
+            # (1) Reasoning NATIVO (campo separado de Ollama): directo al canal.
+            _thinking_nativo = msg.get("thinking") or ""
+            if _thinking_nativo:
+                emit_reasoning(_thinking_nativo)
+            # (2) Content: splitter en vivo — la respuesta no espera al
+            #     razonamiento; apenas hay texto visible, sale.
+            token = msg.get("content", "") or ""
+            if token:
+                _razon_delta, _content_delta = splitter.feed(token)
+                if _razon_delta:
+                    emit_reasoning(_razon_delta)
+                _emitir_content_delta(_content_delta)
+            # (3) Tool calls: reensamblado incremental del stream.
+            for pos, tc in enumerate(msg.get("tool_calls") or []):
+                _acumular_tool_call(tc, pos)
+        # Prefijo retenido a mitad de tag (stream cortado): drenar.
+        _razon_delta, _content_delta = splitter.flush()
+        if _razon_delta:
+            emit_reasoning(_razon_delta)
+        _emitir_content_delta(_content_delta)
+    except InferenceCancelled:
+        pass
+    except Exception as e:
+        print(f"[LLM] Error durante streaming (tools): {e}")
     finally:
-        record_model_latency(decision_modelo, int((time.time() - policy_start) * 1000))
-
-    msg = resp.get("message", {}) if isinstance(resp, dict) else getattr(resp, "message", {})
-    if not isinstance(msg, dict):
-        # El cliente ollama-python puede devolver un objeto Message en vez
-        # de un dict según la versión -- normalizamos a dict acá para no
-        # duplicar chequeos de tipo más abajo.
-        msg = {
-            "content": getattr(msg, "content", "") or "",
-            "tool_calls": getattr(msg, "tool_calls", None) or [],
-        }
+        pass
 
     tool_calls: list[dict] = []
-    for tc in (msg.get("tool_calls") or []):
-        fn = tc.get("function", {}) if isinstance(tc, dict) else getattr(tc, "function", {})
-        if isinstance(fn, dict):
-            nombre = fn.get("name", "")
-            args = fn.get("arguments", {})
-        else:
-            nombre = getattr(fn, "name", "")
-            args = getattr(fn, "arguments", {})
-        if isinstance(args, str):
+    for idx in sorted(tool_calls_brutos):
+        slot = tool_calls_brutos[idx]
+        args = slot["args_dict"]
+        if not args and slot["args_str"]:
             try:
-                args = json.loads(args)
-            except Exception:
+                args = json.loads(slot["args_str"])
+            except Exception:  # noqa: BLE001 — igual criterio que antes: {} 
                 args = {}
         if not isinstance(args, dict):
             args = {}
-        tool_calls.append({"function": {"name": nombre, "arguments": args}})
+        tool_calls.append({"function": {"name": slot["name"], "arguments": args}})
 
-    return {"content": msg.get("content", "") or "", "tool_calls": tool_calls}
+    return {"content": "".join(contenido), "tool_calls": tool_calls}
 
 
 # ── Fallback: formato de herramientas por texto → tool call nativa ────────
@@ -1220,6 +1378,100 @@ def _firma_call(tool: str, args: dict) -> str:
         return f"{tool}|{args}"
 
 
+# ══════════════════════════════════════════════════════════════════════
+# MEMORIA DE INTENTOS — "si no dio resultado, no dio resultado"
+# ══════════════════════════════════════════════════════════════════════
+# El agent loop no tiene límite de pasos por diseño (quién corta es el
+# usuario). El problema: ante una búsqueda sin resultados el modelo podía
+# seguir variando la query para siempre, convirtiendo algo simple en una
+# tarea larga. Tres capas de defensa:
+#   1. Clasificación: un resultado negativo recibe guía de cierre en el
+#      mensaje de tool (el modelo ve que "sin resultados" es un final
+#      válido, no un error a reparar).
+#   2. Registro: el intento fallido se persiste en la memoria central
+#      (kind='outcome') y el context builder lo reinyecta como
+#      [INTENTOS RECIENTES] en este turno y en los próximos.
+#   3. Tope duro: herramientas de búsqueda/lectura con N fallos en el
+#      turno NO se ejecutan de nuevo — el loop cierra forzado.
+# ══════════════════════════════════════════════════════════════════════
+
+# Tools de búsqueda/lectura: reintentarlas rara vez aporta algo nuevo.
+# El tope duro aplica SOLO acá — shell/codigo/fs_write siguen pudiendo
+# reintentar con variantes, que es legítimo al depurar código.
+_TOOLS_BUSQUEDA = frozenset({"web", "fs_read", "fs_list", "vision"})
+
+# Fallos totales permitidos por tool de búsqueda en un turno antes del
+# cierre forzado del loop.
+_MAX_FALLOS_BUSQUEDA = 3
+
+_PATRONES_SIN_RESULTADOS = (
+    "sin resultados",          # web_search: "Sin resultados disponibles..."
+    "no se encontr",           # "no se encontraron resultados"
+    "no hay resultados",
+    "imposible conectar",      # web_search: ningún motor disponible
+    "error en todos los sistemas",
+)
+
+
+def _clasificar_resultado_tool(resultado: str) -> str:
+    """Clasifica el texto que devolvió una tool.
+
+    'sin_resultados' | 'error' | 'ok'. Heurística sobre patrones conocidos
+    de las tools (web_search en particular). Un resultado vacío cuenta
+    como 'ok': no es fallo, solo no hay nada que registrar.
+    """
+    texto = (resultado or "").strip().lower()
+    if not texto:
+        return "ok"
+    if texto.startswith("[error]"):
+        return "error"
+    if any(p in texto for p in _PATRONES_SIN_RESULTADOS):
+        return "sin_resultados"
+    return "ok"
+
+
+def _guia_resultado_terminal(clase: str, tool: str) -> str:
+    """Guía que se le agrega al resultado negativo de una tool para que
+    el modelo cierre en vez de reintentar sin fin."""
+    if clase == "sin_resultados":
+        return (
+            "[SISTEMA] Esto no dio resultados y ES un resultado válido, no "
+            "un error a reparar: NO reintentes con la misma consulta ni con "
+            "variantes triviales (cambiar una palabra no es un enfoque "
+            "nuevo). Respondé ahora al Creador con lo que ya tenés, "
+            "aclarando que no hay resultados."
+        )
+    return (
+        f"[SISTEMA] La tool '{tool}' falló. Usá el error real para decidir "
+        "un PRÓXIMO paso distinto; si ya probaste una alternativa real y "
+        "también falló, no sigas insistiendo: reportá el error y cerrá."
+    )
+
+
+def _registrar_intento_fallido(tool: str, args, resultado: str, clase: str) -> None:
+    """Persiste el intento fallido en la memoria central (outcomes).
+
+    Fail-open y opt-out (AETHER_CENTRAL_MEMORY=0): la memoria nunca puede
+    romper la ejecución del loop.
+    """
+    if os.environ.get("AETHER_CENTRAL_MEMORY", "1") == "0":
+        return
+    try:
+        from core.memory.central_store_v2 import get_central_memory
+        get_central_memory().register_outcome(
+            tool, args or {}, clase,
+            runtime="core")
+    except Exception as e:  # noqa: BLE001 — fail-open por diseño
+        print(f"   └─ ⚠️  [AGENT LOOP]: no pude registrar el intento fallido: {e}")
+
+
+def _fallos_de_tool(agent_pasos_log: list, tool: str) -> int:
+    """Total de resultados negativos de una tool en el turno actual."""
+    return sum(1 for p in (agent_pasos_log or [])
+               if isinstance(p, dict) and p.get("tool") == tool
+               and p.get("cls") in ("sin_resultados", "error"))
+
+
 def node_agent_loop(state: AetherState) -> dict:
     """
     Un paso del agent loop: el modelo ve el objetivo + todas las tools
@@ -1229,37 +1481,59 @@ def node_agent_loop(state: AetherState) -> dict:
     Es un self-loop en el grafo (como antes lo era plan_executor): cada
     invocación hace UNA ronda de razonamiento + ejecución de las tool
     calls que haya, y vuelve a entrar mientras agent_activo=True. Termina
-    cuando el modelo devuelve texto sin tool_calls (respuesta final) o si
-    ocurre un error irrecuperable llamando al modelo.
+    cuando el modelo devuelve texto sin tool_calls (respuesta final), si
+    ocurre un error irrecuperable llamando al modelo, o si el USUARIO
+    cancela (Stop → InferenceCancelled). NO hay límite general de pasos:
+    quién decide cuándo detenerlo es el usuario. ÚNICA excepción: las
+    tools de búsqueda/lectura tienen un tope de fallos por turno
+    (_MAX_FALLOS_BUSQUEDA) — "si no dio resultado, no dio resultado", el
+    loop cierra forzado en vez de insistir para siempre.
+
+    Si el turno trae adjuntos de imagen (state["agent_images"], thumbnails
+    b64), van incrustados en el primer mensaje del usuario: el modelo con
+    visión nativa analiza la foto directamente junto con su prompt.
 
     Reutiliza get_node_func() -- los mismos nodos reales (node_web,
     node_shell, etc.) que usaba plan_executor -- así que no hay ejecución
     de tools duplicada entre el camino viejo (fast-paths deterministas) y
     el nuevo (agent loop).
     """
-    from core.agent.tool_registry import construir_tools_ollama, validar_tool_call, get_node_func
+    from core.agent.tool_registry import (
+        construir_tools_ollama,
+        validar_tool_call,
+        get_node_func,
+        _instruccion_de_paso,
+    )
 
     mem   = state.get("mem", {})
     orden = state["orden"]
 
     agent_messages  = list(state.get("agent_messages") or [])
     agent_pasos_log = list(state.get("agent_pasos_log") or [])
-    max_agent_steps = get_config_manager().get("MAX_AGENT_STEPS", 6)
 
-    if len(agent_pasos_log) >= max_agent_steps:
-        return {
-            "final_response": (
-                f"Detuve el razonamiento tras {max_agent_steps} pasos para "
-                "evitar un bucle prolongado."
-            ),
-            "done": True,
-            "agent_activo": False,
-        }
+    # ── Cancelación: el USUARIO decide cuándo detener el loop ──────────
+    # (Stop de la Web UI → POST /api/stop → request_cancel(); ídem el stop
+    # de la TUI). Se chequea al inicio de CADA paso y corta con la misma
+    # excepción que usa el streaming de texto, así la UI muestra
+    # "Inferencia cancelada por el usuario." sin pasos huérfanos.
+    from core.agent.streaming import InferenceCancelled, is_cancelled
+    if is_cancelled():
+        print(f"   └─ 🛑 [AGENT LOOP]: cancelado por el usuario antes del "
+              f"paso {len(agent_pasos_log) + 1}.")
+        raise InferenceCancelled()
 
     if not agent_messages:
+        msg_user: dict = {"role": "user", "content": orden}
+        imagenes_inline = state.get("agent_images") or []
+        if imagenes_inline:
+            # Thumbnails (b64) de los adjuntos del turno: el modelo con
+            # visión nativa los ve junto con el prompt del usuario.
+            msg_user["images"] = list(imagenes_inline)
+            print(f"   └─ 🖼️ [AGENT LOOP]: {len(imagenes_inline)} thumbnail(s) "
+                  "de adjunto(s) incrustado(s) en el mensaje del usuario.")
         agent_messages = [
             {"role": "system", "content": _system_prompt_agent_loop(mem, state)},
-            {"role": "user", "content": orden},
+            msg_user,
         ]
         print("\n🔁 [AGENT LOOP]: Iniciando razonamiento con tool calling nativo...")
 
@@ -1291,6 +1565,25 @@ def node_agent_loop(state: AetherState) -> dict:
     if not tool_calls:
         _, texto_final = _parse_ornith_thinking(contenido)
         texto_final = _limpiar_artefactos_tool_call(texto_final or contenido)
+
+        # FIX acciones fantasma: si el modelo NUNCA llamó una herramienta
+        # en el loop completo (agent_pasos_log vacío), y aun así afirma que
+        # ejecutó algo (creó, escribió, instaló...), es una acción fantasma.
+        # La respuesta es texto puro, no evidencia de ejecución.
+        if not agent_pasos_log and any(x in texto_final.lower() for x in (
+            "creé", "guardé", "escribí", "ejecuté", "ejecuté", "generé",
+            "instalé", "corrí", "creado", "creado", "guardado", "guardado",
+            "escrito", "escrito", "ejecutado", "ejecutado", "generado",
+            "generado", "instalado", "corrido",
+        )):
+            print("   └─ ⚠️  [AGENT LOOP]: El modelo respondió SIN ejecutar "
+                  "ninguna herramienta (acción fantasma). La respuesta puede "
+                  "contener afirmaciones no verificadas del sistema.")
+            texto_final = (texto_final + "\n\n⚠️  Nota: la respuesta anterior "
+                           "indica acciones (crear archivos, ejecutar, escribir) "
+                           "pero ninguna herramienta fue llamada en este turno. "
+                           "Verificá que los archivos o acciones realmente existen.")
+
         print(f"   └─ [AGENT LOOP]: Respuesta final tras {len(agent_pasos_log)} paso(s) de tool calling.")
         return {
             "final_response": texto_final or contenido,
@@ -1307,6 +1600,11 @@ def node_agent_loop(state: AetherState) -> dict:
 
     resultados_previos = [p["resultado"] for p in agent_pasos_log]
 
+    # "Si no dio resultado, no dio resultado": cuando una tool de búsqueda
+    # acumula demasiados fallos en el turno, el loop cierra forzado con lo
+    # que hay (ver _TOOLS_BUSQUEDA / _MAX_FALLOS_BUSQUEDA más arriba).
+    forzar_cierre = None
+
     for call in tool_calls:
         fn   = call.get("function", {})
         tool = fn.get("name", "")
@@ -1320,8 +1618,8 @@ def node_agent_loop(state: AetherState) -> dict:
         # El modelo a veces "llama" a text con la respuesta completa ya
         # escrita en instruccion. Ejecutarla como paso normal la devolvía
         # como resultado de tool y el modelo respondía DE NUEVO con otra
-        # llamada a text → bucle hasta MAX_AGENT_STEPS y una respuesta
-        # final duplicada/concatenada (bug real en producción).
+        # llamada a text → bucle de respuestas duplicadas/concatenadas
+        # (bug real en producción).
         if tool == "text":
             respuesta_directa = _limpiar_artefactos_tool_call(
                 str((args or {}).get("instruccion") or "")).strip()
@@ -1376,19 +1674,53 @@ def node_agent_loop(state: AetherState) -> dict:
             })
             continue
 
+        # ── Tope duro (solo tools de búsqueda/lectura) ─────────────────
+        # Si la tool ya acumuló demasiados resultados negativos en este
+        # turno, NO se ejecuta otra vez: el loop cierra con lo que hay.
+        # El modelo no decide esto solo — es red de seguridad contra
+        # convertir "no dio resultado" en una tarea infinita.
+        if (tool in _TOOLS_BUSQUEDA
+                and _fallos_de_tool(agent_pasos_log, tool) >= _MAX_FALLOS_BUSQUEDA):
+            print(f"   └─ 🛑 [AGENT LOOP]: '{tool}' ya acumuló "
+                  f"{_MAX_FALLOS_BUSQUEDA} intentos sin resultado en este "
+                  f"turno; no se ejecuta de nuevo y cierro con lo que hay.")
+            resultado = (
+                f"[SISTEMA] '{tool}' ya se intentó {_MAX_FALLOS_BUSQUEDA} veces "
+                "en este turno sin resultado. No se va a ejecutar de nuevo: "
+                "es hora de responder al usuario con lo que ya tenés."
+            )
+            agent_pasos_log.append({"tool": tool, "args": args,
+                                    "resultado": resultado, "cls": "error"})
+            agent_messages.append({
+                "role": "tool",
+                "content": resultado[:4000],
+                "name": tool,
+            })
+            forzar_cierre = forzar_cierre or tool
+            continue
+
         ok, motivo = validar_tool_call(tool, args)
         if not ok:
             print(f"   └─ ⚠️  [AGENT LOOP]: Sanity-check rechazó tool call '{tool}': {motivo}")
             resultado = f"[ERROR] Llamada inválida a '{tool}': {motivo}"
         else:
             print(f"\n🔧 [AGENT LOOP]: Paso {len(agent_pasos_log) + 1} → tool={tool} args={args}")
-            # Nota: en el agent loop no hay plan_pasos, así que la
-            # instrucción base es siempre la orden original; los args
-            # estructurados se inyectan vía _construir_orden_paso y
-            # _tool_args más abajo.
-            instruccion = orden
+            # F-1 (bug "4 pasos buscando lo mismo"): la instrucción que el
+            # modelo escribió en los args es LO QUE ESTE PASO DEBE HACER.
+            # Antes la base era siempre la orden original del usuario, así
+            # que todos los pasos web condensaban la MISMA pregunta y la
+            # búsqueda nunca cambiaba pese a instrucciones cada vez más
+            # refinadas (bug real: ley 18331 × 4 pasos idénticos). Mismo
+            # criterio que node_plan_executor: _instruccion_de_paso o la
+            # orden original como fallback. Los args estructurados siguen
+            # viajando por _tool_args.
+            instruccion = _instruccion_de_paso({"args": args}) or orden
             sub_estado = dict(state)
             sub_estado["orden"]           = _construir_orden_paso(instruccion, args, resultados_previos)
+            # Pasos log EN VIVO (no la copia pre-ronda del state): node_web
+            # deduplica URLs ya leídas también entre tool calls paralelas
+            # emitidas en una misma ronda.
+            sub_estado["agent_pasos_log"] = agent_pasos_log
             sub_estado["error_activo"]    = False
             sub_estado["error_mensaje"]   = ""
             sub_estado["final_response"]  = None
@@ -1411,8 +1743,29 @@ def node_agent_loop(state: AetherState) -> dict:
                 print(f"   └─ ❌ Excepción ejecutando tool '{tool}': {e}")
                 resultado = f"[ERROR] Excepción ejecutando '{tool}': {e}"
 
-        agent_pasos_log.append({"tool": tool, "args": args, "resultado": resultado})
+        # ── Clasificación del resultado + memoria de intentos ──────────
+        # Un "sin resultados" es un RESULTADO, no un error a reparar: se
+        # registra (para este turno y los próximos, vía [INTENTOS
+        # RECIENTES]) y se le agrega al mensaje de tool la guía para
+        # cerrar en vez de reintentar.
+        cls = _clasificar_resultado_tool(resultado)
+        if cls in ("sin_resultados", "error"):
+            _registrar_intento_fallido(tool, args, resultado, cls)
+            resultado = ((resultado or "") + "\n\n"
+                         + _guia_resultado_terminal(cls, tool)).strip()
+
+        agent_pasos_log.append({"tool": tool, "args": args,
+                                "resultado": resultado, "cls": cls})
         resultados_previos.append(resultado)
+
+        if (forzar_cierre is None and cls in ("sin_resultados", "error")
+                and tool in _TOOLS_BUSQUEDA
+                and _fallos_de_tool(agent_pasos_log, tool) >= _MAX_FALLOS_BUSQUEDA):
+            forzar_cierre = tool
+            print(f"   └─ 🛑 [AGENT LOOP]: '{tool}' acumuló "
+                  f"{_MAX_FALLOS_BUSQUEDA} intentos sin resultado; "
+                  f"el loop cerrará con lo que hay.")
+
         # role="tool" es el formato que Ollama espera para devolverle al
         # modelo el resultado de una tool call en el siguiente turno.
         agent_messages.append({
@@ -1420,6 +1773,21 @@ def node_agent_loop(state: AetherState) -> dict:
             "content": (resultado or "")[:4000],
             "name":    tool,
         })
+
+    if forzar_cierre:
+        mensaje_cierre = (
+            f"No pude conseguir resultados para esto: intenté con "
+            f"'{forzar_cierre}' varias veces y no dio resultado (sin "
+            "resultados o errores). No insisto más por ahora — si querés, "
+            "lo pruebo con otro enfoque distinto o más tarde."
+        )
+        return {
+            "final_response":  mensaje_cierre,
+            "done":            True,
+            "agent_activo":    False,
+            "agent_messages":  agent_messages,
+            "agent_pasos_log": agent_pasos_log,
+        }
 
     return {
         "agent_messages":  agent_messages,
@@ -1433,6 +1801,47 @@ def node_agent_loop(state: AetherState) -> dict:
 # NODO: WEB — proveedor de datos puro
 # ══════════════════════════════════════════════════════════════════════
 
+# ── Saneamiento de queries de búsqueda (F-5) ─────────────────────────────
+# Bug real (ley 18331 × 4 pasos): el condensador recibía como "mensaje" la
+# orden base + [CONTEXTO DE PASOS PREVIOS] (1500 chars por paso previo) y
+# devolvía queries degeneradas — eco de la pregunta original con la wake
+# word ('aether, que dice ley numero 18331 uruguay?') o un fragmento de
+# marcador cortado a mitad de token ('...uruguay? [contexto'). Tres
+# higienes: (1) el input del condensador NO incluye el bloque de contexto
+# previo, (2) wake words fuera siempre, (3) el output se valida antes de
+# usarse: sin artefactos de marcadores, sin wake words, mínimo 2 palabras.
+
+_MARCADOR_CTX_PREVIO = "[CONTEXTO DE PASOS PREVIOS]"
+_WAKE_WORDS_N = frozenset({"aether"})
+
+
+def _sacar_wake_words(texto: str) -> str:
+    """Saca wake words iniciales (incluso pegadas a puntuación: 'Aether,')."""
+    palabras = (texto or "").split()
+    while palabras and _normalizar(palabras[0].strip(",.?!¡¿:;\"'")) in _WAKE_WORDS_N:
+        palabras.pop(0)
+    return " ".join(palabras)
+
+
+def _sanear_query_llm(query: str) -> str:
+    """Valida/sanea la query que devolvió el condensador LLM.
+
+    Devuelve '' si es un artefacto degenerado (fragmento de marcador del
+    prompt, wake word sola, una sola palabra): el caller cae al fallback
+    local de keywords en vez de buscar basura.
+    """
+    q = (query or "").strip().strip('"').strip("'").strip()
+    # Artefacto de marcador del prompt: '[contexto', '[CONTEXTO...'. Una
+    # query de búsqueda legítima no lleva corchetes.
+    if "[" in q or "]" in q:
+        return ""
+    q = _sacar_wake_words(q).strip().strip('"').strip("'").strip()
+    # Una palabra sola es demasiado vaga para gastar una búsqueda.
+    if len(q.split()) < 2:
+        return ""
+    return q
+
+
 def _generar_query_busqueda(orden: str) -> str:
     """
     Convierte una orden conversacional en una query de búsqueda corta.
@@ -1445,8 +1854,17 @@ def _generar_query_busqueda(orden: str) -> str:
     totalmente ajenos (el bug real: terminó trayendo la letra de una
     canción). Si la orden es corta ya es una query razonable; si es larga,
     se le pide al LLM que la condense a keywords de búsqueda.
+
+    F-5: la higiene de input/output (helpers de arriba) evita las queries
+    degeneradas del bug de la búsqueda repetida (eco con wake word y
+    fragmentos de marcador del contexto).
     """
     texto = (orden or "").strip()
+    # El bloque de pasos previos es CONTEXTO, no tema de búsqueda: afuera
+    # del input del condensador (era la fuente del '[contexto' truncado).
+    if _MARCADOR_CTX_PREVIO in texto:
+        texto = texto.split(_MARCADOR_CTX_PREVIO)[0].strip()
+    texto = _sacar_wake_words(texto)
     if not texto:
         return texto
     # Antes: <=8 palabras pasaban directo sin razonar. Bajado a 3 — con el
@@ -1470,14 +1888,33 @@ def _generar_query_busqueda(orden: str) -> str:
             min_predict=64,
         ).strip()
         _, query = _parse_ornith_thinking(raw)
-        query = query.strip().strip('"').strip("'")
+        query = _sanear_query_llm(query)
         if query and len(query.split()) <= 12:
             return query
     except Exception as e:
         print(f"   └─ ⚠️  [WEB]: no se pudo generar query corta ({e}), usando fallback local.")
 
-    palabras = [w for w in _normalizar(texto).split() if w not in _STOP_WORDS and len(w) > 2]
+    palabras = [w for w in _normalizar(texto).split()
+                if w not in _STOP_WORDS and len(w) > 2 and w not in _WAKE_WORDS_N]
     return " ".join(palabras[:8]) or texto
+
+
+def _urls_ya_leidas_del_turno(state: AetherState) -> set:
+    """URLs que pasos web anteriores de ESTE turno ya leyeron.
+
+    Solo activo durante el agent loop (agent_activo): en el camino de
+    plan_executor no hay deduplicación (comportamiento previo). La URL se
+    recupera del propio resultado del paso ('[CONTENIDO DE <url>]', el
+    formato con el que leer_url reporta lo que leyó).
+    """
+    if not state.get("agent_activo"):
+        return set()
+    urls = set()
+    for p in state.get("agent_pasos_log") or []:
+        if p.get("tool") == "web":
+            urls.update(re.findall(r"\[CONTENIDO DE (\S+?)\]",
+                                   p.get("resultado") or ""))
+    return urls
 
 
 def node_web(state: AetherState) -> dict:
@@ -1485,24 +1922,92 @@ def node_web(state: AetherState) -> dict:
     Búsqueda web + lectura de URL.
     REFACTOR: NO sintetiza con LLM. Devuelve datos crudos en web_results
     para que Ornith (plan_synthesizer) los procese.
+
+    F-2 (args estructurados del agent loop, vía _tool_args):
+      - url:   lee ESA URL directamente, sin buscar (el modelo puede pedir
+        una fuente concreta que vio en resultados previos).
+      - query: busca ESA query tal cual, sin re-condensarla.
+      - sin ninguno: condensa la instrucción a query (comportamiento
+        previo, también usado por plan_executor).
+
+    F-3 (deduplicación por turno, solo agent loop): no se relee una URL
+    ya leída. La misma búsqueda parafraseada lee la primera URL NUEVA de
+    los resultados; si TODAS ya se leyeron, devuelve [SIN RESULTADOS
+    NUEVOS] — que la clasificación del loop trata como 'sin_resultados',
+    así el intento se registra y el tope duro (_MAX_FALLOS_BUSQUEDA)
+    cierra el loop en vez de repetirlo para siempre (bug real: ley
+    18331 × 4 pasos leyendo la misma portada de IMPO).
     """
-    orden = state["orden"]
-    query = _generar_query_busqueda(orden)
+    orden     = state["orden"]
+    tool_args = state.get("_tool_args") or {}
+
+    query_explicita = str(tool_args.get("query") or "").strip()
+    url_explicita   = str(tool_args.get("url") or "").strip()
+    urls_ya_leidas  = _urls_ya_leidas_del_turno(state)
 
     print("\n🔍 [WEB]: Buscando...")
-    if query != orden:
-        print(f"   └─ [WEB]: Query generada: '{query}'")
+
+    # ── URL explícita: leer esa fuente directamente, sin buscar ─────────
+    if url_explicita:
+        if url_explicita in urls_ya_leidas:
+            print(f"   └─ [WEB]: '{url_explicita}' ya se leyó en este turno; "
+                  "no se relee.")
+            return {
+                "web_results": (
+                    f"[SIN RESULTADOS NUEVOS] La URL {url_explicita} ya se "
+                    "leyó en este turno y su contenido ya está en el "
+                    "historial de herramientas de arriba. NO la releas ni "
+                    "repitas la búsqueda: respondé al Creador con lo que ya "
+                    "tenés o buscá una fuente distinta."
+                ),
+                "llm_response":   None,
+                "final_response": None,
+                "messages":       [HumanMessage(content=orden)],
+            }
+        print(f"📖 [WEB]: Leyendo {url_explicita} (URL explícita del modelo)...")
+        contenido = leer_url.invoke(url_explicita)
+        contexto_web = f"[CONTENIDO LEÍDO]\n{contenido}"
+        print(f"   └─ [WEB]: {len(contexto_web)} caracteres de datos obtenidos.")
+        return {
+            "web_results":    contexto_web,
+            "llm_response":   None,
+            "final_response": None,
+            "messages":       [HumanMessage(content=orden)],
+        }
+
+    # ── Búsqueda (query explícita o condensada) ──────────────────────────
+    if query_explicita:
+        query = query_explicita
+        print(f"   └─ [WEB]: Query explícita del modelo: '{query}'")
+    else:
+        query = _generar_query_busqueda(orden)
+        if query != orden:
+            print(f"   └─ [WEB]: Query generada: '{query}'")
     resultados = buscar_web.invoke(query)
 
     urls = re.findall(r"URL:\s*(https?://\S+)", resultados)
+
+    # F-3: la primera URL que NO se leyó ya en este turno.
+    url_a_leer = next((u for u in urls if u not in urls_ya_leidas), None)
+
     contenido_url = ""
-    if urls:
-        print(f"📖 [WEB]: Leyendo {urls[0]}...")
-        contenido_url = leer_url.invoke(urls[0])
+    if url_a_leer:
+        print(f"📖 [WEB]: Leyendo {url_a_leer}...")
+        contenido_url = leer_url.invoke(url_a_leer)
 
     contexto_web = resultados
     if contenido_url:
         contexto_web += f"\n\n[CONTENIDO LEÍDO]\n{contenido_url[:3000]}"
+    elif urls and urls_ya_leidas:
+        # Todos los resultados ya fueron leídos: nada nuevo bajo el sol.
+        contexto_web = (
+            "[SIN RESULTADOS NUEVOS] Esta búsqueda no aportó nada nuevo: "
+            "TODAS las URLs de los resultados ya fueron leídas en este turno "
+            "(el contenido está arriba en el historial de herramientas). NO "
+            "repitas esta búsqueda con variantes triviales: respondé al "
+            "Creador con lo que ya tenés, o pedí una fuente distinta con la "
+            "tool web y el argumento 'url'.\n\n" + resultados
+        )
 
     print(f"   └─ [WEB]: {len(contexto_web)} caracteres de datos obtenidos.")
 
@@ -1510,7 +2015,7 @@ def node_web(state: AetherState) -> dict:
         "web_results":    contexto_web,
         "llm_response":   None,
         "final_response": None,
-        "messages":       [HumanMessage(content=orden)],
+        "messages":      [HumanMessage(content=orden)],
     }
 
 
@@ -3144,15 +3649,20 @@ def node_text(state: AetherState) -> dict:
     mem   = state["mem"]
 
     tokens: list[str] = []
+    razonamiento: list[str] = []
     def _on_token(t):
         tokens.append(t)
         emit_token(t)   # 👈 antes: print del prefijo + print(t, end="", flush=True)
+    def _on_reasoning(t):
+        razonamiento.append(t)
 
     try:
         raw = _llm_chat(
             system=_system_prompt_chat(mem, state),
             user=orden,
             on_token=_on_token,
+            on_reasoning=_on_reasoning,
+            imagenes=state.get("agent_images") or None,
         )
     except Exception as e:
         print(f"   └─ [TEXT]: Error llamando al modelo ({e}). Respuesta simple de fallback.")
@@ -3165,9 +3675,13 @@ def node_text(state: AetherState) -> dict:
 
     # (se borra el `if tokens: print()` — ya no escribe a stdout)
 
-    reasoning, respuesta = _parse_ornith_thinking(raw)
-    if reasoning:
-        print(f"\n🧠 [Ornith thinking (chat)]: {reasoning[:250]}{'...' if len(reasoning)>250 else ''}")
+    # El razonamiento ya viajó por su canal DEDICADO en streaming
+    # (on_reasoning → ReasoningEvent en la Web UI). NUNCA se imprime: stdout
+    # es el canal de logs y el razonamiento no debe aparecer ahí.
+    # _parse_ornith_thinking queda como red de seguridad: si un marcador se
+    # coló por el stream (caso degenerado), se rescata acá sin duplicar.
+    _razonamiento_rescate, respuesta = _parse_ornith_thinking(raw)
+    reasoning = "".join(razonamiento) or _razonamiento_rescate
 
     comando_colado = _extraer_comando_de_texto(respuesta)
     if comando_colado:
@@ -3354,9 +3868,12 @@ def node_plan_synthesizer(state: AetherState) -> dict:
             contexto_datos += f"\n\n[ACCIONES EJECUTADAS EN PANTALLA]:\n{state['computer_use_result']}"
 
     tokens = []
+    razonamiento: list[str] = []
     def _on_token(t):
         tokens.append(t)
         emit_token(t)          # 👈 antes era print(t, end="", flush=True) (+ el print del prefijo)
+    def _on_reasoning(t):
+        razonamiento.append(t)
 
     raw = _llm_chat(
         system=_system_prompt_sintesis(mem, state),
@@ -3367,13 +3884,14 @@ def node_plan_synthesizer(state: AetherState) -> dict:
             "No menciones los pasos internos ni el proceso técnico, solo el resultado."
         ),
         on_token=_on_token,
+        on_reasoning=_on_reasoning,
     )
 
     # ya no hace falta el `if tokens: print()` de acá abajo, se borra
 
-    reasoning, respuesta = _parse_ornith_thinking(raw)
-    if reasoning:
-        print(f"\n🧠 [Ornith thinking (síntesis)]: {reasoning[:200]}{'...' if len(reasoning)>200 else ''}")
+    # Razonamiento por canal dedicado (ídem node_text): sin print a logs.
+    _razonamiento_rescate, respuesta = _parse_ornith_thinking(raw)
+    reasoning = "".join(razonamiento) or _razonamiento_rescate
 
     return {
         "final_response": respuesta,
@@ -3695,7 +4213,7 @@ def _construir_orden_paso(instruccion: str, args: dict, plan_resultados: list[st
     partes = [instruccion]
 
     if isinstance(args, dict):
-        for clave in ("query", "command", "app", "filename", "path"):
+        for clave in ("query", "command", "app", "filename", "path", "url"):
             val = args.get(clave)
             if isinstance(val, str) and val.strip() and val.strip() not in instruccion:
                 partes.append(f"[{clave}] {val.strip()}")

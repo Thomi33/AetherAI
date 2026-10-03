@@ -48,7 +48,8 @@ def node_context_manager(state: AetherState) -> dict:
     plan_pasos = state.get("plan_pasos") or []
     es_multitool = isinstance(plan_pasos, list) and len(plan_pasos) > 1
     contexto = construir_contexto_memoria(
-        mem, tema=tema, sesion_id=sesion_id, es_multitool=es_multitool
+        mem, tema=tema, sesion_id=sesion_id, es_multitool=es_multitool,
+        orden=orden,
     )
 
     context_slots = {

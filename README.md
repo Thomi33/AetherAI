@@ -228,7 +228,6 @@ Los valores más importantes son:
 - `AETHER_DATA_DIR`: carpeta donde se guardan memoria, notas y logs.
 - `NUM_CTX`: contexto efectivo; el instalador lo ajusta según hardware.
 - `NUM_PREDICT`: máximo de tokens generados.
-- `MAX_AGENT_STEPS`: límite de iteraciones del agente.
 - `OLLAMA_KEEP_ALIVE`, threads y batch: parámetros de latencia y memoria.
 - `STT_ENABLED`: dictado por voz opcional.
 
@@ -269,13 +268,23 @@ Roblox Player y futuros runtimes. Tiene tres capas:
 - **Usuario**: hechos estables del usuario; `user_set()` nunca sobrescribe
   silenciosamente, las correcciones pasan por `user_update()` con historial.
 - **Aprendizaje**: recuerdos con `importance` (1–10) y `strength` (0–1).
-  El uso los refuerza, el desuso los debilita (`consolidate()`), y
-  `forget()` los hace inaccesibles **sin borrarlos** (solo `hard=True`
-  elimina). La personalidad es acumulativa: `personality_signals()` agrega
-  patrones, nunca reemplaza nada.
+  El uso los refuerza (asintóticamente: nunca satura), el desuso los
+  debilita (`consolidate()`, agendada tras cada turno), y `forget()` los
+  hace inaccesibles **sin borrarlos** (solo `hard=True` elimina). La
+  personalidad es acumulativa: `personality_signals()` agrega patrones,
+  nunca reemplaza nada.
+- **Intentos (outcomes)**: memoria operativa y efímera (`kind="outcome"`,
+  TTL ~48 h, decaimiento diario, cap de 200 entradas). Registra qué tools
+  ya se intentaron y no dieron resultado — "si no dio resultado, no dio
+  resultado". El agent loop clasifica los resultados negativos, les agrega
+  guía de cierre al mensaje de tool y fuerza el cierre del loop tras 3
+  fallos de una tool de búsqueda en el turno; el registro queda persistido
+  para no repetirlo en próximos turnos.
 
 El context builder inyecta los aprendizajes relevantes en el slot
-`[APRENDIZAJES]` (desactivable con `AETHER_CENTRAL_MEMORY=0`).
+`[APRENDIZAJES]` y los intentos fallidos en el slot `[INTENTOS RECIENTES]`
+(ambos desactivables con `AETHER_CENTRAL_MEMORY=0`; la inyección no
+refuerza memorias — solo el uso real lo hace).
 
 ## Arquitectura del proyecto
 

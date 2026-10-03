@@ -419,6 +419,133 @@ def listar_sesiones(limit: int = 15) -> list[dict]:
         return []
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CONSOLIDACIÓN DE RESUMEN (antes en consolidator.py — ahora síncrono y simple)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Umbral por defecto: no vale la pena gastar una llamada al LLM por cada
+# turno nuevo. Se consolida cuando hay un lote razonable acumulado.
+MIN_TURNOS_PARA_CONSOLIDAR = 12
+COMPACTACION_MIN_CHARS = 12000
+
+_SYSTEM_PROMPT_CONSOLIDATOR = (
+    "Sos el consolidador de memoria de Aether. Tu única salida es un resumen "
+    "acumulativo actualizado — NO un log de conversación, NO una lista de "
+    "turnos, NO explicaciones sobre lo que hiciste.\n\n"
+    "Reglas:\n"
+    "- Reescribís el resumen COMPLETO cada vez, integrando lo nuevo relevante "
+    "y descartando charla efímera, saludos, o información que ya quedó "
+    "obsoleta (ej: un problema que ya se resolvió, un plan que cambió).\n"
+    "- Priorizá: hechos estables del usuario, proyectos activos y su estado, "
+    "preferencias técnicas, decisiones tomadas, problemas pendientes.\n"
+    "- Nunca inventes datos que no estén en el resumen previo o los turnos "
+    "nuevos.\n"
+    "- Prosa organizada en secciones cortas si hace falta, sin relleno, en "
+    "español.\n"
+    "- Si un turno nuevo contradice al resumen previo (ej: un dato cambió), "
+    "el turno nuevo gana — no dejes versiones viejas y nuevas conviviendo."
+)
+
+
+def _bloque_turnos(turnos: list[dict]) -> str:
+    lineas = []
+    for t in turnos:
+        rol = str(t.get("rol", "?")).upper()
+        texto = str(t.get("texto", "")).strip()
+        if texto:
+            lineas.append(f"[{rol}] {texto}")
+    return "\n".join(lineas)
+
+
+def consolidar_resumen(forzar: bool = False, min_turnos: int = MIN_TURNOS_PARA_CONSOLIDAR) -> str | None:
+    """
+    Actualiza el resumen acumulativo con los turnos nuevos desde la última
+    consolidación.
+    
+    Retorna el nuevo resumen si se consolidó, None si no hizo falta.
+    """
+    from core.config.settings import RUTA_NOTAS
+
+    pendientes = obtener_turnos_pendientes_de_resumen()
+    if not forzar and (len(pendientes) < min_turnos):
+        return None
+
+    resumen_previo = obtener_resumen()
+    prompt = f"{_SYSTEM_PROMPT_CONSOLIDATOR}\n\n[RESUMEN PREVIO]:\n{resumen_previo or '(vacío)'} \n\n[TURNOS NUEVOS]:\n{_bloque_turnos(pendientes)}"
+
+    from core.config.settings import OLLAMA_HOST, MODELO, NUM_CTX
+    import requests
+
+    payload = {
+        "model": MODELO,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.3, "num_ctx": NUM_CTX},
+        "keep_alive": "10m",
+    }
+
+    try:
+        r = requests.post(f"{OLLAMA_HOST}/api/generate", json=payload, timeout=180)
+    except Exception as e:
+        print(f"[MEMORIA] Error llamando al modelo para consolidar: {e}")
+        return None
+
+    if r.status_code != 200:
+        print(f"[MEMORIA] Error HTTP {r.status_code} consolidando: {r.text[:200]}")
+        return None
+
+    data = r.json()
+    if "error" in data:
+        print(f"[MEMORIA] Error del modelo consolidando: {data['error']}")
+        return None
+
+    nuevo_resumen = data.get("response", "").strip()
+    if not nuevo_resumen:
+        print("[MEMORIA] Resumen vacío devuelto por el modelo")
+        return None
+
+    guardar_resumen(nuevo_resumen)
+    print(f"[MEMORIA] Resumen consolidado ({len(pendientes)} turnos integrados)")
+    return nuevo_resumen
+
+
+def compactar_contexto_si_necesario() -> bool:
+    """Compacta turnos pendientes cuando el contexto crudo ya es demasiado grande."""
+    pendientes = obtener_turnos_pendientes_de_resumen()
+    chars = sum(len(str(t.get("texto", ""))) for t in pendientes)
+    if len(pendientes) < MIN_TURNOS_PARA_CONSOLIDAR and chars < COMPACTACION_MIN_CHARS:
+        return False
+    return consolidar_resumen(forzar=True, min_turnos=1) is not None
+
+
+def programar_consolidacion(mem: dict | None = None) -> bool:
+    """
+    Ejecuta consolidación síncrona (sin worker thread).
+    Si hay turnos pendientes, consolida y actualiza mem['resumen'] si se pasó.
+    """
+    nuevo_resumen = consolidar_resumen()
+    if nuevo_resumen is not None and isinstance(mem, dict):
+        mem["resumen"] = nuevo_resumen
+    return nuevo_resumen is not None
+
+
+def consolidar_memoria_central() -> dict | None:
+    """Decaimiento + barrido TTL de la memoria central compartida.
+    
+    Fail-open: cualquier error se traga — no bloquea el worker.
+    """
+    import os
+    if os.environ.get("AETHER_CENTRAL_MEMORY", "1") == "0":
+        return None
+    try:
+        from core.memory.central_store_v2 import get_central_memory
+        return get_central_memory().consolidate()
+    except Exception as e:
+        print(f"[MEMORIA] Consolidación central falló (no bloqueante): {e}")
+        return None
+
+
 # ══════════════════════════════════════════════════════════════════════
 # ALIAS / COMPAT — para nodos del grafo que todavía esperan estas funcs
 # ══════════════════════════════════════════════════════════════════════

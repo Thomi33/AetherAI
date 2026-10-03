@@ -1,11 +1,18 @@
 """
-mcp_routes.py — Gestión de servers MCP (core/config/mcp_servers.json).
+mcp_routes.py — Gestión de servers MCP (dos capas, como config.json/config.local.json).
 
 Es el comando /mcps de la TUI, más la posibilidad de AGREGAR un MCP custom
 desde la Web UI (nombre, transport, command, args, env) y de ver las tools
 que expone cada server.
 
-Formato del archivo (es el que consume core/tools/mcp_client.py):
+Capas de configuración (ver core/tools/mcp_client.py):
+  1. core/config/mcp_servers.json        → PLANTILLA versionada con
+     placeholders "{token}". NUNCA se escribe en runtime.
+  2. core/config/mcp_servers.local.json   → capa LOCAL (ignorada por Git)
+     con los tokens REALES. Todo lo que escriben estas rutas vive acá:
+     altas, ediciones, toggles y tombstones de borrado.
+
+Formato de ambas capas (el que consume core/tools/mcp_client.py):
 
     {
       "nombre": {
@@ -17,11 +24,12 @@ Formato del archivo (es el que consume core/tools/mcp_client.py):
       }
     }
 
-SEGURIDAD: `env` puede guardar tokens (GITHUB_PERSONAL_ACCESS_TOKEN, etc.).
-El backend expone la API con CORS abierto, así que GET NUNCA devuelve los
-valores de env en claro: devuelve los valores enmascarados ("********") más
-un preview de 4 chars. Al escribir, un valor igual al mask conserva el valor
-real guardado (keychain transparente).
+SEGURIDAD: `env` guarda tokens (GITHUB_PERSONAL_ACCESS_TOKEN, etc.) en la
+capa LOCAL, que Git ignora. El backend expone la API con CORS abierto,
+así que GET NUNCA devuelve los valores de env en claro: devuelve los
+valores enmascarados ("********") más un preview de 4 chars. Al escribir,
+un valor igual al mask conserva el valor real guardado (keychain
+transparente).
 """
 
 import asyncio
@@ -39,29 +47,37 @@ _MASK = "********"
 
 
 def _ruta_config():
-    """Misma ruta que usa core/tools/mcp_client.py: core/config/mcp_servers.json
-    (resuelta desde el paquete, no desde este archivo, para no depender de
-    cuántos niveles de carpeta tenga backend/api/routes/)."""
+    """Plantilla versionada: core/config/mcp_servers.json (resuelta desde el
+    paquete, no desde este archivo, para no depender de cuántos niveles de
+    carpeta tenga backend/api/routes/)."""
     from pathlib import Path
     import core.config
     return Path(core.config.__file__).resolve().parent / "mcp_servers.json"
 
 
 def _leer() -> dict:
-    ruta = _ruta_config()
-    if not ruta.exists():
-        return {}
-    try:
-        data = json.loads(ruta.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception as e:  # noqa: BLE001
-        raise ValueError(f"No se pudo leer mcp_servers.json: {e}") from e
+    """Vista MERGEADA que ve el usuario: plantilla ← overrides locales
+    (tokens reales, servers custom). Tombstones filtrados por el merge."""
+    from core.tools.mcp_client import cargar_merge
+    return cargar_merge()
 
 
-def _escribir(data: dict) -> None:
-    _ruta_config().write_text(
-        json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-    )
+def _leer_local() -> dict:
+    """Capa local cruda (tokens reales + custom + tombstones)."""
+    from core.tools.mcp_client import cargar_local
+    return cargar_local()
+
+
+def _escribir_local(data: dict) -> None:
+    """Persiste SOLO la capa local. La plantilla versionada nunca se toca."""
+    from core.tools.mcp_client import guardar_local
+    guardar_local(data)
+
+
+def _en_plantilla(nombre: str) -> bool:
+    """True si el server viene de la plantilla versionada (no del usuario)."""
+    from core.tools.mcp_client import _leer_json_servers, RUTA_BASE
+    return nombre in _leer_json_servers(RUTA_BASE)
 
 
 def _preview(valor: str) -> str:
@@ -142,45 +158,59 @@ def _cfg_desde_body(body: McpServerBody, env_base: dict) -> dict:
 
 @router.post("/mcps")
 async def agregar(body: McpServerBody):
-    """Agrega un server MCP custom. 409 si el nombre ya existe (usar PATCH)."""
+    """Agrega un server MCP custom. 409 si el nombre ya existe (usar PATCH).
+
+    Escribe SOLO en la capa local (mcp_servers.local.json): la plantilla
+    versionada queda intacta.
+    """
     err = _validar(body)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
     try:
-        data = _leer()
+        merged = _leer()
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-    if body.name in data:
+    if body.name in merged:
         return JSONResponse(
             {"ok": False, "error": f"Ya existe '{body.name}'"}, status_code=409)
-    data[body.name] = _cfg_desde_body(body, {})
+    local = _leer_local()
+    local[body.name] = _cfg_desde_body(body, {})
     try:
-        _escribir(data)
+        _escribir_local(local)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-    return {"ok": True, "server": _serializar(body.name, data[body.name])}
+    return {"ok": True, "server": _serializar(body.name, local[body.name])}
 
 
 @router.patch("/mcps/{nombre}")
 async def editar(nombre: str, body: McpServerBody):
-    """Edita un server (incluye el toggle enabled del /mcps de la TUI)."""
+    """Edita un server (incluye el toggle enabled del /mcps de la TUI).
+
+    La edición se guarda como OVERRIDE en la capa local. Si se renombra un
+    server de la plantilla, el nombre viejo recibe un tombstone en local
+    (la plantilla no se toca, pero el nombre viejo desaparece de la vista).
+    """
     err = _validar(body)
     if err:
         return JSONResponse({"ok": False, "error": err}, status_code=400)
     try:
-        data = _leer()
+        merged = _leer()
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-    if nombre not in data:
+    if nombre not in merged:
         return JSONResponse(
             {"ok": False, "error": f"No existe '{nombre}'"}, status_code=404)
-    viejo = data[nombre] if isinstance(data[nombre], dict) else {}
+    viejo = merged[nombre] if isinstance(merged[nombre], dict) else {}
     nueva = _cfg_desde_body(body, viejo.get("env") or {})
+    local = _leer_local()
     if body.name != nombre:
-        del data[nombre]
-    data[body.name] = nueva
+        if _en_plantilla(nombre):
+            local[nombre] = {"__deleted__": True}   # ocultar el nombre viejo
+        else:
+            local.pop(nombre, None)
+    local[body.name] = nueva
     try:
-        _escribir(data)
+        _escribir_local(local)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     return {"ok": True, "server": _serializar(body.name, nueva)}
@@ -188,16 +218,22 @@ async def editar(nombre: str, body: McpServerBody):
 
 @router.delete("/mcps/{nombre}")
 async def borrar(nombre: str):
+    """Borra un server de la vista. Si viene de la plantilla versionada,
+    escribe un tombstone en la capa local (la plantilla nunca se toca)."""
     try:
-        data = _leer()
+        merged = _leer()
     except ValueError as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-    if nombre not in data:
+    if nombre not in merged:
         return JSONResponse(
             {"ok": False, "error": f"No existe '{nombre}'"}, status_code=404)
-    del data[nombre]
+    local = _leer_local()
+    if _en_plantilla(nombre):
+        local[nombre] = {"__deleted__": True}   # tombstone en la capa local
+    else:
+        local.pop(nombre, None)                 # server custom: fuera del local
     try:
-        _escribir(data)
+        _escribir_local(local)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
     return {"ok": True}

@@ -29,6 +29,9 @@ class AetherState(TypedDict):
     agent_activo:    bool          # True mientras el agent loop sigue corriendo
     agent_messages:  list          # transcript formato Ollama (system/user/assistant/tool)
     agent_pasos_log: list[dict]    # [{"tool":..., "args":..., "resultado":...}, ...] para debug/síntesis
+    agent_images:    list[str]     # thumbnails b64 de adjuntos del turno → van
+                                   # incrustados en el mensaje del usuario del
+                                   # agent loop / text (visión nativa del modelo)
 
     # ── Mensajes LangChain ───────────────────────────────────────────
     messages:       list[BaseMessage]
@@ -98,7 +101,8 @@ class AetherState(TypedDict):
 # FACTORY DE ESTADO INICIAL
 # ══════════════════════════════════════════════════════════════════════
 
-def crear_estado_inicial(orden: str, mem: dict, modo_autonomo: bool = True) -> "AetherState":
+def crear_estado_inicial(orden: str, mem: dict, modo_autonomo: bool = True,
+                         imagenes: list[str] | None = None) -> "AetherState":
     """
     Construye un AetherState completo y coherente para invocar el grafo.
 
@@ -109,6 +113,9 @@ def crear_estado_inicial(orden: str, mem: dict, modo_autonomo: bool = True) -> "
     Es la única fuente de verdad para inicializar el estado del grafo; tanto
     el CLI/servicio como los tests deben usar esta factory en vez de armar
     el dict a mano.
+
+    imagenes: thumbnails b64 de adjuntos de imagen (agente con visión
+    inline). Vacío/None → comportamiento texto-only clásico.
     """
     # Import local para evitar import circular (memory_manager → no depende de state)
     from core.memory.memory_manager import normalizar_mem
@@ -133,6 +140,7 @@ def crear_estado_inicial(orden: str, mem: dict, modo_autonomo: bool = True) -> "
         "agent_activo":    False,
         "agent_messages":  [],
         "agent_pasos_log": [],
+        "agent_images":    list(imagenes or []),
 
         # ── Mensajes ─────────────────────────────────────────────────
         "messages":      [],

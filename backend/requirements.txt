@@ -5,3 +5,5 @@ uvicorn[standard]>=0.30.0
 pydantic>=2.8
 pydantic-settings>=2.4
 requests>=2.31
+# Thumbnails de adjuntos (downscale de imágenes para el modelo de visión)
+Pillow>=10.0

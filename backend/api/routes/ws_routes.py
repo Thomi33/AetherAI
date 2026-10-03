@@ -32,6 +32,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from backend.core.aether_service import (
     AetherService,
     TokenEvent,
+    ReasoningEvent,
     StdoutLineEvent,
     NodeUpdateEvent,
     DoneEvent,
@@ -44,11 +45,14 @@ from tui.status_messages import real_state_for_node
 router = APIRouter()
 
 
-def _iter_payloads(mensaje: str):
+def _iter_payloads(mensaje: str, imagenes: list[str] | None = None):
     """Generador síncrono: eventos del grafo → dicts JSON (espejo del SSE)."""
-    for evento in AetherService.iter_eventos(mensaje):
+    for evento in AetherService.iter_eventos(mensaje, imagenes):
         if isinstance(evento, TokenEvent):
             yield {"type": "token", "data": evento.fragmento}
+        elif isinstance(evento, ReasoningEvent):
+            # Canal de razonamiento separado de la respuesta (Web UI).
+            yield {"type": "reasoning", "data": evento.fragmento}
         elif isinstance(evento, NodeUpdateEvent):
             yield {
                 "type": "node",
@@ -59,15 +63,21 @@ def _iter_payloads(mensaje: str):
         elif isinstance(evento, StdoutLineEvent):
             yield {"type": "log", "data": evento.texto[:2000]}
         elif isinstance(evento, DoneEvent):
-            yield {"type": "done", "response": limpiar_respuesta_chat(evento.respuesta)}
+            yield {
+                "type": "done",
+                "response": limpiar_respuesta_chat(evento.respuesta),
+                # Razonamiento completo del turno (por si se perdió streaming).
+                "reasoning": evento.reasoning,
+            }
         elif isinstance(evento, ErrorEvent):
             yield {"type": "error", "message": evento.mensaje}
 
 
-async def _stream_mensaje(ws: WebSocket, mensaje: str) -> None:
+async def _stream_mensaje(ws: WebSocket, mensaje: str,
+                          imagenes: list[str] | None = None) -> None:
     """Corre UNA orden por el grafo y streamea los eventos por el socket."""
     await ws.send_json({"type": "start", "busy": AetherService.ocupado()})
-    gen = _iter_payloads(mensaje)
+    gen = _iter_payloads(mensaje, imagenes)
     loop = asyncio.get_running_loop()
     _VACIO = itertools.chain()  # sentinel del run_in_executor
     try:
@@ -108,14 +118,14 @@ async def ws_chat(ws: WebSocket):
                 await ws.send_json({"type": "stopped"})
                 continue
             # Visión/IO fuera del event loop (ver chat.py /chat/stream).
-            mensaje, _metas = await asyncio.get_running_loop().run_in_executor(
+            mensaje, _metas, imagenes = await asyncio.get_running_loop().run_in_executor(
                 None, _preparar_orden, data)
             if not mensaje.strip():
                 await ws.send_json(
                     {"type": "error", "message": "Mandá {'message': 'texto'}"}
                 )
                 continue
-            await _stream_mensaje(ws, mensaje)
+            await _stream_mensaje(ws, mensaje, imagenes)
     except WebSocketDisconnect:
         # Cliente se fue: el lock lo libera el hilo del grafo al terminar.
         return

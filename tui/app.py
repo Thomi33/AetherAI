@@ -843,32 +843,13 @@ class AetherApp(App):
         def _on_done(states: dict | None) -> None:
             if states is None:
                 return
-            # Persistir el estado de los toggles en mcp_servers.json
-            import json, pathlib
-            p = pathlib.Path(__file__).parent.parent / "core" / "config" / "mcp_servers.json"
+            # Persistir el estado de los toggles en la capa LOCAL
+            # (core/config/mcp_servers.local.json, ignorado por Git): la
+            # plantilla versionada (mcp_servers.json) nunca se modifica.
             try:
-                data = json.loads(p.read_text())
-                if isinstance(data, list):
-                    for s in data:
-                        name = s.get("name", s.get("url", ""))
-                        if name in states:
-                            s["enabled"] = states[name]
-                    out = data
-                elif isinstance(data, dict) and "servers" in data:
-                    for s in data["servers"]:
-                        name = s.get("name", s.get("url", ""))
-                        if name in states:
-                            s["enabled"] = states[name]
-                    out = data
-                elif isinstance(data, dict):
-                    # Formato real: {"nombre_server": {config...}, ...}
-                    for name, cfg in data.items():
-                        if name in states and isinstance(cfg, dict):
-                            cfg["enabled"] = states[name]
-                    out = data
-                else:
-                    out = data
-                p.write_text(json.dumps(out, indent=2, ensure_ascii=False))
+                from core.tools.mcp_client import set_enabled
+                for name, activo in states.items():
+                    set_enabled(name, bool(activo))
             except Exception:
                 pass
             enabled = [k for k, v in states.items() if v]
@@ -938,7 +919,7 @@ class AetherApp(App):
         self.push_screen(MemoryEditorScreen(texto_actual=texto_actual, on_save=_on_save), _on_save)
 
     def _forzar_consolidacion_memoria(self) -> None:
-        from core.memory.consolidator import consolidar_resumen
+        from core.memory.memory_manager import consolidar_resumen
         chat_panel = self.query_one("#chat_panel", ChatPanel)
         nuevo = consolidar_resumen(forzar=True)
         if nuevo is None:

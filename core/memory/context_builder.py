@@ -8,6 +8,7 @@ y filtra por relevancia al tema actual.
 Slots:
     [SISTEMA]         — core_memory (siempre presente)
     [RECUERDOS]       — hechos permanentes relevantes al tema
+    [INTENTOS RECIENTES] — acciones que ya se probaron y NO dieron resultado
     [CONVERSACIÓN]    — solo turnos del tema actual (no todo el historial)
     [COMANDOS]        — últimos comandos ejecutados (solo si aplica)
 
@@ -112,7 +113,8 @@ def _limite_turnos(tema: str, es_multitool: bool) -> int:
 
 
 def construir_contexto_memoria(
-    mem: dict, tema: str = "", sesion_id: str = "", es_multitool: bool = False
+    mem: dict, tema: str = "", sesion_id: str = "", es_multitool: bool = False,
+    orden: str = "",
 ) -> str:
     """
     Construye el contexto para el LLM filtrando por relevancia.
@@ -123,6 +125,8 @@ def construir_contexto_memoria(
               Si está vacío, solo inyecta core_memory y recuerdos importantes.
         es_multitool: True si el plan activo tiene más de 1 paso. Fuerza
               MAX_TURNOS_CONTEXTO_PLAN (ventana adaptativa, ver arriba).
+        orden: pedido original del usuario. Matchea los intentos fallidos
+              previos ([INTENTOS RECIENTES]) contra lo que se pide ahora.
 
     Returns:
         String listo para inyectar en el system prompt.
@@ -199,6 +203,18 @@ def construir_contexto_memoria(
     aprendizajes = _aprendizajes_centrales(tema)
     if aprendizajes:
         slots["APRENDIZAJES"] = aprendizajes
+
+    # ── Slot 2c: INTENTOS RECIENTES (memoria de intentos fallidos) ─────
+    # "Si no dio resultado, no dio resultado": los intentos que ya fallaron
+    # se inyectan para que el modelo NO repita lo que ya probó y cierre con
+    # lo que hay en vez de convertir una búsqueda fallida en tarea larga.
+    intentos = _intentos_recientes(tema, orden)
+    if intentos:
+        slots["INTENTOS RECIENTES"] = (
+            "Acciones que YA se intentaron y NO dieron resultado.\n"
+            "Si el pedido actual coincide con una, NO la reintentes: "
+            "reportá que no hay resultados y cerrá ahí.\n" + intentos
+        )
 
     # ── Slot 3: CONVERSACIÓN filtrada por tema ────────────────────────
     turnos_relevantes = []
@@ -334,12 +350,44 @@ def _aprendizajes_centrales(tema: str, *, limit: int = 5, max_chars: int = 600) 
     if os.environ.get("AETHER_CENTRAL_MEMORY", "1") == "0":
         return ""
     try:
-        from core.memory.central import get_central_memory
+        from core.memory.central_store_v2 import get_central_memory
         central = get_central_memory()
-        resultados = central.search(tema or "", limit=limit)
+        # touch=False: la inyección de contexto NO es "uso". Antes el solo
+        # aparecer en el prompt los reforzaba (+0.05 por turno), un bucle
+        # de ricos-más-ricos que ensuciaba la señal de strength.
+        resultados = central.search(tema or "", limit=limit, touch=False)
         if not resultados:
             return ""
         lineas = [f"  - {r['summary']}" for r in resultados]
+        return "\n".join(lineas)[:max_chars]
+    except Exception:
+        return ""
+
+
+def _intentos_recientes(tema: str, orden: str = "", *, limit: int = 5,
+                        max_chars: int = 600) -> str:
+    """Intentos fallidos recientes (outcomes de la memoria central).
+
+    El punto: "si no dio resultado, no dio resultado". Inyectar qué
+    búsquedas/lecturas ya fallaron le dice al modelo qué NO reintentar,
+    en este turno y en los próximos (los outcomes tienen TTL). Fail-open
+    por diseño: cualquier error devuelve "".
+    """
+    import os
+    if os.environ.get("AETHER_CENTRAL_MEMORY", "1") == "0":
+        return ""
+    try:
+        from core.memory.central_store_v2 import get_central_memory
+        central = get_central_memory()
+        resultados = central.recent_outcomes(
+            query=f"{tema} {orden}".strip(), limit=limit)
+        if not resultados:
+            return ""
+        lineas = []
+        for r in resultados:
+            data = r.get("data") or {}
+            count = int(data.get("count", 1))
+            lineas.append(f"  - {r.get('summary', '')} (veces: {count})")
         return "\n".join(lineas)[:max_chars]
     except Exception:
         return ""

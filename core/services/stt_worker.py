@@ -2,7 +2,7 @@
 """
 stt_worker.py — Proceso persistente de transcripción (faster-whisper).
 
-Corre DENTRO del venv aislado (~/whisper_aether_test/venv-stt), NO en el
+Corre DENTRO del venv aislado (~/Whisper_TTS/venv), NO en el
 venv principal de Aether (crewai-env). Se comunica con el proceso padre
 (core/services/stt_service.py) por stdin/stdout con un protocolo JSON-lines:
 
