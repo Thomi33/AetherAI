@@ -237,28 +237,33 @@ class _QueueWriter(io.TextIOBase):
 
 def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
     writer = _QueueWriter(q)
+    ultimo_estado: dict[str, Any] = {}
+    llego_finalize = False
     try:
         from core.agent.graph_builder import get_graph
         from core.agent.graph_state import crear_estado_inicial
-        from core.memory.memory_manager import registrar_turno
         from core.agent.streaming import InferenceCancelled, set_token_sink, clear_token_sink
 
         set_token_sink(lambda frag: q.put(TokenEvent(fragmento=frag)))
-        # FIX eco: NO registrar el turno del usuario antes de correr el grafo.
-        # obtener_turnos_por_tema lee del store PERSISTENTE, así que el turno
-        # recién registrado terminaba en el contexto de CONVERSACIÓN → el
-        # modelo veía su input dos veces (historial + prompt) y lo ecoaba.
-        # Se registra al final (bloque finally), cuando la inferencia ya corrió.
+        # FIX eco: el turno del usuario NO se registra antes de correr el grafo
+        # (obtener_turnos_por_tema lee del store PERSISTENTE: el turno recién
+        # registrado terminaba en el contexto de CONVERSACIÓN → el modelo veía
+        # su input dos veces y lo ecoaba). Ahora lo registra node_finalize —
+        # antes que la respuesta y con tema/sesión— cuando la inferencia
+        # completa; el finally de abajo es solo fallback para los caminos que
+        # no llegan a finalize (cancelación, errores, END directo).
 
         grafo = get_graph()
         estado = crear_estado_inicial(orden, _motor.mem, modo_autonomo=True)
-        ultimo_estado: dict[str, Any] = dict(estado)
+        ultimo_estado = dict(estado)
 
         with contextlib.redirect_stdout(writer):
             for update in grafo.stream(estado, stream_mode="updates"):
                 for nodo, delta in update.items():
                     if isinstance(delta, dict):
                         ultimo_estado.update(delta)
+                    if nodo == "finalize":
+                        llego_finalize = True
                     q.put(NodeUpdateEvent(nodo=nodo, delta=delta or {}))
             writer.vaciar_residual()
 
@@ -275,13 +280,20 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
         writer.vaciar_residual()
         q.put(ErrorEvent(mensaje=f"{type(e).__name__}: {e}"))
     finally:
-        # Registrar el turno del usuario AHORA (después de la inferencia):
-        # el context_manager ya no lo ve en el historial del turno actual.
-        try:
-            from core.memory.memory_manager import registrar_turno
-            registrar_turno(_motor.mem, "usuario", orden)
-        except Exception:
-            pass
+        # Fallback del turno del usuario: SOLO si el grafo no llegó a finalize
+        # (cancelación, error, END directo de error_confirm/error_fallback).
+        # Si llegó, node_finalize ya lo registró ANTES que la respuesta y con
+        # tema/sesión — no duplicar.
+        if not llego_finalize:
+            try:
+                from core.memory.memory_manager import registrar_turno
+                registrar_turno(
+                    _motor.mem, "usuario", orden,
+                    sesion_id=_motor.mem.get("sesion_id", ""),
+                    tema=ultimo_estado.get("tema_actual", ""),
+                )
+            except Exception:
+                pass
         try:
             from core.agent.streaming import clear_token_sink
             clear_token_sink()

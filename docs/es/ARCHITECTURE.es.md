@@ -261,22 +261,33 @@ Memoria RAM
     └── historial de comandos
           │
           ▼
-     current.db
+  memoria.json (<BASE_AETHER>/db/, escrituras atómicas + .bak rotativo)
           │
-          ├── conversaciones
+          ├── core
+          ├── resumen {texto, ultimo_turno_id, actualizado}
+          ├── conversaciones {id, fecha, rol, texto, sesion_id, tema, proyecto}
           ├── comandos
-          ├── recuerdos
-          ├── core_memory
-          └── resumen_memoria
+          └── recuerdos
 ```
 
-`memory_manager.py` utiliza `~/Aether/db/current.db` como DB de producción. La estructura RAM se normaliza mediante `normalizar_mem()`.
+`memory_manager.py` persiste todo a través de `memoria_store.py`: un único store JSON con escritura atómica, backup y recuperación ante corrupción. La DB legacy (`current.db`, sqlite) se importa una sola vez al primer arranque y no se vuelve a tocar. La estructura RAM se normaliza mediante `normalizar_mem()`.
 
-El contexto conversacional no se inyecta sin límite: `settings.py` define presupuestos de turnos y caracteres. Para planes multi-tool, el historial conversacional puede recortarse a cero turnos para evitar contaminación entre pasos; los resultados de pasos anteriores constituyen el contexto operativo relevante.
+El contexto conversacional no se inyecta sin límite: `settings.py` define presupuestos de turnos y caracteres. Para planes multi-tool, el historial conversacional puede recortarse a cero turnos para evitar contaminación entre pasos; los resultados de pasos anteriores constituyen el contexto operativo relevante. Con tema, el historial se inyecta por tema/sesión; sin tema, los últimos N turnos por recencia.
 
-`consolidator.py` programa la actualización del resumen acumulativo después de completar una orden.
+Los turnos se registran al completar la inferencia (`node_finalize`), en orden cronológico real (usuario → asistente) y con `tema`/`sesion_id` en ambos, así el mensaje actual nunca se duplica entre historial y prompt.
 
-El repositorio también contiene un subsistema `core/memory/store/` destinado a controlar esquema, migraciones, snapshots, staging y escritura persistente.
+La consolidación del resumen acumulativo se agenda tras completar una orden (la v2 la movió a `memory_manager`; el viejo `consolidator.py` se eliminó). El consolidador:
+
+- llama al modelo con `think=false` y toma la salida tras el ÚLTIMO bloque
+  de thinking (aunque falte el tag de apertura): el razonamiento del modelo
+  nunca llega al resumen;
+- exige que la salida empiece con `RESUMEN CONSOLIDADO` — si no, se conserva
+  el resumen anterior y se reintenta más tarde;
+- avanza el cursor `ultimo_turno_id` al último turno consolidado: los mismos
+  turnos no se re-procesan;
+- guarda solo hechos verificables, decisiones y pendientes — sin perfil
+  psicológico ni estado de ánimo, sin log de eventos, sin duplicados, y lo
+  que dice el asistente nunca se registra como hechos del usuario.
 
 ## 11. MCP y extensibilidad
 
@@ -319,9 +330,6 @@ bin/aether
 run.py
     └── CLI/TUI
           └── core.services.graph_service
-
-jarvis_new.py
-    └── entrada alternativa al motor
 ```
 
 El launcher `bin/aether` soporta ejecución desde cualquier directorio y comandos como `task`, `doctor`, `cli`, `--version` y `--help`.

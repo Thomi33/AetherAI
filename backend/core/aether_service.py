@@ -224,6 +224,12 @@ class AetherService:
 
                 logger.debug("Cargando memoria desde BD...")
                 _AETHER_MEMORY = cargar_memoria()
+                # Sesión única por arranque del servicio (igual que la TUI):
+                # sin sesion_id, los turnos del backend quedan sin sesión y
+                # no aparecen en /sesiones ni en el historial por tema/sesión.
+                if not _AETHER_MEMORY.get("sesion_id"):
+                    import uuid
+                    _AETHER_MEMORY["sesion_id"] = uuid.uuid4().hex
 
                 # Índice de programas (best-effort: si falla no bloquea el arranque)
                 try:
@@ -401,6 +407,8 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
     # hilo_context-cancel_event, y el check ISP (ver abajo) lo lee.
     set_cancel_thread_event(_CANCEL_EVENT)
     writer = _QueueWriter(q)
+    ultimo_estado: dict[str, Any] = {}
+    llego_finalize = False
     try:
         from core.agent.graph_builder import get_graph
         from core.agent.graph_state import crear_estado_inicial
@@ -427,16 +435,16 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
 
         set_reasoning_sink(_sink_reasoning)
 
-        # NO registrar el turno del usuario aquí: si lo hacemos antes de correr
+        # NO registrar el turno del usuario acá: si lo hacemos antes de correr
         # el grafo, el context_manager lo verá en la memoria y lo incluirá en
-        # el contexto de conversación. El modelo vería el mensaje del usuario
-        # tanto en el historial como en el prompt actual, generando eco.
-        # El turno del usuario se registra al final (ver bloque finally).
+        # el contexto de conversación (eco). Ahora lo registra node_finalize
+        # —antes que la respuesta y con tema/sesión— al completarse la
+        # inferencia; el finally solo cubre los caminos sin finalize.
 
         grafo = get_graph()
         estado = crear_estado_inicial(orden, _AETHER_MEMORY, modo_autonomo=True,
                                       imagenes=imagenes)
-        ultimo_estado: dict[str, Any] = dict(estado)
+        ultimo_estado = dict(estado)
 
         with contextlib.redirect_stdout(writer):
             from core.agent.streaming import is_cancelled, InferenceCancelled
@@ -444,6 +452,8 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
                 for nodo, delta in update.items():
                     if isinstance(delta, dict):
                         ultimo_estado.update(delta)
+                    if nodo == "finalize":
+                        llego_finalize = True
                     q.put(NodeUpdateEvent(nodo=nodo, delta=delta or {}))
                     # Chequeo cooperativo de cancelación entre pasos: si el
                     # frontend cerró la conexión (Stop, cierre de pestaña,
@@ -458,7 +468,8 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
                         raise InferenceCancelled()
             writer.vaciar_residual()
 
-        respuesta = ultimo_estado.get("final_response") or "Operación completada."
+        from core.services.graph_service import respuesta_final_o_informe
+        respuesta = respuesta_final_o_informe(ultimo_estado)
         programar_consolidacion(_AETHER_MEMORY)
         q.put(DoneEvent(respuesta=respuesta, reasoning="".join(razonamiento_turno)))
 
@@ -476,14 +487,19 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
             clear_reasoning_sink()
         except Exception:
             pass
-        # Registrar el turno del usuario AHORA (después de que el grafo terminó).
-        # Así el context_manager no lo ve en el historial de la inferencia actual,
-        # evitando que el modelo eco el mensaje del usuario.
-        try:
-            from core.memory.memory_manager import registrar_turno
-            registrar_turno(_AETHER_MEMORY, "usuario", orden)
-        except Exception:
-            pass
+        # Fallback del turno del usuario: SOLO si el grafo no llegó a finalize
+        # (cancelación, error, END directo). Si llegó, node_finalize ya lo
+        # registró —antes que la respuesta y con tema/sesión—; no duplicar.
+        if not llego_finalize:
+            try:
+                from core.memory.memory_manager import registrar_turno
+                registrar_turno(
+                    _AETHER_MEMORY, "usuario", orden,
+                    sesion_id=_AETHER_MEMORY.get("sesion_id", ""),
+                    tema=ultimo_estado.get("tema_actual", ""),
+                )
+            except Exception:
+                pass
         # Estado final: COMPLETED / FAILED / CANCELLED según cómo terminó.
         try:
             if cancelled:

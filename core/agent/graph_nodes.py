@@ -794,7 +794,7 @@ def _resolver_referencia_anaforica(mem: dict, sesion_id: str = "") -> dict | Non
         if sesion_actual else turnos
     )
 
-    # Último turno de Aether (rol jarvis/asistente/aether), buscando hacia atrás.
+    # Último turno de Aether (rol aether/asistente/assistant, o jarvis legacy), buscando hacia atrás.
     # También capturamos el turno del USUARIO inmediatamente anterior: cuando el
     # turno de Aether es una OFERTA (ej. "¿Querés que lo busque?") el tema real
     # (el QUÉ buscar) suele estar en ese pedido previo del usuario, no en la
@@ -1699,6 +1699,7 @@ def node_agent_loop(state: AetherState) -> dict:
             forzar_cierre = forzar_cierre or tool
             continue
 
+        salida_nodo: dict = {}
         ok, motivo = validar_tool_call(tool, args)
         if not ok:
             print(f"   └─ ⚠️  [AGENT LOOP]: Sanity-check rechazó tool call '{tool}': {motivo}")
@@ -1749,6 +1750,12 @@ def node_agent_loop(state: AetherState) -> dict:
         # RECIENTES]) y se le agrega al mensaje de tool la guía para
         # cerrar en vez de reintentar.
         cls = _clasificar_resultado_tool(resultado)
+        # Un nodo puede marcar el fallo explícitamente (error_activo/shell_error)
+        # aunque su salida cruda no matchee los patrones de texto del clasificador
+        # (ej. stderr de zsh: 'head: cannot open ...'). Sin esto, pasos fallidos
+        # quedan como 'ok' y la respuesta final no informa los fallos.
+        if salida_nodo.get("error_activo") or salida_nodo.get("shell_error"):
+            cls = "error"
         if cls in ("sin_resultados", "error"):
             _registrar_intento_fallido(tool, args, resultado, cls)
             resultado = ((resultado or "") + "\n\n"
@@ -2510,10 +2517,22 @@ def node_shell(state: AetherState) -> dict:
 
     comando_explicito = _comando_explicito_del_paso(state)
 
+    # Agent loop (tool calling nativo): la tool call trae el comando EXACTO en
+    # args['instruccion'] (via _tool_args; lo setea node_agent_loop). Se ejecuta
+    # TAL CUAL: regenerarlo con el LLM interno -- cuyo prompt viene cargado con
+    # COMANDOS RECIENTES y [CONTEXTO DE PASOS PREVIOS] -- hacía que zsh corriera
+    # OTRA cosa (bug: args={'instruccion': 'ss -tupn'} → se ejecutaba un curl
+    # viejo del historial de memoria).
+    cmd_de_tool_call = str(((state.get("_tool_args") or {}).get("instruccion")) or "").strip()
+
     if comando_explicito:
         print(f"   └─ [SHELL]: Comando ya resuelto por el planner, sin pasar por LLM.")
         comando  = comando_explicito
         llm_resp = f"[SHELL]{comando_explicito}[/SHELL]"
+    elif cmd_de_tool_call:
+        print(f"   └─ [SHELL]: Comando exacto de la tool call, sin pasar por LLM.")
+        comando  = cmd_de_tool_call
+        llm_resp = f"[SHELL]{cmd_de_tool_call}[/SHELL]"
     else:
         # LLM interno: solo para generar el comando, no para responder al usuario
         # Always strip Ornith <think> before extracting the [SHELL] command.
@@ -3796,8 +3815,19 @@ def node_memory(state: AetherState) -> dict:
 
 def node_finalize(state: AetherState) -> dict:
     """
-    Registra SOLO la respuesta de Aether en DB y marca done=True.
-    NO registra el turno del usuario (ya lo hace procesar_orden_completo).
+    Registra el intercambio COMPLETO y marca done=True: PRIMERO el turno del
+    usuario y DESPUÉS la respuesta de Aether, ambos con tema_actual y sesion_id.
+
+    Registrar el usuario ACÁ (al final de la inferencia: el context_manager ya
+    corrió, así que no hay eco) arregla dos cosas:
+    - Orden: en el store queda usuario → respuesta (orden cronológico real;
+      antes la respuesta se guardaba primero y el usuario quedaba último).
+    - Historial por tema/sesión: el turno del usuario también lleva tema y
+      sesion_id, así el diálogo no se ve "a medias" en el contexto.
+
+    Los caminos que terminan SIN pasar por finalize (cancelación, errores,
+    END directo de error_confirm/error_fallback) quedan a cargo del fallback
+    de los bridges (tui/engine_bridge.py y backend/core/aether_service.py).
 
     Si final_response es None (tool no sintetizó), intentar construir
     una respuesta de fallback desde los datos disponibles en el estado.
@@ -3815,14 +3845,23 @@ def node_finalize(state: AetherState) -> dict:
             ""
         )
 
+    sesion_id = state.get("sesion_id", "")
+    tema = state.get("tema_actual", "")
+
+    # Turno del usuario ANTES que la respuesta (orden cronológico en el store)
+    # y con tema/sesión en AMBOS turnos.
+    registrar_turno(
+        mem, "usuario", state.get("orden", ""),
+        sesion_id=sesion_id, tema=tema,
+    )
+
     if respuesta:
         # Pasamos tema_actual (seteado por context_manager) para que
         # _resolver_referencia_anaforica pueda distinguir el tipo de
         # payload del turno anterior (shell vs web vs vision, etc).
         registrar_turno(
-            mem, "jarvis", respuesta,
-            sesion_id=state.get("sesion_id", ""),
-            tema=state.get("tema_actual", ""),
+            mem, "aether", respuesta,
+            sesion_id=sesion_id, tema=tema,
         )
 
     print(f"\n{'─'*50}")
@@ -4476,6 +4515,10 @@ def node_error_retry(state: AetherState) -> dict:
     archivo_cod  = state.get("_archivo_codigo", "/tmp/aether_code.py")
     mem          = state["mem"]
     orden        = state["orden"]
+    # (c) El comando que genera el diagnóstico NO reemplaza al original: el
+    # estado sigue registrando el comando PEDIDO; el fix queda identificado
+    # como tal (fix_propuesto) y la respuesta lo reporta explícitamente.
+    cmd_original = state.get("shell_command") or ""
 
     if not fix_propuesto:
         return {
@@ -4505,15 +4548,21 @@ def node_error_retry(state: AetherState) -> dict:
     else:
         cmd = fix_propuesto
         print(f"\n⚙️  [RETRY SHELL]: \033[1;33m{cmd}\033[0m")
+        if cmd_original and cmd_original != cmd:
+            print(f"   └─ (fix del diagnóstico; comando original pedido: {cmd_original})")
         salida, hubo_error = ejecutar_comando(cmd)
 
     print(f"\n{'─'*50}\n{salida}\n{'─'*50}")
     registrar_comando(mem, orden, cmd)
 
+    # Comando que queda en el estado tras el reintento: para shell, el
+    # ORIGINAL pedido (el fix del diagnóstico no lo reemplaza).
+    cmd_registrado = (cmd_original or cmd) if error_ctx == "shell" else cmd
+
     if hubo_error:
         print(f"\n❌ [RETRY]: Sigue fallando. Volviendo a diagnosticar...")
         return {
-            "shell_command":    cmd,
+            "shell_command":    cmd_registrado,
             "shell_output":     salida,
             "shell_error":      True,
             "error_activo":     True,
@@ -4528,8 +4577,11 @@ def node_error_retry(state: AetherState) -> dict:
         m = re.search(r'(\d+)', salida or "")
         if m:
             final_msg = f"Proceso lanzado en segundo plano. PID: {m.group(1)}"
+    if error_ctx == "shell" and cmd_original and cmd_original != cmd:
+        final_msg = (f"El comando original `{cmd_original}` falló; el diagnóstico "
+                     f"automático probó en su lugar `{cmd}`:\n{salida}")
     return {
-        "shell_command":  cmd,
+        "shell_command":  cmd_registrado,
         "shell_output":   salida,
         "shell_error":    False,
         "error_activo":   False,

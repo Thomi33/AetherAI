@@ -12,6 +12,30 @@ Función principal:
 from core.memory.memory_manager import registrar_turno, programar_consolidacion
 
 
+def respuesta_final_o_informe(resultado: dict) -> str:
+    """
+    Respuesta final del grafo con reemplazo honesto del texto genérico.
+
+    Si el modelo dejó texto final, se devuelve tal cual. Si cerró sin texto
+    (respuesta vacía) pero el agent loop ejecutó pasos de herramientas, en
+    vez de "Operación completada." se informa cuántos pasos fallaron
+    (clasificación 'error'/'sin_resultados' de agent_pasos_log).
+    """
+    final = ((resultado or {}).get("final_response") or "").strip()
+    if final:
+        return final
+
+    pasos = (resultado or {}).get("agent_pasos_log") or []
+    fallidos = sum(
+        1 for p in pasos
+        if isinstance(p, dict) and p.get("cls") in ("error", "sin_resultados")
+    )
+    if fallidos:
+        return (f"Operación incompleta: {fallidos} de {len(pasos)} paso(s) de "
+                f"herramientas fallaron. Podés pedirme reintentar los que fallaron.")
+    return "Operación completada."
+
+
 def procesar_orden_grafo(orden: str, mem: dict, modo_autonomo: bool = True,
                          imagenes: list[str] | None = None) -> str:
     """
@@ -38,4 +62,4 @@ def procesar_orden_grafo(orden: str, mem: dict, modo_autonomo: bool = True,
     # de invoke garantiza que el lote vea el intercambio completo y no añade
     # latencia al caller (API/CLI).
     programar_consolidacion(mem)
-    return resultado.get("final_response") or "Operación completada."
+    return respuesta_final_o_informe(resultado)

@@ -429,16 +429,51 @@ def listar_sesiones(limit: int = 15) -> list[dict]:
 MIN_TURNOS_PARA_CONSOLIDAR = 12
 COMPACTACION_MIN_CHARS = 12000
 
+# Marca con la que DEBE arrancar la salida del consolidador. Si el modelo no
+# la emite (p.ej. la "respuesta" quedó siendo puro razonamiento), se descarta
+# la salida y se conserva el resumen anterior.
+_MARCA_RESUMEN = "RESUMEN CONSOLIDADO"
+
+# Cierre del bloque de razonamiento de Ornith. Se construye por partes (mismo
+# criterio que _ThinkingStreamSplitter en core/agent/graph_nodes.py) para que
+# el marcador exacto quede visible y auditable en el diff.
+_THINK_CLOSE = "<" + "/think" + ">"
+
+
+def _extraer_salida_post_thinking(raw: str) -> str:
+    """
+    Se queda SOLO con el texto posterior al ÚLTIMO cierre de thinking.
+
+    Ornith razona en bloques inline; a veces el tag de APERTURA no llega en
+    la salida (el server lo consume) y queda razonamiento suelto terminado
+    en el tag de cierre. Quedarse con lo posterior al ÚLTIMO cierre descarta
+    todo el razonamiento y deja el contenido final, haya llegado o no el
+    tag de apertura.
+    """
+    texto = str(raw or "")
+    if _THINK_CLOSE in texto:
+        texto = texto.rsplit(_THINK_CLOSE, 1)[-1]
+    return texto.strip()
+
+
 _SYSTEM_PROMPT_CONSOLIDATOR = (
     "Sos el consolidador de memoria de Aether. Tu única salida es un resumen "
     "acumulativo actualizado — NO un log de conversación, NO una lista de "
     "turnos, NO explicaciones sobre lo que hiciste.\n\n"
+    "Formato de salida:\n"
+    f"- La salida EMPIEZA con la línea '{_MARCA_RESUMEN}', seguida del resumen.\n\n"
     "Reglas:\n"
     "- Reescribís el resumen COMPLETO cada vez, integrando lo nuevo relevante "
     "y descartando charla efímera, saludos, o información que ya quedó "
     "obsoleta (ej: un problema que ya se resolvió, un plan que cambió).\n"
-    "- Priorizá: hechos estables del usuario, proyectos activos y su estado, "
-    "preferencias técnicas, decisiones tomadas, problemas pendientes.\n"
+    "- Guardá SOLO hechos verificables (datos, preferencias, proyectos con "
+    "su estado), decisiones tomadas y pendientes.\n"
+    "- PROHIBIDO el perfil psicológico y el estado de ánimo del usuario: no "
+    "registres cómo se siente ni especulaciones sobre su personalidad.\n"
+    "- Sin log de eventos ni cronología de la conversación: no es una bitácora.\n"
+    "- Sin duplicados: cada dato figura UNA sola vez, en su versión más actual.\n"
+    "- Lo que dice el asistente (turnos [AETHER]) NO es un hecho del usuario: "
+    "solo consolidá como hechos lo que el usuario dijo, hizo o confirmó.\n"
     "- Nunca inventes datos que no estén en el resumen previo o los turnos "
     "nuevos.\n"
     "- Prosa organizada en secciones cortas si hace falta, sin relleno, en "
@@ -465,13 +500,15 @@ def consolidar_resumen(forzar: bool = False, min_turnos: int = MIN_TURNOS_PARA_C
     
     Retorna el nuevo resumen si se consolidó, None si no hizo falta.
     """
-    from core.config.settings import RUTA_NOTAS
-
     pendientes = obtener_turnos_pendientes_de_resumen()
+    if not pendientes:
+        return None
     if not forzar and (len(pendientes) < min_turnos):
         return None
 
-    resumen_previo = obtener_resumen()
+    # [RESUMEN PREVIO] va como TEXTO: obtener_resumen() es un dict
+    # {texto, ultimo_turno_id, actualizado} y antes se inyectaba entero.
+    resumen_previo = obtener_resumen().get("texto", "") or ""
     prompt = f"{_SYSTEM_PROMPT_CONSOLIDATOR}\n\n[RESUMEN PREVIO]:\n{resumen_previo or '(vacío)'} \n\n[TURNOS NUEVOS]:\n{_bloque_turnos(pendientes)}"
 
     from core.config.settings import OLLAMA_HOST, MODELO, NUM_CTX
@@ -481,6 +518,10 @@ def consolidar_resumen(forzar: bool = False, min_turnos: int = MIN_TURNOS_PARA_C
         "model": MODELO,
         "prompt": prompt,
         "stream": False,
+        # Ornith es thinking: sin think=False el razonamiento llega inline en
+        # "response" y contamina el resumen (el parseo de abajo es la red de
+        # seguridad para cuando el server no soporta/respeta el flag).
+        "think": False,
         "options": {"temperature": 0.3, "num_ctx": NUM_CTX},
         "keep_alive": "10m",
     }
@@ -500,13 +541,27 @@ def consolidar_resumen(forzar: bool = False, min_turnos: int = MIN_TURNOS_PARA_C
         print(f"[MEMORIA] Error del modelo consolidando: {data['error']}")
         return None
 
-    nuevo_resumen = data.get("response", "").strip()
+    # 1) El modelo puede razonar antes de contestar: quedarse SOLO con el
+    #    texto posterior al ÚLTIMO cierre de thinking (falte o no el de apertura).
+    nuevo_resumen = _extraer_salida_post_thinking(data.get("response", ""))
     if not nuevo_resumen:
         print("[MEMORIA] Resumen vacío devuelto por el modelo")
         return None
 
-    guardar_resumen(nuevo_resumen)
-    print(f"[MEMORIA] Resumen consolidado ({len(pendientes)} turnos integrados)")
+    # 2) Sanity check de formato: sin la marca, la salida no es un resumen
+    #    (quedó siendo razonamiento o charla) → conservar el anterior y no
+    #    avanzar el cursor, para reintentar en la próxima consolidación.
+    if not nuevo_resumen.startswith(_MARCA_RESUMEN):
+        print(f"[MEMORIA] ⚠️  Salida del consolidador inválida (no empieza con "
+              f"'{_MARCA_RESUMEN}'); se conserva el resumen anterior")
+        return None
+
+    # 3) Avanzar el cursor de consolidación al último turno integrado: sin
+    #    esto la próxima corrida re-procesa los mismos turnos para siempre.
+    ultimo_id = int(pendientes[-1].get("id") or 0)
+    guardar_resumen(nuevo_resumen, ultimo_turno_id=ultimo_id)
+    print(f"[MEMORIA] Resumen consolidado ({len(pendientes)} turnos integrados, "
+          f"hasta turno #{ultimo_id})")
     return nuevo_resumen
 
 

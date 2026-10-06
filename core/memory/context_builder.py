@@ -9,7 +9,7 @@ Slots:
     [SISTEMA]         — core_memory (siempre presente)
     [RECUERDOS]       — hechos permanentes relevantes al tema
     [INTENTOS RECIENTES] — acciones que ya se probaron y NO dieron resultado
-    [CONVERSACIÓN]    — solo turnos del tema actual (no todo el historial)
+    [CONVERSACIÓN]    — turnos del tema actual; sin tema, los últimos N por recencia
     [COMANDOS]        — últimos comandos ejecutados (solo si aplica)
 
 Context Dump:
@@ -122,7 +122,8 @@ def construir_contexto_memoria(
     Args:
         mem:  dict RAM de Aether (cargado por memory_manager)
         tema: intención detectada por el planner ("web", "shell", "chat", etc.)
-              Si está vacío, solo inyecta core_memory y recuerdos importantes.
+              Si está vacío, el historial entra por recencia (últimos N turnos
+              sin filtro de tema) además de core_memory y recuerdos.
         es_multitool: True si el plan activo tiene más de 1 paso. Fuerza
               MAX_TURNOS_CONTEXTO_PLAN (ventana adaptativa, ver arriba).
         orden: pedido original del usuario. Matchea los intentos fallidos
@@ -216,13 +217,19 @@ def construir_contexto_memoria(
             "reportá que no hay resultados y cerrá ahí.\n" + intentos
         )
 
-    # ── Slot 3: CONVERSACIÓN filtrada por tema ────────────────────────
+    # ── Slot 3: CONVERSACIÓN ───────────────────────────────────────────
+    # Con tema: solo turnos de ese tema (y sesión, si se sabe). SIN tema no
+    # hay criterio de relevancia → últimos N turnos por recencia, sin
+    # importar con qué tema se hayan guardado.
     turnos_relevantes = []
 
-    if tema and limite_turnos > 0:
-        turnos_relevantes = obtener_turnos_por_tema(
-            tema, sesion_id=sesion_id, limit=limite_turnos
-        )
+    if limite_turnos > 0:
+        if tema:
+            turnos_relevantes = obtener_turnos_por_tema(
+                tema, sesion_id=sesion_id, limit=limite_turnos
+            )
+        else:
+            turnos_relevantes = obtener_ultimos_turnos(limite_turnos)
 
     if not turnos_relevantes and limite_turnos > 0:
         # Usar sesion_id explícito, o fallback al último de la RAM

@@ -350,26 +350,45 @@ RAM memory
     └── command history
           │
           ▼
-     current.db
+  memoria.json (<BASE_AETHER>/db/, atomic writes + rotating .bak)
           │
-          ├── conversations
-          ├── commands
-          ├── memories
-          ├── core_memory
-          └── summary_memory
+          ├── core
+          ├── resumen {texto, ultimo_turno_id, actualizado}
+          ├── conversaciones {id, fecha, rol, texto, sesion_id, tema, proyecto}
+          ├── comandos
+          └── recuerdos
 ```
 
-`memory_manager.py` uses `~/Aether/db/current.db` as the production DB. The
+`memory_manager.py` persists everything through `memoria_store.py`: a single
+atomic JSON store with backup and corruption recovery. The legacy sqlite DB
+(`current.db`) is imported once on first boot, then never touched again. The
 RAM structure is normalized through `normalizar_mem()`.
 
 Conversational context is not injected without limits: `settings.py` defines
 per-turn and character budgets. For multi-tool plans, conversational history
 can be trimmed to zero turns to avoid contamination between steps; previous
-step results are the relevant operating context.
+step results are the relevant operating context. With a topic, history is
+injected per topic/session; without one, the last N turns by recency.
+
+Turns are registered when the inference completes (`node_finalize`), in real
+chronological order (user → assistant) and with `tema`/`sesion_id` on both
+turns, so the current message is never duplicated between history and
+prompt.
 
 Consolidation of the accumulated summary is scheduled after completing an
 order (v2 moved this into `memory_manager`; the old `consolidator.py` was
-removed).
+removed). The consolidator:
+
+- calls the model with `think=false` and takes the output after the LAST
+  thinking block (even when the opening tag is missing), so the model's
+  reasoning never reaches the summary;
+- requires the output to start with `RESUMEN CONSOLIDADO` — otherwise the
+  previous summary is kept and consolidation is retried later;
+- advances the `ultimo_turno_id` cursor to the last consolidated turn, so
+  the same turns are never re-processed;
+- stores only verifiable facts, decisions and pending items — no
+  psychological profile or mood, no event log, no duplicates, and nothing
+  the assistant said is ever recorded as a user fact.
 
 ### Shared central memory (v2: SQLite)
 
@@ -477,7 +496,7 @@ AetherAI/
 ├── core/
 │   ├── agent/                   # graph, state, planner, loop, registry
 │   ├── config/                  # two-layer config and directory authorization
-│   ├── memory/                  # memory + SQLite stores (session + central v2)
+│   ├── memory/                  # memory: JSON session store + SQLite central v2
 │   ├── parser/                  # shell/response parsing
 │   ├── services/                # compatible facades/services
 │   ├── skills/                  # reusable behavior

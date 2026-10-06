@@ -57,7 +57,7 @@ chmod +x install.sh
 5. Preparar el entorno virtual de Aether.
 6. Instalar/verificar Ollama cuando corresponde.
 7. Descargar el modelo seleccionado, con tu autorización.
-8. Configurar memoria, SQLite y los parámetros de ejecución.
+8. Configurar la memoria (store JSON) y los parámetros de ejecución.
 9. Instalar el comando global `aether` en `~/.local/bin` y dejarlo disponible en
    el `PATH`.
 10. Ejecutar una validación final del entorno y del modelo.
@@ -237,32 +237,48 @@ VRAM, cuantización y modelo elegido.
 
 ## Memoria y datos
 
-Aether mantiene memoria temporal en RAM y persistente mediante el subsistema
-controlado de [`core/memory/store`](./core/memory/store):
+Aether mantiene memoria temporal en RAM y persistente en un **store JSON
+único**: `<BASE_AETHER>/db/memoria.json` (default `~/Aether/db/memoria.json`),
+manejado por [`core/memory/memoria_store.py`](./core/memory/memoria_store.py):
 
-- Producción: `$AETHER_DATA_DIR/db/current.db`.
-- Pruebas: `$AETHER_DATA_DIR/db/staging.db`.
-- Snapshots: `$AETHER_DATA_DIR/db/snapshots/`.
-- Backups: `$AETHER_DATA_DIR/db/backups/`.
+- Escritura **atómica** (tmp + rename) y backup rotativo `memoria.json.bak`:
+  un corte a mitad de camino nunca deja el archivo roto.
+- Recuperación ante corrupción: restaura desde `.bak`; si ambos fallan, el
+  archivo dañado se aparta (`memoria.corrupt-<ts>.json`) y se arranca vacío.
+- Guarda `core` (estado siempre presente), `resumen` (rolling summary con su
+  cursor `ultimo_turno_id`), `conversaciones`, `comandos` y `recuerdos`, con
+  techos de tamaño para que el archivo no crezca sin control.
+- Migración one-shot: si `memoria.json` no existe y queda la DB legacy
+  (`current.db`, sqlite), se importa todo una sola vez y el formato viejo no
+  se vuelve a tocar.
 
-Las escrituras pasan por `MemoryStore`, migraciones versionadas y un guard de
-integridad. La base `memoria.db` que estaba en la raíz era un artefacto legacy
-sin uso por el runtime actual; fue conservada fuera del árbol principal en
-`_legacy/data/` junto con el dump antiguo para no perder datos históricos.
+El **resumen acumulativo** es la fuente principal de memoria de largo plazo.
+Se re-consolida con los turnos nuevos al completar una orden
+(`consolidar_resumen()` en `core/memory/memory_manager.py`):
 
-Durante inferencias largas, el resumen consolidado también se guarda en
-`notes/contexto_importante.md` antes de compactar el contexto. Así los datos
-importantes sobreviven aunque el prompt se reduzca. Durante el onboarding, el
-instalador pregunta si Aether debe tener su propia carpeta. Si elegís que no,
-usa `<proyecto>/.aether-data/` para la base y sus notas.
+- El modelo se llama con `think=false` y la salida se toma tras el último
+  bloque de thinking: el razonamiento del modelo nunca llega al resumen.
+- El resumen debe empezar con `RESUMEN CONSOLIDADO`; si el modelo no cumplió
+  el formato, se conserva el resumen anterior y se reintenta después.
+- `ultimo_turno_id` avanza al último turno consolidado: los mismos turnos no
+  se re-procesan.
+- Solo guarda hechos verificables, decisiones y pendientes — sin perfil
+  psicológico ni estado de ánimo, sin log de eventos, sin duplicados, y lo
+  que dice el asistente nunca se registra como hechos del usuario.
+
+Los **turnos** se registran al completar la inferencia, en orden cronológico
+real (usuario → respuesta) y con `tema` y `sesion_id` en ambos, así el
+mensaje actual no se duplica entre historial y prompt. El context builder
+inyecta el historial filtrado por tema/sesión y, cuando no hay tema, los
+últimos N turnos por recencia.
 
 ### Memoria central compartida
 
-Además del almacenamiento de sesión anterior, Aether tiene una **memoria
-central compartida** en JSON (`core/memory/central/`) que vive fuera de
+Además del store de sesión anterior, Aether tiene una **memoria central
+compartida** en SQLite (`core/memory/central_store_v2.py`) que vive fuera de
 cualquier runtime (default `~/.aether/memory/`, override con
 `AETHER_CENTRAL_MEMORY_PATH`) y es la misma para todos: terminal, Web UI,
-Roblox Player y futuros runtimes. Tiene tres capas:
+Roblox Player y futuros runtimes. Tiene cuatro capas:
 
 - **Conversación**: contexto temporal por sesión, compactable.
 - **Usuario**: hechos estables del usuario; `user_set()` nunca sobrescribe
@@ -297,7 +313,7 @@ refuerza memorias — solo el uso real lo hace).
 ├── core/
 │   ├── agent/                # Grafo, planner, loop y tools
 │   ├── config/               # Configuración y autorización de directorios
-│   ├── memory/               # Memoria, compactación y SQLite
+│   ├── memory/               # Memoria: store JSON, central SQLite y compactación
 │   ├── services/             # Entrada única al grafo
 │   └── tools/                # Shell, web, visión y filesystem
 ├── tui/                      # Interfaz Textual y estados
