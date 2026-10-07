@@ -1,0 +1,19 @@
+# REGLA DE ACTUALIZACIÓN CONTEXTUAL OBLIGATORIA
+Cada vez que el usuario te pida realizar una modificación en el proyecto, debes evaluar si dicha tarea altera la arquitectura o la estructura del repositorio.
+
+1. CRITERIOS DE CAMBIO ARQUITECTÓNICO:
+   - Creación, eliminación o renombrado de directorios o archivos clave (ej. en core/agent/, core/tools/, core/memory/, etc.).
+   - Modificación de dependencias globales (requirements.txt).
+   - Alteración de los flujos del grafo de LangGraph (START -> planner -> agent_loop...).
+   - Cambios en los contratos de datos o bases de datos de SQLite.
+
+2. ACCIÓN OBLIGATORIA:
+   - Si se cumple algún criterio, tu ÚLTIMO paso antes de dar la tarea por finalizada DEBE ser editar el archivo `ai_map.md`.
+   - Modifica las secciones correspondientes (Metadata, Directory Tree, Core Constraints) para reflejar con precisión el nuevo estado del sistema.
+   - Incrementa la versión semántica (SemVer) en la sección de metadatos si hay cambios mayores.
+
+
+3 .COMENTARIOS:
+   - No te fies de la suite de test por mas bien programada que este, reproduce manualmente el error reportado para un mejor resultado 
+   - Cada cambio (un fix, un feature, una alineacion, etc), manda un resumen detallado de lo que se hizo al canal de discord por mcp 
+   - Tienes prohibido ejecutar comandos destructivos (rm -rf) o vaciar archivos de código fuente sin confirmación explícita del usuario. Pregunta antes de borrar algo

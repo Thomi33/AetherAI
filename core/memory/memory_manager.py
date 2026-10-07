@@ -73,6 +73,7 @@ def _memoria_vacia() -> dict:
         "flatpaks":          {},
         "conversacion":       [],   # [{rol, texto, fecha, sesion_id, tema}]
         "historial_comandos": [],   # [{orden, cmd, fecha, sesion_id}]
+        "resultados_tools":   [],   # [{tool, args, resultado, fecha, sesion_id}] (RAM, por sesión)
         "core":               {},   # espejo de core
         "resumen":            "",   # espejo de resumen.texto
         "sesion_id":          "",
@@ -103,6 +104,8 @@ def normalizar_mem(mem: dict | None) -> dict:
         mem["conversacion"] = []
     if not isinstance(mem.get("historial_comandos"), list):
         mem["historial_comandos"] = []
+    if not isinstance(mem.get("resultados_tools"), list):
+        mem["resultados_tools"] = []
     if not isinstance(mem.get("core"), dict):
         mem["core"] = {}
     if "sesion_id" not in mem:
@@ -273,6 +276,72 @@ def registrar_comando(
         "orden": orden, "cmd": cmd, "fecha": fecha, "sesion_id": sesion_id,
     })
     mem["historial_comandos"] = mem["historial_comandos"][-50:]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# RESULTADOS DE TOOLS (RAM, por sesión — para turnos follow-up)
+# ══════════════════════════════════════════════════════════════════════
+def registrar_resultado_tool(
+    mem: dict,
+    tool: str,
+    args,
+    resultado,
+    sesion_id: str = "",
+) -> None:
+    """
+    Conserva en el dict RAM la salida de una tool ejecutada, para que los
+    turnos follow-up ("dame una síntesis de lo que encontraste", "qué
+    encontraste") tengan los DATOS REALES en contexto y no alucinen.
+
+    Fix del bug "síntesis inventada": antes las salidas morían con el estado
+    del grafo al cerrar el turno y el modelo rellenaba el hueco con IPs,
+    puertos y procesos inventados. Solo vive en RAM (por sesión); no se
+    persiste al store JSON — la sesión lo mantiene vivo el servicio/TUI.
+    """
+    try:
+        if not isinstance(mem, dict):
+            return
+        lista = mem.get("resultados_tools")
+        if not isinstance(lista, list):
+            lista = []
+            mem["resultados_tools"] = lista
+        from core.config.settings import MAX_RESULTADOS_TOOLS_RAM
+        lista.append({
+            "tool": str(tool or "?"),
+            "args": str(args or "")[:300],
+            "resultado": str(resultado or "")[:6000],
+            "fecha": datetime.now().isoformat(timespec="seconds"),
+            "sesion_id": str(sesion_id or ""),
+        })
+        limite = int(MAX_RESULTADOS_TOOLS_RAM)
+        if limite > 0 and len(lista) > limite:
+            del lista[:-limite]
+    except Exception as e:
+        print(f"[MEMORIA] Error registrando resultado de tool: {e}")
+
+
+def obtener_resultados_tools(
+    mem: dict,
+    sesion_id: str = "",
+    limit: int | None = None,
+) -> list[dict]:
+    """
+    Últimos resultados de tools de la SESIÓN indicada (los más recientes al
+    final). Si se pasa sesion_id y no hay resultados de esa sesión, devuelve
+    [] (aislamiento: no se mezclan sesiones).
+    """
+    if not isinstance(mem, dict):
+        return []
+    lista = mem.get("resultados_tools")
+    if not isinstance(lista, list):
+        return []
+    if sesion_id:
+        lista = [r for r in lista
+                 if isinstance(r, dict) and r.get("sesion_id") == sesion_id]
+    lista = [r for r in lista if isinstance(r, dict)]
+    if limit and limit > 0:
+        lista = lista[-limit:]
+    return lista
 
 
 # ══════════════════════════════════════════════════════════════════════

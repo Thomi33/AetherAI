@@ -60,6 +60,9 @@ class AetherState(TypedDict):
                                    # (seteado por node_agent_loop; ver
                                    # _args_del_paso en graph_nodes.py)
 
+    # ── Net audit (tool de red read-only, ver core/tools/net_audit.py) ──
+    net_audit_result: str        # JSON estructurado de la auditoría de red
+
     # ── Computer use (loop percepción-acción) ───────────────────────
     computer_use_log:    list[dict]  # pasos ejecutados [{paso, accion, error}, ...]
     computer_use_result: str         # resumen en texto para plan_synthesizer
@@ -159,6 +162,7 @@ def crear_estado_inicial(orden: str, mem: dict, modo_autonomo: bool = True,
         "mcp_result":       "",
         "vision_result":    "",
         "fs_result":        "",
+        "net_audit_result": "",
         "_tool_args":       {},
         "computer_use_log":    [],
         "computer_use_result": "",

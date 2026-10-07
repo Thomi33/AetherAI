@@ -12,14 +12,47 @@ Función principal:
 from core.memory.memory_manager import registrar_turno, programar_consolidacion
 
 
+def _detalle_pasos_fallidos(pasos: list) -> str:
+    """
+    Detalle legible de los pasos fallidos de agent_pasos_log: qué paso, qué
+    tool, qué comando/query pedía y el error (primera línea).
+
+    Fix del mensaje genérico "Operación incompleta: 1 de 6 paso(s) de
+    herramientas fallaron": no decía QUÉ falló, así que el usuario (y el
+    modelo en el turno siguiente) no podía saber si la conclusión estaba
+    afectada.
+    """
+    lineas: list[str] = []
+    for i, p in enumerate(pasos):
+        if not isinstance(p, dict) or p.get("cls") not in ("error", "sin_resultados"):
+            continue
+        tool = str(p.get("tool") or "?")
+        args = p.get("args") if isinstance(p.get("args"), dict) else {}
+        comando = ""
+        for clave in ("instruccion", "command", "query", "url", "path"):
+            val = args.get(clave)
+            if isinstance(val, str) and val.strip():
+                comando = val.strip()
+                break
+        resultado = str(p.get("resultado") or "").strip()
+        primera = resultado.splitlines()[0][:150] if resultado else "(sin salida)"
+        linea = f"- Paso {i + 1} (tool: {tool}"
+        if comando:
+            linea += f", pedido: «{comando[:80]}»"
+        linea += f"): {primera}"
+        lineas.append(linea)
+    return "\n".join(lineas)
+
+
 def respuesta_final_o_informe(resultado: dict) -> str:
     """
     Respuesta final del grafo con reemplazo honesto del texto genérico.
 
     Si el modelo dejó texto final, se devuelve tal cual. Si cerró sin texto
     (respuesta vacía) pero el agent loop ejecutó pasos de herramientas, en
-    vez de "Operación completada." se informa cuántos pasos fallaron
-    (clasificación 'error'/'sin_resultados' de agent_pasos_log).
+    vez de "Operación completada." se informa qué pasos fallaron
+    (clasificación 'error'/'sin_resultados' de agent_pasos_log), CON el
+    detalle de cada uno y el impacto en la conclusión.
     """
     final = ((resultado or {}).get("final_response") or "").strip()
     if final:
@@ -31,8 +64,14 @@ def respuesta_final_o_informe(resultado: dict) -> str:
         if isinstance(p, dict) and p.get("cls") in ("error", "sin_resultados")
     )
     if fallidos:
-        return (f"Operación incompleta: {fallidos} de {len(pasos)} paso(s) de "
-                f"herramientas fallaron. Podés pedirme reintentar los que fallaron.")
+        detalle = _detalle_pasos_fallidos(pasos)
+        return (
+            f"Operación incompleta: {fallidos} de {len(pasos)} paso(s) de "
+            f"herramientas fallaron:\n{detalle}\n\n"
+            f"La conclusión puede estar afectada por {fallidos} paso(s) "
+            f"fallido(s) — no todos los datos pudieron obtenerse. Podés "
+            f"pedirme reintentar solo los que fallaron."
+        )
     return "Operación completada."
 
 

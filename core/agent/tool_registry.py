@@ -116,6 +116,20 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "instruccion_requerida": True,
         "descripcion": "Gestionar la memoria del agente (ver, borrar, recordar).",
     },
+    "net_audit": {
+        "node": "node_net_audit",
+        "instruccion_requerida": False,  # releva la red completa sin args
+        "descripcion": (
+            "Auditoría de red SOLO LECTURA: conexiones establecidas "
+            "(con clase loopback/LAN/externa), puertos en escucha (expuestos "
+            "vs. loopback), intentos fallidos de SSH, últimos logins y mtime "
+            "de ~/.ssh/authorized_keys. Devuelve JSON estructurado que SOLO "
+            "hay que resumir. Usala ANTES que shell/netstat ante pedidos de "
+            "'revisar mi tráfico de red', 'mirá mis conexiones', 'chequeá si "
+            "hay algo sospechoso', 'qué puertos están abiertos'. No usa sudo "
+            "ni modifica nada."
+        ),
+    },
     "file_write": {
     "node": "node_file_write",
     "instruccion_requerida": False,  # puede inferir contenido de plan_resultados
@@ -258,6 +272,11 @@ TOOL_PARAMETROS: dict[str, dict] = {
             "instruccion": {"type": "string", "description": "Qué operación de memoria realizar (ver, borrar, recordar)."},
         },
         "required": ["instruccion"],
+    },
+    "net_audit": {
+        "type": "object",
+        "properties": {},
+        "required": [],
     },
     "file_write": {
         "type": "object",

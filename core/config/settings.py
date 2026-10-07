@@ -96,7 +96,7 @@ RUTA_NOTAS.mkdir(parents=True, exist_ok=True)
 # A diferencia de BASE_AETHER (datos de runtime, fuera del repo: ~/Aether),
 # las skills son comportamiento del agente -- viven DENTRO del proyecto para
 # versionarse junto al código.
-RUTA_SKILLS  = PROJECT_ROOT / "skills"
+RUTA_SKILLS  = BASE_AETHER / "skills"
 
 # ─────────────────────────────────────────────────────────────────────
 # 📁 CARPETA DE TRABAJO (feature: Aether trabaja sobre la ruta desde la
@@ -162,6 +162,83 @@ MAX_TURNOS_CONTEXTO_PLAN = _config_value("MAX_TURNOS_CONTEXTO_PLAN", 0)
 # ventana chica da contexto reciente sin arrastrar tareas viejas (anti-
 # contaminación del chat). 0 = sin historial (no recomendado para chat).
 MAX_TURNOS_CONTEXTO_CHAT = _config_value("MAX_TURNOS_CONTEXTO_CHAT", 10)
+
+# ─────────────────────────────────────────────────────────────────────
+# 🛡️  ANTI-ALUCINACIÓN / SALIDAS DE TOOLS (fix "síntesis inventada")
+# ─────────────────────────────────────────────────────────────────────
+# Bug real (sesión de seguridad): el usuario pidió "revisá mi tráfico de red"
+# (netstat vía shell) y luego "dame una síntesis de lo que encontraste". Las
+# salidas de las tools morían con el estado del grafo al cerrar el turno, así
+# que el modelo no tenía NADA de los datos reales e inventó una intrusión
+# completa (IPs, puertos, procesos). Estos valores acotan las salidas que se
+# conservan e inyectan, y las que devuelve la shell.
+
+# Tope de la salida cruda de la tool shell (líneas). Comandos tipo
+# `netstat -an` sin filtro vuelcan miles de líneas y arruinan el contexto.
+MAX_LINEAS_SALIDA_TOOL = _config_value("MAX_LINEAS_SALIDA_TOOL", 150)
+
+# Tope en KB de la salida cruda de la tool shell (defensa para salidas con
+# líneas larguísimas, ej. JSON minificado o binario decodificado).
+MAX_KB_SALIDA_TOOL = _config_value("MAX_KB_SALIDA_TOOL", 16)
+
+# Cuántos resultados de tools (de la sesión actual) se conservan en el dict
+# RAM `mem["resultados_tools"]` para los turnos follow-up ("qué encontraste",
+# "resumime", etc.).
+MAX_RESULTADOS_TOOLS_RAM = _config_value("MAX_RESULTADOS_TOOLS_RAM", 20)
+
+# Cuántos de esos resultados se inyectan en el contexto de un turno normal
+# (no multi-tool) y con cuántas líneas cada uno (verbatim + aviso de truncado).
+MAX_RESULTADOS_TOOLS_CONTEXTO = _config_value("MAX_RESULTADOS_TOOLS_CONTEXTO", 5)
+MAX_LINEAS_RESULTADO_TOOL = _config_value("MAX_LINEAS_RESULTADO_TOOL", 40)
+
+# Allowlist de dominios para cualquier curl/wget/http QUE EL AGENTE EJECUTE O
+# SUGIERA (bug real: el modelo inventó un `curl` a api.threatconnect.com).
+# Todo dominio fuera de esta lista se rechaza con aviso. Se permite el dominio
+# exacto y sus subdominios. Configurable desde config.json.
+ALLOWLIST_DOMINIOS_RED = _config_value("ALLOWLIST_DOMINIOS_RED", [
+    "localhost",
+    "127.0.0.1",
+    "::1",
+    "api.github.com",
+    "github.com",
+    "raw.githubusercontent.com",
+    "objects.githubusercontent.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "ollama.com",
+    "huggingface.co",
+    "archlinux.org",
+])
+
+# ── Veredicto determinista de la auditoría de red (core/tools/net_audit.py) ──
+# Umbral de intentos SSH fallidos para elevar el hallazgo a severidad alta
+# (veredicto "alerta"). Por debajo (y mayor que cero) es un hallazgo info.
+UMBRAL_FALLOS_SSH_ALERTA = _config_value("UMBRAL_FALLOS_SSH_ALERTA", 10)
+
+# Puertos en escucha expuestos (0.0.0.0/::) considerados ESPERADOS en una
+# máquina normal: no generan hallazgo. Cualquier otro puerto expuesto genera
+# un hallazgo de severidad media (veredicto "revisar").
+PUERTOS_ESCUCHA_ESPERADOS = _config_value("PUERTOS_ESCUCHA_ESPERADOS", [
+    "22",    # sshd
+    "68",    # DHCP client (dhcpcd/dhcpcd6)
+    "80",    # http
+    "443",   # https
+    "5353",  # mDNS (avahi)
+])
+
+# Puertos REMOTOS considerados estándar en conexiones externas (DNS, web,
+# NTP). Una conexión externa a un puerto fuera de esta lista y SIN proceso
+# identificable es un hallazgo de severidad alta (veredicto "alerta").
+PUERTOS_EXTERNOS_ESTANDAR = _config_value("PUERTOS_EXTERNOS_ESTANDAR", [
+    "53",    # DNS
+    "80",    # http
+    "123",   # NTP
+    "443",   # https
+])
+
+# Si ~/.ssh/authorized_keys fue modificado dentro de esta cantidad de días,
+# es un hallazgo de severidad media (veredicto "revisar").
+UMBRAL_DIAS_AUTHORIZED_KEYS = _config_value("UMBRAL_DIAS_AUTHORIZED_KEYS", 7)
 
 
 # ─────────────────────────────────────────────────────────────────────
