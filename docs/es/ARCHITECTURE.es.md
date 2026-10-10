@@ -398,3 +398,46 @@ Este documento se contrastó directamente con los componentes principales de `ma
 - `core/memory/memory_manager.py`
 - `core/tools/*`
 - `README.md`
+
+## 19. Modelos aprobados y pipeline multimodal (2026-10, v1.5)
+
+### Modelos aprobados (evaluados oficialmente)
+
+**Ornith** (`ornith-1.5:9b`) y **Granite**
+(`hf.co/ibm-granite/granite-4.2-8b-GGUF:Q6_K`) aprobaron las evaluaciones del
+mantenedor y figuran como modelos compatibles con Aether. Granite registra una
+**limitación de autonomía** (en tareas agénticas largas puede detenerse antes
+de completar y requerir intervención manual) que NO afecta su aprobación:
+compatibilidad funcional y autonomía sostenida son dimensiones distintas, y la
+causa no está atribuida (modelo, runtime o gestión de contexto). Detalle
+completo con capacidades medidas (`ollama show`), hardware registrado y la
+propuesta de mecanismos de recuperación (NO implementada):
+[`MODELOS.es.md`](./MODELOS.es.md) · [EN](../MODELOS.md). El instalador
+(`installer/install-core.sh`) ofrece ambos, detecta los ya instalados y
+mantiene la opción de modelo personalizado.
+
+### Matriz de capacidades por modelo
+
+`core/config/capabilities.py` es la fuente única de verdad de qué puede hacer
+Aether con cada modelo: capacidades DECLARADAS por Ollama
+(`capacidades_modelo()` → `/api/show`: vision/tools/thinking/embedding/audio,
+con fallback `projector_info`) vs capacidades EFECTIVAS
+(`funciones_disponibles()`: declaradas + entorno — ffmpeg / faster-whisper /
+grim — + config MODELO/MODELO_VISION). Los wrappers delegan
+(`attachments.modelo_admite_imagenes`, `aether_service._modelo_con_reasoning`);
+el `reasoning` del SSE `start` sale de las capacidades reales de Ollama, con el
+heurístico por nombre solo como fallback. Regla R19 de `ai_map.md`.
+
+### Pipeline de video multimodal
+
+Los adjuntos de video se analizan visualmente: `_extraer_frames_video` extrae
+N frames equiespaciados UNA vez (persisten en `<video>.frames/` y se reusan
+para captions, inline y turnos futuros; presupuesto ffmpeg 30 s; config
+`VIDEO_FRAMES`, default 4, tope 8). `componer_orden` embebe los captions con
+timestamps junto a la transcripción (faster-whisper, decodificada vía
+ffmpeg→ndarray — PyAV nunca se usa en runtime). Los modelos text-only reciben
+captions vía `MODELO_VISION`; los multimodales, los frames inline dentro del
+presupuesto compartido de 4 imágenes (las imágenes del usuario van primero).
+La tool `vision` del grafo también analiza videos por frames. El texto
+extraído/transcripciones se persisten como sidecar (`<archivo>.txt`) para que
+el flujo upload→path de la Web UI los recupere.

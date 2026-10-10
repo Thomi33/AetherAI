@@ -13,6 +13,7 @@ externos. El modelo corre en tu máquina mediante Ollama.
 - [Instalación](#instalación)
 - [Uso](#uso)
 - [Cómo funciona](#cómo-funciona)
+- [Modelos aprobados](#modelos-aprobados)
 - [Herramientas](#herramientas)
 - [Configuración y rendimiento](#configuración-y-rendimiento)
 - [Memoria y datos](#memoria-y-datos)
@@ -52,7 +53,9 @@ chmod +x install.sh
 
 1. Detectar CPU, RAM, VRAM y espacio disponible.
 2. Elegir el tier de hardware (`POTATO`, `LOW`, `MID`, `HIGH` o `ULTRA`).
-3. Seleccionar el modelo y los parámetros apropiados para tu equipo.
+3. Elegir el modelo primario (los aprobados **Ornith** y **Granite**, el
+   recomendado por tu hardware, o uno personalizado de Ollama) y los
+   parámetros apropiados para tu equipo.
 4. Instalar las dependencias Python del core de Aether.
 5. Preparar el entorno virtual de Aether.
 6. Instalar/verificar Ollama cuando corresponde.
@@ -80,6 +83,28 @@ límite de `65536`.
 
 La visión usa el mismo modelo principal configurado cuando ese modelo soporta
 entrada multimodal; no se descarga un segundo modelo de visión.
+
+## Modelos aprobados
+
+**Ornith** (`ornith-1.5:9b`) y **Granite**
+(`hf.co/ibm-granite/granite-4.2-8b-GGUF:Q6_K`) aprobaron las evaluaciones
+oficiales del mantenedor y figuran como modelos compatibles con Aether. No
+implican idéntico rendimiento ni los mismos requisitos de hardware: Granite
+tiene una **limitación de autonomía registrada** (en tareas agénticas largas
+puede detenerse antes de completar y requerir intervención manual) que no
+afecta su aprobación — compatibilidad funcional y autonomía sostenida son
+dimensiones distintas.
+
+Detalle completo (nombres exactos, capacidades medidas con `ollama show`,
+hardware registrado y la distinción funcional/autonomía):
+[`docs/es/MODELOS.es.md`](./docs/es/MODELOS.es.md) ·
+[EN](./docs/MODELOS.md).
+
+Los adjuntos de **video** se analizan de forma multimodal: Aether extrae
+frames equiespaciados (config `VIDEO_FRAMES`, default 4), los describe con
+visión —inline si el MODELO es multimodal, captions vía `MODELO_VISION` si
+es text-only— y transcribe el audio localmente con faster-whisper. La matriz
+de qué puede hacer cada modelo vive en `core/config/capabilities.py`.
 
 ## Uso
 

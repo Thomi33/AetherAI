@@ -454,6 +454,45 @@ The v2 migration removed the old observational model policy
 (`model_policy.py`): the configured model is used directly. The decision
 point for future adaptive policies now lives in the plain config layer.
 
+### Approved models (officially evaluated)
+
+**Ornith** (`ornith-1.5:9b`) and **Granite**
+(`hf.co/ibm-granite/granite-4.2-8b-GGUF:Q6_K`) passed the maintainer's
+evaluations and are approved for Aether. Granite carries a recorded
+autonomy limitation (during long agentic tasks it may stop before
+completing and require manual intervention) that does NOT affect its
+approval — functional compatibility and sustained autonomy are distinct
+dimensions. Full details, measured capabilities, recorded hardware
+requirements and the proposed (not implemented) recovery mechanisms:
+[`MODELOS.md`](./MODELOS.md). The installer offers both models, detects
+already-installed ones, and keeps the custom-model option.
+
+### Per-model capability matrix (2026-10)
+
+`core/config/capabilities.py` is the single source of truth for what
+Aether can do with each model: capabilities declared by Ollama
+(`capacidades_modelo()` → `/api/show`: vision/tools/thinking/embedding/
+audio, with `projector_info` fallback) vs Aether's effective features
+(`funciones_disponibles()`: declared + environment — ffmpeg /
+faster-whisper / grim — + config). Wrappers delegate
+(`attachments.modelo_admite_imagenes`, `aether_service._modelo_con_reasoning`);
+the SSE `start.reasoning` flag comes from real Ollama capabilities, with
+the name-based heuristic as fallback only.
+
+### Multimodal video pipeline (2026-10)
+
+Video attachments are analyzed visually: `_extraer_frames_video` extracts
+N evenly-spaced frames ONCE (persisted under `<video>.frames/` and reused
+across captions, inline images and future turns; ffmpeg budget 30s;
+`VIDEO_FRAMES` config, default 4, max 8). `componer_orden` embeds frame
+captions with timestamps next to the transcription (faster-whisper,
+decoded via ffmpeg→ndarray — PyAV is never used at runtime). Text-only
+models get captions through `MODELO_VISION`; multimodal models receive
+the frames inline within the shared 4-image budget (user images first).
+The graph's `vision` tool also analyzes videos by frames. Extracted
+text/transcriptions are persisted as a sidecar (`<file>.txt`) so the
+Web UI's upload→path flow recovers them.
+
 ## 14. CLI and launcher
 
 The relevant entry points are:

@@ -23,6 +23,7 @@
 | venvs (gitignored) | `env/` (TUI, prioridad 1) · `crewai-env/` · `.venv/` (backend). El lanzador elige en ese orden. |
 | Backend | `backend/` = API FastAPI **experimental**, fuera del flujo soportado (el soportado es CLI/TUI). |
 | Tests | pytest hermético: `conftest.py` (raíz) agrega el repo a `sys.path` y fuerza `AETHER_CENTRAL_MEMORY=0`. |
+| Versión del mapa | **1.5.0** (2026-10-10) — Modelos aprobados documentados + menú de modelos en el instalador: (1) Nueva doc de compatibilidad `docs/es/MODELOS.es.md` + `docs/MODELOS.md` (EN): **Ornith** (`ornith-1.5:9b`, Q4_K_M, 9.0B, vision+thinking+tools, 6.6 GB — default del proyecto) y **Granite** (`hf.co/ibm-granite/granite-4.2-8b-GGUF:Q6_K`, Q6_K, 8.79B, tools+thinking sin vision, 7.2 GB) aprobaron las evaluaciones del mantenedor; capacidades medidas con `ollama show` (nada inventado); Granite registra una **limitación de autonomía** (puede detenerse en tareas agénticas largas y requerir intervención) SIN afectar su aprobación — distinción explícita compatibilidad funcional vs autonomía sostenida; propuesta de mecanismos de recuperación (NO implementada) documentada aparte. (2) `installer/install-core.sh`: `choose_model()` ofrece Ornith/Granite (con aviso de autonomía de Granite)/recomendado del probe/custom, detecta ya-instalados con `ollama list` y preserva los modos no interactivos (`--model`, `-y`, `--minimal`, `--no-ollama`). Verificado con harness bash (6 casos) + `bash -n`. (3) Docs al día con el trabajo no commiteado: README + README.es (índice + sección Modelos aprobados + pipeline de video), ARCHITECTURE.md §13 (EN) y ARCHITECTURE.es.md §19 (ES) con matriz de capacidades + pipeline multimodal, y README de la Web UI (adjuntos multimodales + sidecar upload→path). Base: 1.4.1. |
 
 ---
 
@@ -49,19 +50,38 @@ mi_proyecto_crew/            ← raíz del repo (nombre local histórico; el rep
 │   │                            node_plan_executor, node_agent_loop, node_plan_synthesizer,
 │   │                            node_<tool>*, node_error_*, node_finalize (≈5200 líneas).
 │   │   · graph_state.py        AetherState (TypedDict): estado que fluye por el grafo.
+│   │                            Incluye `fecha_envio` (hora real de llegada de la
+│   │                            orden): node_finalize la usa para estampar el turno
+│   │                            del usuario con su hora de ENVÍO real.
 │   │   · tool_registry.py      REGISTRO ÚNICO de tools: TOOL_REGISTRY (nombre→nodo+desc),
 │   │                            TOOL_PARAMETROS (JSON schemas), TOOLS_VALIDAS.
 │   │   · node_context_manager.py  Poda/compacta contexto ANTES de inferir (protege VRAM).
-│   │   · prompts.py / streaming.py / grounding.py / keywords_config.json.
+│   │   · prompts.py / streaming.py / keywords_config.json.
+│   │   · grounding.py          Validador determinista (SIN LLM) anti-alucinación:
+│   │                            ítems verificables (IPv4/IPv6/puerto/proceso/ruta)
+│   │                            vs salidas reales de tools. ALINEACIÓN 2026-10:
+│   │                            clasificación hard/soft (soft = ruta variante →
+│   │                            aviso "no verificado"), corpus enriquecido con
+│   │                            comandos ejecutados y nombres de tools, proceso
+│   │                            case-insensitive, equivalencia ~/home/relativa,
+│   │                            feedback específico de regeneración, sanitizado
+│   │                            parcial (quitar oraciones, no descartar todo) y
+│   │                            resumen determinista con salidas informativas.
+│   │                            Consumido por _aplicar_validacion_grounding
+│   │                            (graph_nodes) en 4 puntos del flujo.
 │   ├── services/          ★ graph_service.py → procesar_orden_grafo(): PUNTO DE ENTRADA
 │   │                        LÓGICO ÚNICO al motor. + stt_service/stt_worker/audio_input
 │   │                        (dictado por voz, whisper local).
 │   ├── config/            settings.py (constantes; delega en settings_v2) · settings_v2.py
 │   │                        (Settings lazy) · config_manager.py (2 capas + hot reload) ·
+│   │                        capabilities.py (MATRIZ DE CAPACIDADES por modelo — fuente
+│   │                        única: declaradas de Ollama vs efectivas; la consultan
+│   │                        attachments, aether_service y node_vision) ·
 │   │                        dir_authorization.py (autorización de dirs de trabajo) ·
 │   │                        config.json / config.local.json · mcp_servers.json /
 │   │                        mcp_servers.local.json (mismo patrón de 2 capas).
-│   ├── memory/            memory_manager.py (store JSON de sesión: turnos, recuerdos,
+│   ├── memory/            memory_manager.py (store JSON de sesión: turnos con fecha
+│   │                        REAL de envío vía `registrar_turno(fecha=...)`, recuerdos,
 │   │                        resumen acumulativo) · central_store_v2.py (memoria central
 │   │                        SQLite compartida por TODOS los runtimes) · context_builder.py
 │   │                        (inyecta memoria al prompt) · memoria_store.py · central/ (v1).
@@ -85,8 +105,15 @@ mi_proyecto_crew/            ← raíz del repo (nombre local histórico; el rep
 ├── backend/               API FastAPI aislada: api/main.py:app (lifespan → AetherService
 │                          on-demand) · api/routes/ (14 routers: chat SSE, ws, config, prompt,
 │                          models, session, memory, skills, mcp, runtime, roblox, workspace,
-│                          account, stt) · api/models/schemas.py (Pydantic) ·
-│                          core/aether_service.py (envuelve el grafo) · core/attachments.py
+│                          account, stt; chat.py expone además la sesión live del turno
+│                          para re-attach de la Web UI tras F5/reinicio del navegador:
+│                          GET /api/chat/live/status + /api/chat/live/stream, replay desde
+│                          seq 0 + stream en vivo, TTL 15 min post-done) ·
+│                          api/models/schemas.py (Pydantic) ·
+│                          core/aether_service.py (envuelve el grafo; _LIVE_SESSION
+│                          bufferiza TODOS los eventos del turno: una desconexión NO
+│                          cancela la inferencia y el lock lo libera el hilo) ·
+│                          core/attachments.py
 │                          (adjuntos base64) · core/config.py (pydantic-settings) · run.sh
 │                          (uvicorn desde RAÍZ) · requirements.txt propios.
 │
@@ -185,6 +212,9 @@ Errores (executor/loop): error_diagnose → error_confirm → error_retry (acota
 | R14 | **Síntesis honesta**: si una tool ya fijó respuesta determinista, no se re-sintetiza con LLM. El consolidador de memoria descarta bloques de thinking del modelo. | `graph_builder.py`, `memory_manager.py` |
 | R15 | **Observabilidad no invasiva**: `context_dump`, logs de pasos del agent loop, lifecycle explícito en backend (`QUEUED/RUNNING/COMPLETED/FAILED/CANCELLED`). Métricas de bench solo con `AETHER_BENCH_INSTRUMENT=1`. | varios |
 | R16 | **Higiene de repo**: jamás commitear `.env`, `*.db`, memoria, `config.local.json`, `mcp_servers.local.json`, backups ni credenciales. Ver `.gitignore` (defensa en profundidad). | git |
+| R17 | **Turno re-atachable (Web UI)**: una desconexión del cliente SSE/WS NUNCA cancela la inferencia (la libera el hilo del grafo). El hilo publica vía `_publish()`: cola del consumidor actual + buffer secuenciado `_LIVE_SESSION` (re-attach desde seq 0, TTL 24 h post-done; la sesión vieja se reemplaza con la próxima inferencia). El frontend persiste el marcador del turno en `localStorage` (`aether_webui_live`) y al boot `restaurarTurnoVivo()` reconstruye la burbuja y re-consume `/api/chat/live/stream` con el MISMO contrato de eventos del stream normal. ⚠️ Durante el unload (`pagehide` → flag `_pageUnloading`) el turno NO se finaliza: el fetch abortado por el refresh no es un error real y el marcador debe sobrevivir. | `backend/core/aether_service.py`, `backend/api/routes/chat.py`, web_ui `app.js` |
+| R18 | **Timestamps reales del historial**: la fecha de cada turno es la REAL. El turno del usuario se registra al FINAL (`node_finalize` — fix del eco de contexto) pero estampado con su hora de ENVÍO: el entry point (backend SSE/WS, TUI, CLI) captura `fecha_envio` al llegar la orden y la hace viajar por `AetherState.fecha_envio`; el turno de Aether queda con la hora de finalización. `registrar_turno(fecha=...)` es opcional (sin fecha → `now()`, histórico). Los TRES caminos de entrada usan el MISMO contrato (stream + detección de finalize + fallback con fecha). | `graph_state.py`, `graph_nodes.py` (node_finalize), `memory_manager.py`, `backend/core/aether_service.py`, `tui/engine_bridge.py`, `core/services/graph_service.py` |
+| R19 | **Capacidades por modelo = fuente única**: TODA decisión de "¿qué puede Aether con este modelo?" (visión nativa, reasoning `thinking`, frames de video, transcripción, captura de pantalla) vive en `core/config/capabilities.py`: capacidades DECLARADAS de Ollama (`capacidades_modelo` → `/api/show`, con fallback `projector_info`) vs EFECTIVAS (`funciones_disponibles()`: declaradas + entorno ffmpeg/faster-whisper/grim + config MODELO/MODELO_VISION). Los wrappers delegan (`attachments.modelo_admite_imagenes`, `aether_service._modelo_con_reasoning`); NADIE duplica la lógica ni consulta `/api/show` por su cuenta. Heurístico de reasoning por nombre = SOLO fallback si Ollama no reporta capabilities. Fallos de consulta NO se cachean (reintento). | `core/config/capabilities.py`, `backend/core/attachments.py`, `backend/core/aether_service.py`, `core/agent/graph_nodes.py` |
 
 ## 6. VARIABLES DE ENTORNO Y CONFIGURACIÓN
 
@@ -201,7 +231,7 @@ Errores (executor/loop): error_diagnose → error_confirm → error_retry (acota
 | `AETHER_WEB_PORT` / `WEB_UI_DIR` | Puerto del backend web / carpeta de estáticos. | `8000` / autodetección |
 | `GOOGLE_APPLICATION_CREDENTIALS` / `GOOGLE_API_KEY` | Solo `/play-roblox google`. NUNCA en `config.json`. | — |
 
-Claves relevantes de `config.json`: `MODELO` (default `ornith:9b`) · `MODELO_VISION` (= MODELO) · `MODO_AUTONOMO` · `TOOL_CALLING_NATIVO` · `TIMEOUT_CMD` · `NUM_CTX`/`NUM_PREDICT` · `MAX_STEPS_COMPUTER_USE` (default 8) · `SEARXNG_URL`. Validación de modelos y rangos: `ConfigValidator` en `config_manager.py`.
+Claves relevantes de `config.json`: `MODELO` (default `ornith:9b`) · `MODELO_VISION` (= MODELO) · `MODO_AUTONOMO` · `TOOL_CALLING_NATIVO` · `TIMEOUT_CMD` · `NUM_CTX`/`NUM_PREDICT` · `MAX_STEPS_COMPUTER_USE` (default 8) · `VIDEO_FRAMES` (default 4, tope 8: frames equiespaciados analizados por video) · `WHISPER_MODEL` (default `base`) · `SEARXNG_URL`. Validación de modelos y rangos: `ConfigValidator` en `config_manager.py`. Capacidades por modelo (visión/thinking/frames): `core/config/capabilities.py`.
 
 ## 7. COMANDOS OPERATIVOS (verificación rápida)
 
@@ -235,6 +265,8 @@ python tps.py "modelo" "prompt"
 8. Roblox: runtime en repo separado (`~/aether-roblox`); aquí solo `core/tools/roblox_bridge.py` (primitivas genéricas).
 9. `graph_nodes.py` ≈5200 líneas: navegar por `def node_*`, no leer de corrido.
 10. Alias/nombres históricos de settings y memoria se conservan a propósito (R11): antes de renombrar algo público, buscar referencias en todo el repo.
+11. **faster-whisper × PyAV (2026-10)**: faster-whisper ≤ 1.2.1 decodifica con PyAV (`av.open(..., metadata_errors=...)`), kwarg que PyAV 19 eliminó (y PyAV 14 no publica wheels para Python 3.14): pasar PATHS a `WhisperModel.transcribe` revienta en cualquier combinación de versiones. Aether lo esquiva decodificando con ffmpeg a ndarray (`_audio_a_numpy` en `backend/core/attachments.py`) y pasando el ARRAY a `transcribe`; `av` queda solo como dependencia de import de faster_whisper.
+12. **Video/audio vía upload→path: transcripción RECUPERADA (1.4.1)**. La Web UI sube a `/api/attachments/upload` (que transcribe/extrae con `guardar_adjuntos`) y el turno referencia solo por PATH; antes `adjuntos_ya_guardados` no restauraba `texto_extraido` y se perdía. Ahora: `guardar_adjuntos` persiste el texto extraído en un SIDECAR `<archivo>.txt` junto al adjunto (kinds pdf/docx/vector/audio/video) y `adjuntos_ya_guardados` lo relee (best-effort, sanity 2 MB; `text` no necesita sidecar — se releen el original). Ambos caminos (data directo y upload→path) transcriben; los frames de video funcionan en ambos.
 
 ## 9. MAPA DE LECTURA POR TAREA (dónde empezar según el trabajo)
 
@@ -246,6 +278,8 @@ python tps.py "modelo" "prompt"
 | Configuración / instalación | `core/config/settings.py` → `settings_v2.py` → `config_manager.py` → `installer/install-core.sh` |
 | TUI / UX | `tui/app.py` → `engine_bridge.py` → `tui/widgets/*` |
 | Backend web | `backend/api/main.py` → `backend/core/aether_service.py` → `backend/api/routes/*` |
+| Adjuntos / imagen / video / transcripción | `backend/core/attachments.py` → `core/config/capabilities.py` (matriz) → `backend/api/routes/chat.py::_preparar_orden` → `core/agent/graph_nodes.py::node_vision` |
+| Modelos aprobados / instalador | `docs/es/MODELOS.es.md` (+ `docs/MODELOS.md` EN) → `installer/install-core.sh` (`choose_model`) → `tools/hardware_probe.py` (tiers/suite) |
 | Tests nuevos | `conftest.py` → el test más parecido de `tests/` |
 | Documentación | `README.md` (ES) → `docs/ARCHITECTURE.md` (EN) → `docs/es/` |
 
