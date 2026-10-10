@@ -847,9 +847,12 @@ class AetherApp(App):
             # (core/config/mcp_servers.local.json, ignorado por Git): la
             # plantilla versionada (mcp_servers.json) nunca se modifica.
             try:
-                from core.tools.mcp_client import set_enabled
+                from core.tools.mcp_client import set_enabled, reset_mcp_manager
                 for name, activo in states.items():
                     set_enabled(name, bool(activo))
+                # El manager cachea la config al crearse: sin el reset, el
+                # toggle recién aplicaba al reiniciar la TUI.
+                reset_mcp_manager()
             except Exception:
                 pass
             enabled = [k for k, v in states.items() if v]

@@ -76,3 +76,15 @@ build/
 *.bak
 *.bak2
 *.old
+
+# Artefactos de prueba del fix del MCP de GitHub (sesiones de Aether,
+# Oct 07-09): contienen el token REAL en texto plano — JAMÁS commitearlos
+# (el repo es público). Los archivos quedan en el disco intactos; esto
+# solo evita que un `git add .` los suba. Ídem /report.json (27 MB de
+# datos; la copia operativa ya vive en ~/Aether/adjuntos).
+/validar_token*.py
+/test_github*.py
+/prueba_mcp_*.py
+/inspeccion_paquete*.py
+/test_token_api.py
+/report.json

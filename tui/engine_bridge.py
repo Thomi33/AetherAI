@@ -33,6 +33,7 @@ import queue
 import threading
 import contextlib
 import logging
+from datetime import datetime
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
@@ -235,7 +236,8 @@ class _QueueWriter(io.TextIOBase):
         self._buffer = ""
 
 
-def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
+def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
+                          fecha_envio: str = "") -> None:
     writer = _QueueWriter(q)
     ultimo_estado: dict[str, Any] = {}
     llego_finalize = False
@@ -254,7 +256,8 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
         # no llegan a finalize (cancelación, errores, END directo).
 
         grafo = get_graph()
-        estado = crear_estado_inicial(orden, _motor.mem, modo_autonomo=True)
+        estado = crear_estado_inicial(orden, _motor.mem, modo_autonomo=True,
+                                      fecha_envio=fecha_envio)
         ultimo_estado = dict(estado)
 
         with contextlib.redirect_stdout(writer):
@@ -291,6 +294,7 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]") -> None:
                     _motor.mem, "usuario", orden,
                     sesion_id=_motor.mem.get("sesion_id", ""),
                     tema=ultimo_estado.get("tema_actual", ""),
+                    fecha=fecha_envio or None,
                 )
             except Exception:
                 pass
@@ -313,8 +317,13 @@ def iter_eventos(orden: str) -> Iterator[Evento]:
     """
     from core.agent.streaming import reset_cancel
     reset_cancel()
+    # FIX reloj (Plan B): hora REAL de envío de la orden — misma semántica
+    # que el backend: viaja por el estado hasta node_finalize, que estampa
+    # el turno del usuario con esta fecha y no con la del finalize.
+    fecha_envio = datetime.now().isoformat()
     q: "queue.Queue[Evento]" = queue.Queue()
-    hilo = threading.Thread(target=_correr_grafo_en_hilo, args=(orden, q), daemon=True)
+    hilo = threading.Thread(target=_correr_grafo_en_hilo,
+                            args=(orden, q, fecha_envio), daemon=True)
     hilo.start()
 
     while True:

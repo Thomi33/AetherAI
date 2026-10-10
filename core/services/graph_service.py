@@ -9,6 +9,8 @@ Función principal:
     procesar_orden_grafo(orden, mem, modo_autonomo) -> str
 """
 
+from datetime import datetime
+
 from core.memory.memory_manager import registrar_turno, programar_consolidacion
 
 
@@ -82,8 +84,14 @@ def procesar_orden_grafo(orden: str, mem: dict, modo_autonomo: bool = True,
     (planner → plan_executor → [error handler] → synthesizer → finalize).
 
     - Normaliza la memoria y construye el estado con la factory central.
-    - Registra el turno del usuario aquí; node_finalize registra el de Aether
-      (evita doble registro en la tabla conversaciones).
+    - Turnos del historial: los registra node_finalize al completarse la
+      inferencia (el turno del usuario con su fecha REAL de envío vía
+      AetherState.fecha_envio; el de Aether con la hora de finalización).
+      Acá queda SOLO el fallback para los caminos que terminan sin pasar
+      por finalize (mismo contrato que tui/engine_bridge.py y
+      backend/core/aether_service.py). Antes el turno del usuario se
+      pre-registraba acá: además de duplicarse en el store, terminaba en
+      el contexto de conversación y el modelo ecoeaba su propio input.
     - imagenes: thumbnails b64 de adjuntos de imagen → el modelo principal
       los ve incrustados en su mensaje (visión inline).
     - Retorna la respuesta final del grafo.
@@ -92,13 +100,32 @@ def procesar_orden_grafo(orden: str, mem: dict, modo_autonomo: bool = True,
     from core.agent.graph_builder import get_graph
     from core.agent.graph_state import crear_estado_inicial
 
-    registrar_turno(mem, "usuario", orden)
+    # FIX reloj (Plan B): hora REAL de llegada de la orden — viaja por el
+    # estado hasta node_finalize, que estampa el turno del usuario con
+    # esta fecha y no con la del fin de la inferencia.
+    fecha_envio = datetime.now().isoformat()
 
     grafo = get_graph()
-    estado = crear_estado_inicial(orden, mem, modo_autonomo, imagenes=imagenes)
-    resultado = grafo.invoke(estado)
-    # node_finalize ya dejó registrado el turno de Aether. Programar después
-    # de invoke garantiza que el lote vea el intercambio completo y no añade
-    # latencia al caller (API/CLI).
+    estado = crear_estado_inicial(orden, mem, modo_autonomo, imagenes=imagenes,
+                                  fecha_envio=fecha_envio)
+
+    # Mismo patrón de consumo que los bridges: deltas del stream acumulados
+    # en el resultado + detección de finalize para el fallback del turno
+    # del usuario.
+    resultado: dict = {}
+    llego_finalize = False
+    for update in grafo.stream(estado, stream_mode="updates"):
+        for nodo, delta in update.items():
+            if isinstance(delta, dict):
+                resultado.update(delta)
+            if nodo == "finalize":
+                llego_finalize = True
+
+    if not llego_finalize:
+        registrar_turno(mem, "usuario", orden, fecha=fecha_envio)
+
+    # node_finalize ya dejó registrado el intercambio completo. Programar
+    # después del stream garantiza que el lote de consolidación vea ambos
+    # turnos y no añade latencia al caller (API/CLI).
     programar_consolidacion(mem)
     return respuesta_final_o_informe(resultado)

@@ -207,3 +207,52 @@ class TestRutasMcp:
         r2 = client.get("/api/mcps")
         nombres = {s["name"] for s in r2.json()["servers"]}
         assert "notion" not in nombres and "notion-pro" in nombres
+
+
+class TestEnabledSeRespetaEnElManager:
+    """FIX: el toggle `enabled` era cosmético — el manager conectaba igual y
+    las tools del server deshabilitado seguían llegando al catálogo del agente
+    (graph_nodes/node_mcp). Ahora _cargar_config_servers los filtra y las
+    mutaciones de config resetean el singleton para que apliquen en vivo."""
+
+    def test_config_del_manager_filtra_deshabilitados(self, capas):
+        capas["local"].write_text(json.dumps({
+            "github": {"enabled": False},
+        }), encoding="utf-8")
+        cfg = capas["mc"]._cargar_config_servers(capas["base"])
+        assert "github" not in cfg          # deshabilitado → fuera del runtime
+        assert "notion" in cfg              # habilitado → queda
+        # La vista de la Web UI (cargar_merge) sigue mostrando ambos: el
+        # usuario necesita ver el server apagado para poder re-activarlo.
+        vista = capas["mc"].cargar_merge()
+        assert set(vista) == {"github", "notion"}
+
+    def test_manager_no_lista_servers_deshabilitados(self, capas):
+        capas["local"].write_text(json.dumps({
+            "github": {"enabled": False},
+        }), encoding="utf-8")
+        m = capas["mc"].MCPClientManager(config_path=capas["base"])
+        try:
+            assert m.list_servers() == ["notion"]
+        finally:
+            m.close()
+
+    def test_reset_mcp_manager_cierra_y_descarta_singleton(self):
+        import core.tools.mcp_client as mc
+
+        class _Fake:
+            def __init__(self):
+                self.cerrado = False
+
+            def close(self):
+                self.cerrado = True
+
+        fake = _Fake()
+        viejo = mc._manager_singleton
+        mc._manager_singleton = fake
+        try:
+            mc.reset_mcp_manager()
+            assert fake.cerrado is True
+            assert mc._manager_singleton is None
+        finally:
+            mc._manager_singleton = viejo

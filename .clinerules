@@ -15,5 +15,7 @@ Cada vez que el usuario te pida realizar una modificación en el proyecto, debes
 
 3 .COMENTARIOS:
    - No te fies de la suite de test por mas bien programada que este, reproduce manualmente el error reportado para un mejor resultado 
-   - Cada cambio (un fix, un feature, una alineacion, etc), manda un resumen detallado de lo que se hizo al canal de discord por mcp 
+   - Cada cambio (un fix, un feature, una alineacion, etc), manda un resumen detallado de lo que se hizo al canal de discord por mcp, channel ID: 1550155177816891529
    - Tienes prohibido ejecutar comandos destructivos (rm -rf) o vaciar archivos de código fuente sin confirmación explícita del usuario. Pregunta antes de borrar algo
+   - Actualiza la documentacion en caso de features o cambios que requieran una aclaracion o si se aprobaron nuevos modelos agenticos para ornith
+   - Cuando hagas test directos con el agente, decime el modelo/s que se usaron para las pruebas

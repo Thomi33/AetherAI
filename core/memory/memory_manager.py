@@ -219,10 +219,20 @@ def registrar_turno(
     sesion_id: str = "",
     tema: str = "",
     proyecto: str = "",
+    fecha: str | None = None,
 ) -> None:
-    """Registra un turno en el store JSON y en el dict RAM."""
+    """Registra un turno en el store JSON y en el dict RAM.
+
+    fecha (ISO, opcional): estampa el turno con su hora REAL. Caso de uso
+    (fix "reloj detenido en 7:43 pm", Plan B): el turno del usuario se
+    registra al FINAL de la inferencia (node_finalize — fix del eco de
+    contexto), así que sin este parámetro su fecha era la del registro y
+    no la del envío real (una inferencia de 5 min nacía "enviada" 5 min
+    tarde en el historial). El entry point captura la hora de llegada y
+    la hace viajar por el estado del grafo (AetherState.fecha_envio)
+    hasta acá. Sin fecha → datetime.now() (comportamiento histórico)."""
     texto = str(texto)[:MAX_TEXTO]
-    fecha = datetime.now().isoformat()
+    fecha = fecha or datetime.now().isoformat()
     try:
         data = memoria_store.cargar()
         data["conversaciones"].append({

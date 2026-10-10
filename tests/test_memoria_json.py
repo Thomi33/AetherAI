@@ -9,6 +9,7 @@ falla, migración one-shot desde la DB sqlite legacy, y el contrato REST.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
 import pytest
 
@@ -192,3 +193,60 @@ class TestSystemPromptEndpoints:
         assert data.get("persona_sintesis")
         assert data.get("agent_loop"), "falta el prompt del agent loop"
         assert "[ADJUNTOS DEL USUARIO]" in data["agent_loop"]
+
+
+class TestFechaRealDeTurnos:
+    """FIX "reloj detenido en 7:43 pm" (Plan B): el turno del usuario debe
+    quedar estampado con su hora REAL de envío — capturada por el entry point
+    (Web UI/TUI/WS), viajando por AetherState.fecha_envio hasta node_finalize.
+    El turno de Aether mantiene la hora de finalización (datetime.now())."""
+
+    def test_registrar_turno_respeta_fecha_explicita(self, mem_tmp):
+        mem = mm.cargar_memoria()
+        mm.registrar_turno(mem, "usuario", "hola", sesion_id="s1",
+                           fecha="2026-10-09T19:43:37.381972")
+        turnos = mm.obtener_turnos_por_sesion("s1")
+        assert turnos[0]["fecha"] == "2026-10-09T19:43:37.381972"
+
+    def test_registrar_turno_sin_fecha_mantiene_now(self, mem_tmp):
+        # Compat: sin fecha explícita sigue usando datetime.now() (histórico).
+        mem = mm.cargar_memoria()
+        antes = datetime.now().isoformat()
+        mm.registrar_turno(mem, "usuario", "hola", sesion_id="s1")
+        turnos = mm.obtener_turnos_por_sesion("s1")
+        assert turnos[0]["fecha"] >= antes
+
+    def test_node_finalize_estampa_usuario_con_fecha_envio(self, mem_tmp):
+        """Reproducción del escenario del bug: orden enviada a las 19:43:37,
+        inferencia que finalize minutos después → el turno del usuario debe
+        quedar con la fecha de ENVÍO y el de Aether con la de finalización
+        (antes ambos nacían con la misma fecha del registro: 11ms entre uno
+        y otro)."""
+        from core.agent.graph_nodes import node_finalize
+        from core.agent.graph_state import crear_estado_inicial
+
+        mem = mm.cargar_memoria()
+        estado = crear_estado_inicial(
+            "analiza el reporte que te envié", mem, True,
+            fecha_envio="2026-10-09T19:43:37.381972")
+        estado["final_response"] = "listo, analizado"
+        estado["sesion_id"] = "s-fix"
+        estado["tema_actual"] = "reporte"
+
+        assert node_finalize(estado)["done"] is True
+
+        turnos = mm.obtener_turnos_por_sesion("s-fix")
+        assert [t["rol"] for t in turnos] == ["usuario", "aether"]
+        # usuario → hora REAL de envío (viajó por el estado del grafo)
+        assert turnos[0]["fecha"] == "2026-10-09T19:43:37.381972"
+        # aether → hora de finalización (posterior al envío real)
+        assert turnos[1]["fecha"] > "2026-10-09T19:43:37.381972"
+
+    def test_crear_estado_inicial_propaga_fecha_envio(self):
+        from core.agent.graph_state import crear_estado_inicial, _claves_estado
+        est = crear_estado_inicial("hola", {"conversacion": []}, True,
+                                   fecha_envio="2026-10-09T19:43:37")
+        assert est["fecha_envio"] == "2026-10-09T19:43:37"
+        assert "fecha_envio" in _claves_estado()
+        # Compat: sin fecha → "" (node_finalize cae a now() histórico).
+        assert crear_estado_inicial("hola", {"conversacion": []})["fecha_envio"] == ""

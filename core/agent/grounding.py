@@ -49,6 +49,17 @@ INSTRUCCION_DATOS_TOOL = (
     "ejecutar la revisión de nuevo."
 )
 
+# Nombres de las tools del sistema (espejo de TOOL_REGISTRY en
+# core/agent/tool_registry.py; mantener sincronizado al agregar tools).
+# Alineación 2026-10: citar entre backticks la herramienta que uno mismo
+# usó (`shell`, `fs_read`) es un reporte honesto de la ejecución, no una
+# invención — el validador no debe exigirlo en las salidas.
+NOMBRES_TOOLS = frozenset({
+    "text", "web", "shell", "launch", "vision", "codigo", "fs_write",
+    "fs_read", "fs_mkdir", "fs_list", "memory", "net_audit", "mcp",
+    "computer_use",
+})
+
 
 def sanitizar_bloque_datos(texto: str) -> str:
     """
@@ -157,7 +168,28 @@ def _ipv6_en_corpus(valor: str, corpus: str) -> bool:
     return False
 
 
-def _en_corpus(valor: str, corpus: str, tipo: str = "") -> bool:
+def _segmento_tras_home(ruta: str) -> str | None:
+    """
+    Sufijo de una ruta quitando el prefijo del home: '/home/thomi/x/y' →
+    'x/y', '~/x/y' → 'x/y'. None si el sufijo no tiene al menos DOS
+    segmentos (evita matches triviales tipo '/home/thomi' → 'thomi').
+    Se usa para la equivalencia de FORMA entre '/home/thomi/.gradle/caches',
+    '~/.gradle/caches' y '.gradle/caches' (la relativa que imprimen du/ls
+    cuando corren con el cwd en el home): es la misma ruta del mismo
+    usuario escrita de otra manera, y reescribirla es normalización
+    legítima del modelo, no invención.
+    """
+    ruta = (ruta or "").strip()
+    m = re.match(r"^~/(.+)$", ruta) or re.match(
+        r"^/(?:home|Users)/[^/]+/(.+)$", ruta)
+    resto = m.group(1).rstrip("/") if m else ""
+    if not resto or "/" not in resto:
+        return None
+    return resto
+
+
+def _en_corpus(valor: str, corpus: str, tipo: str = "",
+               corpus_lower: str | None = None) -> bool:
     """
     El ítem aparece en alguna salida de tool, con BORDES DE TOKEN para que
     un prefijo en común no cuente como presencia:
@@ -173,7 +205,12 @@ def _en_corpus(valor: str, corpus: str, tipo: str = "") -> bool:
     - puerto: se acepta la forma host:puerto (":" inmediatamente antes),
       que es como netstat/ss imprimen los puertos.
     - IPv6: comparación por formas normalizadas (ver _ipv6_en_corpus).
-    - rutas/procesos: substring clásico (son tokens con bordes naturales).
+    - proceso: substring case-INSENSITIVE (alineación 2026-10: los nombres
+      de apps aparecen en las salidas con otra capitalización — 'Bottles'
+      vs 'com.usebottles.bottles' — y citar el nombre legible es
+      normalización del modelo, no invención).
+    - ruta: substring clásico + equivalencia de forma del home
+      ('~' ↔ '/home/<usuario>' ↔ relativa), con al menos 2 segmentos.
     """
     if not corpus:
         return False
@@ -192,6 +229,15 @@ def _en_corpus(valor: str, corpus: str, tipo: str = "") -> bool:
             rf"(?<![\d.:]){re.escape(valor)}(?![\d.])", corpus))
     if tipo == "ipv6":
         return _ipv6_en_corpus(valor, corpus)
+    if tipo == "proceso":
+        if corpus_lower is None:
+            corpus_lower = corpus.lower()
+        return valor.strip().lower() in corpus_lower
+    if tipo == "ruta":
+        if valor in corpus:
+            return True
+        resto = _segmento_tras_home(valor)
+        return bool(resto and resto in corpus)
     return valor in corpus
 
 
@@ -214,7 +260,15 @@ def extraer_items_verificables(texto: str) -> list[tuple[str, str]]:
         if _normalizar_ipv6(m.group(0)) is not None:
             items.append(("ipv6", m.group(0)))
     for m in RE_RUTA_ABS.finditer(texto):
-        items.append(("ruta", m.group(0)))
+        # Alineación 2026-10: la clase de caracteres de RE_RUTA_ABS incluye
+        # '(' y ')' (rutas con paréntesis son legítimas), así que una ruta al
+        # final de una frase entre paréntesis — '(cache: /a/b)' — se extraía
+        # CON el ')' de cierre y fallaba la búsqueda en el corpus (bug real
+        # de la auditoría de almacenamiento: '/home/thomi/.npm/_cacache)').
+        # Se recorta la puntuación de cierre del ítem.
+        ruta = m.group(0).rstrip("(),.;:!¡¿?\"'/")
+        if ruta and ruta != "/":
+            items.append(("ruta", ruta))
     for m in RE_PROCESO_BACKTICK.finditer(texto):
         token = m.group(1).strip()
         # Un "proceso" es un token simple: sin espacios ni sintaxis de shell.
@@ -261,19 +315,186 @@ def validate_grounding(response_text: str, tool_outputs,
         salidas reales.
     """
     corpus = "\n".join(str(o) for o in (tool_outputs or []) if o)
+    corpus_lower = corpus.lower()
     ungrounded: list[tuple[str, str]] = []
     for tipo, valor in extraer_items_verificables(response_text or ""):
         if _es_inocuo(valor):
             continue
         if _mencionado_por_usuario(valor, user_message):
             continue
+        # Alineación 2026-10: citar entre backticks la tool que uno mismo
+        # usó (`shell`, `fs_read`) es un reporte honesto de la ejecución,
+        # no una invención — no se la exige en las salidas.
+        if tipo == "proceso" and valor.strip().lower() in NOMBRES_TOOLS:
+            continue
         # Comparación con bordes de token (por tipo): un prefijo en común
         # ("22" en "22067", "192.168.1.10" en "192.168.1.100") NO cuenta
         # como presencia. IPv6 se compara por forma normalizada.
-        if _en_corpus(valor, corpus, tipo):
+        if _en_corpus(valor, corpus, tipo, corpus_lower):
             continue
         ungrounded.append((tipo, valor))
     return (len(ungrounded) == 0), ungrounded
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ALINEACIÓN DEL GROUNDING (2026-10)
+#
+# Bug real (auditoría de almacenamiento de Arch, 24 pasos): el validador
+# descartó una síntesis útil por 4 ítems que NO eran invenciones — una ruta
+# con ')' arrastrado por la regex, comandos ejecutados citados entre
+# backticks, un nombre de app con otra capitalización y una ruta escrita
+# en otra forma. Política nueva, SIN rebajar los controles anti-alucinación:
+#
+#   - HARD (IPs/puertos/procesos realmente ausentes, rutas sin NINGUNA
+#     relación con lo observado): regeneración con la LISTA EXACTA de lo
+#     que falló → sanitizado parcial (quitar solo las oraciones con lo
+#     inventado) → recién ahí, resumen determinista.
+#   - SOFT (rutas variante de una real): aviso honesto de "no verificado",
+#     sin regenerar ni descartar. Nada de descartes totales silenciosos.
+# ═══════════════════════════════════════════════════════════════════════
+
+# Un prefijo de ruta cuenta como "relación" para la clasificación soft
+# recién a partir de este mínimo de segmentos más allá de la raíz del
+# home: '/home/thomi' es prefijo de cualquier ruta del usuario y no
+# demuestra nada por sí solo; '/home/thomi/.gradle' sí.
+_MIN_SEGMENTOS_RELACION = 1
+
+
+def _segmentos_utiles(ruta: str) -> int:
+    """Segmentos de una ruta MÁS ALLÁ de la raíz del home: '/home/thomi/
+    .gradle' → 1 ('.gradle'), '/home/thomi' → 0, '/etc/ssh' → 2."""
+    partes = [p for p in (ruta or "").strip("/").split("/") if p]
+    if len(partes) >= 3 and partes[0] in ("home", "Users"):
+        return len(partes[2:])
+    if len(partes) >= 2 and partes[0] == "root":
+        return len(partes[1:])
+    return len(partes)
+
+
+def _ruta_casi_respaldada(valor: str, corpus: str) -> bool:
+    """
+    True si una ruta sin respaldo EXACTO es una variante de forma de una
+    ruta real de las salidas: diferencia de capitalización, o relación
+    padre/hijo con una ruta observada (el modelo extendió '/home/x/.gradle'
+    a '/home/x/.gradle/caches' desde conocimiento del mundo). No es
+    invención: es normalización o inferencia marcable → se avisa, no se
+    descarta la respuesta entera.
+    """
+    if not valor or not corpus:
+        return False
+    if valor.lower() in corpus.lower():
+        return True
+    for cp in RE_RUTA_ABS.findall(corpus):
+        cp = cp.rstrip("(),.;:!¡¿?\"'/")
+        if not cp or _segmentos_utiles(cp) < _MIN_SEGMENTOS_RELACION:
+            continue
+        if valor.startswith(cp + "/") or cp.startswith(valor + "/"):
+            return True
+    return False
+
+
+def clasificar_sin_respaldo(ungrounded_items, tool_outputs, comandos=()):
+    """
+    Divide los ítems sin respaldo en dos clases con consecuencias distintas:
+
+    - hard: señal real de alucinación — IPs, puertos, procesos ausentes y
+      rutas sin NINGUNA relación con lo observado (el bug original de la
+      intrusión inventada sobre un netstat sano). Justifican regenerar
+      y sanitizar.
+    - soft: rutas con respaldo "casi" exacto (variante de forma de una
+      ruta real). Se entregan marcadas como no verificadas.
+
+    `comandos` (instrucciones realmente ejecutadas en la sesión) entra al
+    corpus de clasificación: si la ruta citada es variante de una que
+    aparece en un comando ejecutado ('du -h ~/.gradle'), también es soft.
+    """
+    corpus = "\n".join(
+        str(o) for o in list(tool_outputs or []) + list(comandos or []) if o)
+    hard: list[tuple[str, str]] = []
+    soft: list[tuple[str, str]] = []
+    for tipo, valor in ungrounded_items or []:
+        if tipo == "ruta" and _ruta_casi_respaldada(valor, corpus):
+            soft.append((tipo, valor))
+        else:
+            hard.append((tipo, valor))
+    return hard, soft
+
+
+def aviso_no_verificados(soft_items) -> str:
+    """
+    Línea de cierre generada por el SISTEMA (no por el modelo) que marca
+    explícitamente qué quedó sin comprobar: transparencia epistémica. El
+    usuario ve qué es dato verificado y qué es estimación.
+    """
+    if not soft_items:
+        return ""
+    vals = ", ".join(f"`{v}`" for _, v in soft_items[:6])
+    return ("\n\n⚠️ Nota de verificación: " + vals + " no aparece(n) "
+            "literalmente en las salidas de esta sesión; tratalo como "
+            "estimación, no como dato verificado.")
+
+
+def construir_feedback_regeneracion(hard_items, soft_items) -> str:
+    """
+    Instrucción correctiva ESPECÍFICA para la regeneración: lista los
+    ítems exactos que fallaron. Antes el modelo recibía solo una regla
+    genérica y no sabía qué quitar (bug de la auditoría: la segunda
+    respuesta volvía a citar `mount` y las rutas normalizadas, y todo el
+    trabajo se descartaba).
+    """
+    partes: list[str] = []
+    if hard_items:
+        vals = ", ".join(f"`{v}`" for _, v in hard_items[:8])
+        partes.append(
+            "Estos datos NO aparecen en ninguna salida real y no podés "
+            f"afirmarlos como verificados: {vals}. Quitalos de la respuesta "
+            "o marcalos explícitamente como no comprobados.")
+    if soft_items:
+        vals = ", ".join(f"`{v}`" for _, v in soft_items[:8])
+        partes.append(
+            "Estos datos no están literalmente en las salidas (parecen "
+            f"normalizaciones tuyas): {vals}. Solo mencionálos marcándolos "
+            "como estimación no verificada.")
+    partes.append("Conservá TODO lo demás: el resto de la respuesta sí "
+                  "está respaldado por los resultados.")
+    return " ".join(partes)
+
+
+_RE_ORACION = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _cita_valor(oracion: str, tipo: str, valor: str) -> bool:
+    """La oración cita el ítem (con bordes de token para números)."""
+    if tipo == "puerto":
+        return bool(re.search(rf"(?<!\d){re.escape(valor)}(?!\d)", oracion))
+    if tipo in ("ipv4", "ipv6"):
+        return bool(re.search(
+            rf"(?<![\d.]){re.escape(valor)}(?![\d.])", oracion))
+    return valor in oracion
+
+
+def sanitizar_texto_sin_respaldo(texto: str, hard_items) -> tuple[str, list[str]]:
+    """
+    Reparación parcial (alineación): quita las ORACIONES que citan ítems
+    hard y conserva el resto de la respuesta, que sí está respaldado.
+    Devuelve (texto_sanitizado, valores_quitados). Es la alternativa al
+    descarte total: si la regeneración insistió con datos inventados, el
+    trabajo verificado de una investigación larga no se tira a la basura.
+    """
+    if not texto or not hard_items:
+        return texto or "", []
+    lineas_out: list[str] = []
+    for linea in texto.splitlines():
+        oraciones = _RE_ORACION.split(linea)
+        quedan = [o for o in oraciones
+                  if not any(_cita_valor(o, t, v) for t, v in hard_items)]
+        if any(s.strip() for s in quedan):
+            lineas_out.append(" ".join(quedan))
+    sanitizado = "\n".join(lineas_out)
+    quitados = [v for t, v in hard_items
+                if _cita_valor(texto, t, v)
+                and not _cita_valor(sanitizado, t, v)]
+    return sanitizado, quitados
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -399,13 +620,22 @@ def tiene_terminos_alarma(texto: str) -> bool:
 
 
 def resumen_determinista(tool_outputs, ungrounded_items=None,
-                         veredicto: str | None = None) -> str:
+                         veredicto: str | None = None, comandos=None) -> str:
     """
     Resumen determinista armado SOLO con lo que sí está en los datos reales.
     Se usa cuando la respuesta del modelo no pasa la validación ni tras la
-    regeneración: en vez de devolver inventos, se reporta qué hay. Si las
-    salidas traen un veredicto determinista (net_audit), se lo afirma tal
-    cual — es lo único que el modelo tiene permitido concluir.
+    regeneración (y el sanitizado parcial no dejó nada rescatable): en vez
+    de devolver inventos, se reporta qué hay. Si las salidas traen un
+    veredicto determinista (net_audit), se lo afirma tal cual — es lo
+    único que el modelo tiene permitido concluir.
+
+    Alineación 2026-10: antes solo se mostraban las ÚLTIMAS 3 salidas × 3
+    líneas — tras una sesión larga (24 pasos de auditoría de disco) el
+    usuario se quedaba con 9 líneas y perdía casi toda la investigación.
+    Ahora se eligen las 4 salidas más informativas (por cantidad de líneas
+    con datos, garantizando siempre la última) y se listan los comandos
+    ejecutados: son datos reales de la sesión y le devuelven al usuario el
+    alcance del relevamiento.
     """
     tipos = ", ".join(sorted({t for t, _ in (ungrounded_items or [])})) or "datos"
     lineas = [
@@ -422,9 +652,24 @@ def resumen_determinista(tool_outputs, ungrounded_items=None,
     salidas = [str(o) for o in (tool_outputs or []) if str(o).strip()]
     if not salidas:
         lineas.append("- (no hay salidas de herramientas en esta sesión)")
-    for i, salida in enumerate(salidas[-3:], 1):
-        utiles = [l.strip() for l in salida.splitlines() if l.strip()][:3]
-        lineas.append(f"- Salida {i}: " + (" | ".join(utiles) if utiles else "(vacía)"))
+    if salidas:
+        puntuadas = [
+            (i, s, sum(1 for l in s.splitlines() if l.strip()))
+            for i, s in enumerate(salidas)
+        ]
+        top = sorted(puntuadas, key=lambda p: p[2], reverse=True)[:4]
+        if puntuadas[-1] not in top:
+            top[-1] = puntuadas[-1]      # la más reciente siempre entra
+        for i, (_, salida, _) in enumerate(sorted(top), 1):
+            utiles = [l.strip() for l in salida.splitlines() if l.strip()][:3]
+            lineas.append(
+                f"- Salida {i}: " + (" | ".join(utiles) if utiles else "(vacía)"))
+    comandos_utiles = [str(c) for c in (comandos or []) if str(c).strip()]
+    if comandos_utiles:
+        lineas.append("")
+        lineas.append("Comandos que sí se ejecutaron en esta sesión:")
+        for c in comandos_utiles[-8:]:
+            lineas.append(f"- $ {c}")
     lineas.append("")
     lineas.append("Si querés, vuelvo a ejecutar la revisión y te reporto "
                   "solo lo que devuelva.")

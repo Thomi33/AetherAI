@@ -1,6 +1,6 @@
 import json, shutil, sys, time, requests
 
-MODEL = sys.argv[1] if len(sys.argv) > 1 else "hf.co/MaziyarPanahi/Mistral-7B-Instruct-v0.3-GGUF:Q4_K_M"
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "hf.co/peculiar-ragdoll/Sharp-MiniCPM5-2B-GGUF:Q6_K_XL"
 PROMPT = sys.argv[2] if len(sys.argv) > 2 else "Explicame cómo funciona TCP en detalle."
 
 rows = shutil.get_terminal_size().lines

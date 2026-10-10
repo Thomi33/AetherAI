@@ -15,6 +15,11 @@ class AetherState(TypedDict):
     orden:          str
     mem:            dict[str, Any]
     modo_autonomo:  bool
+    fecha_envio:    str           # ISO de CUÁNDO llegó la orden al runtime
+                                   # (Web UI/TUI/WS). node_finalize estampa el
+                                   # turno del usuario con ESTA fecha — la real
+                                   # de envío — y no con la del fin de la
+                                   # inferencia (fix "reloj detenido en 7:43 pm").
 
     # ── Control de flujo ─────────────────────────────────────────────
     done:           bool          # True → el grafo debe terminar
@@ -105,7 +110,8 @@ class AetherState(TypedDict):
 # ══════════════════════════════════════════════════════════════════════
 
 def crear_estado_inicial(orden: str, mem: dict, modo_autonomo: bool = True,
-                         imagenes: list[str] | None = None) -> "AetherState":
+                         imagenes: list[str] | None = None,
+                         fecha_envio: str = "") -> "AetherState":
     """
     Construye un AetherState completo y coherente para invocar el grafo.
 
@@ -119,6 +125,13 @@ def crear_estado_inicial(orden: str, mem: dict, modo_autonomo: bool = True,
 
     imagenes: thumbnails b64 de adjuntos de imagen (agente con visión
     inline). Vacío/None → comportamiento texto-only clásico.
+
+    fecha_envio: ISO de la hora REAL de llegada de la orden, capturada por
+    el entry point (Web UI/TUI/CLI). Viaja por el estado hasta
+    node_finalize, que estampa con ella el turno del usuario en el
+    historial persistente (sin esto quedaba con la hora del finalize —
+    minutos después en inferencias largas). Vacío → comportamiento
+    histórico (fecha = now() al registrar).
     """
     # Import local para evitar import circular (memory_manager → no depende de state)
     from core.memory.memory_manager import normalizar_mem
@@ -130,6 +143,7 @@ def crear_estado_inicial(orden: str, mem: dict, modo_autonomo: bool = True,
         "orden":         orden,
         "mem":           mem_norm,
         "modo_autonomo": modo_autonomo,
+        "fecha_envio":   fecha_envio,   # "" → node_finalize cae a now() (histórico)
 
         # ── Control de flujo ─────────────────────────────────────────
         "done":          False,
