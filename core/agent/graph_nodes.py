@@ -67,6 +67,10 @@ from core.agent.grounding import (
     extraer_veredicto,
     tiene_terminos_alarma,
     delimitar_bloque_datos,
+    clasificar_sin_respaldo,
+    aviso_no_verificados,
+    construir_feedback_regeneracion,
+    sanitizar_texto_sin_respaldo,
 )
 from core.tools.shell_executor import ejecutar_comando, validar_comando_red
 from core.tools.web_search import buscar_web
@@ -632,45 +636,126 @@ def _linea_veredicto_regeneracion(tool_outputs) -> str:
             "conteos, nada más.")
 
 
-def _aplicar_validacion_grounding(texto: str, orden: str, tool_outputs,
-                                  regenerar) -> str:
+# ── Alineación de grounding (2026-10): comandos ejecutados como corpus ────
+# El corpus del validador antes solo tenía las SALIDAS de las tools; el
+# nombre de un comando jamás aparece en su propia salida, así que citar
+# entre backticks lo que uno mismo corrió (`mount`, `du`) contaba como
+# "invención" y descartaba síntesis honestas (bug real de la auditoría de
+# almacenamiento). Estas helpers arman la lista de instrucciones realmente
+# ejecutadas para sumarlas al corpus de validación/clasificación.
+
+_RE_ARG_INSTRUCCION = re.compile(
+    r"'(?:instruccion|command|cmd|query|path|url)'\s*:\s*'([^']*)'")
+
+
+def _instruccion_de_args(args) -> str:
     """
-    P0-4 — validador anti-alucinación determinista (sin LLM).
+    String de la instrucción/comando de un paso, venga como dict (tool call
+    nativa del agent loop) o como repr-str (los resultados de sesión en RAM
+    guardan args como str). "" si no hay nada citable.
+    """
+    if isinstance(args, dict):
+        for clave in ("instruccion", "command", "cmd", "query", "path", "url"):
+            v = str(args.get(clave) or "").strip()
+            if v:
+                return v
+        return ""
+    m = _RE_ARG_INSTRUCCION.search(str(args or ""))
+    return (m.group(1) if m else "").strip()
+
+
+def _comandos_ejecutados(agent_pasos_log=(), resultados_sesion=(),
+                         plan_pasos=()) -> list[str]:
+    """
+    Comandos/instrucciones REALES ejecutadas en la sesión. Los pasos
+    bloqueados (cls="bloqueado") no cuentan: esa tool nunca llegó a
+    ejecutarse (P2-8, prohibición de ejecución del turno).
+    """
+    cmds: list[str] = []
+
+    def _agregar(c: str) -> None:
+        c = (c or "").strip()
+        if c and c not in cmds:
+            cmds.append(c)
+
+    for p in (agent_pasos_log or []):
+        if isinstance(p, dict) and p.get("cls") != "bloqueado":
+            _agregar(_instruccion_de_args(p.get("args")))
+    for p in (plan_pasos or []):
+        if isinstance(p, dict):
+            _agregar(str(p.get("instruccion") or "").strip()
+                     or _instruccion_de_args(p.get("args")))
+    for r in (resultados_sesion or []):
+        if isinstance(r, dict):
+            _agregar(_instruccion_de_args(r.get("args")))
+    return cmds
+
+
+def _aplicar_validacion_grounding(texto: str, orden: str, tool_outputs,
+                                  regenerar, comandos=None) -> str:
+    """
+    P0-4 + alineación 2026-10 — validador anti-alucinación determinista (sin LLM).
 
     Solo para flujos de seguridad/red/sistema. Verifica que la respuesta:
 
     1. cite exclusivamente datos presentes en las salidas de tools (con las
        exenciones de siempre: datos dichos por el usuario, constantes
-       inocuas);
+       inocuas, tools del sistema y COMANDOS EJECUTADOS en la sesión);
     2. no sugiera ningún curl/wget/http fuera de la allowlist;
     3. NO use términos de alarma (intrusión, comprometido, atacante,
        backdoor) si el veredicto determinista de net_audit no es "alerta":
        esas conclusiones las decide el veredicto, no el modelo.
 
-    Si falla algo: UNA regeneración con instrucción correctiva. Si vuelve a
-    fallar: resumen determinista armado solo con lo verificable (con el
-    veredicto, si existe), avisando que se descartó contenido no
-    verificable. `regenerar` es un callable que devuelve la respuesta
-    regenerada ("" si no se pudo).
+    Política de la alineación (bug real: una síntesis útil de 24 pasos de
+    auditoría se descartó entera por rutas normalizadas y comandos citados
+    entre backticks):
+
+    - ítems HARD (IPs/puertos/procesos realmente ausentes, rutas ajenas a
+      los datos): UNA regeneración con la LISTA EXACTA de lo que falló
+      (no una regla genérica). Si insiste: sanitizado parcial — se quitan
+      solo las oraciones con lo inventado y se conserva el resto
+      respaldado. Recién si no queda nada rescatable: resumen determinista.
+    - ítems SOFT (rutas variante de una real): la respuesta se entrega con
+      aviso honesto de "no verificado" — no se regenera ni se descarta.
+    - dominios fuera de allowlist o conclusión de alarma sin veredicto
+      "alerta": sin sanitizado — directo a resumen determinista.
+
+    `regenerar` es un callable que recibe el feedback correctivo y devuelve
+    la respuesta regenerada ("" si no se pudo); por compatibilidad también
+    se aceptan callables sin parámetros. `comandos` son las instrucciones
+    realmente ejecutadas en la sesión (ver _comandos_ejecutados).
     """
     if not _es_flujo_seguridad(orden, tool_outputs):
         return texto
-    veredicto = extraer_veredicto(tool_outputs)
+    comandos = list(comandos or [])
+    corpus = list(tool_outputs or []) + comandos
+    veredicto = extraer_veredicto(corpus)
 
     def _evaluar(t):
-        ok_t, ungt = validate_grounding(t, tool_outputs, user_message=orden)
+        ok_t, ungt = validate_grounding(t, corpus, user_message=orden)
+        hard_t, soft_t = clasificar_sin_respaldo(ungt, tool_outputs, comandos)
         dom_t = dominios_comando_no_permitidos(t)
         # Veredicto (item 3): términos de alarma solo con veredicto "alerta".
         alarma_t = (bool(veredicto) and veredicto != "alerta"
                     and tiene_terminos_alarma(t))
-        return ok_t, ungt, dom_t, alarma_t
+        return ok_t, hard_t, soft_t, dom_t, alarma_t
 
-    ok, ungrounded, dominios, alarma = _evaluar(texto)
-    if ok and not dominios and not alarma:
-        return texto
+    def _aceptar(t, soft_t):
+        if soft_t:
+            print(f"   └─ ⚠️  [GROUNDING]: {len(soft_t)} ítem(s) sin respaldo "
+                  "literal pero variante de datos reales; se entregan con "
+                  "aviso de no verificados.")
+            return t + aviso_no_verificados(soft_t)
+        return t
+
+    ok, hard, soft, dominios, alarma = _evaluar(texto)
+    if not hard and not dominios and not alarma:
+        return _aceptar(texto, soft)
     motivo = []
-    if not ok:
-        motivo.append(f"ítems sin respaldo ({[v for _, v in ungrounded][:6]})")
+    if hard:
+        motivo.append(f"ítems sin respaldo ({[v for _, v in hard][:6]})")
+    if soft:
+        motivo.append(f"ítems no verificados ({[v for _, v in soft][:6]})")
     if dominios:
         motivo.append(f"dominios no permitidos ({dominios})")
     if alarma:
@@ -678,18 +763,51 @@ def _aplicar_validacion_grounding(texto: str, orden: str, tool_outputs,
     print(f"   └─ ⚠️  [GROUNDING]: {', '.join(motivo)}. "
           "Regenerando una vez con instrucción de fidelidad.")
     regenerado = ""
-    try:
-        regenerado = (regenerar() or "").strip() if callable(regenerar) else ""
-    except Exception as e:
-        print(f"   └─ ⚠️  [GROUNDING]: la regeneración falló ({e}).")
+    if callable(regenerar):
+        try:
+            feedback = construir_feedback_regeneracion(hard, soft)
+            try:
+                regenerado = (regenerar(feedback) or "").strip()
+            except TypeError:
+                # Callable legado sin parámetro de feedback.
+                regenerado = (regenerar() or "").strip()
+        except Exception as e:
+            print(f"   └─ ⚠️  [GROUNDING]: la regeneración falló ({e}).")
+    mejor, hard_mejor, soft_mejor = texto, hard, soft
     if regenerado:
-        ok2, ungrounded2, dominios2, alarma2 = _evaluar(regenerado)
-        if ok2 and not dominios2 and not alarma2:
-            return regenerado
-        ungrounded = ungrounded2 or ungrounded
+        _, hard2, soft2, dominios2, alarma2 = _evaluar(regenerado)
+        if not hard2 and not dominios2 and not alarma2:
+            return _aceptar(regenerado, soft2)
+        # quedamos con el texto que tenga MENOS ítems hard
+        if len(hard2) < len(hard_mejor) and not dominios2 and not alarma2:
+            mejor, hard_mejor, soft_mejor = regenerado, hard2, soft2
+    # Sanitizado parcial: reparar antes que descartar (alineación). Solo
+    # cuando el problema son ítems hard puros — con dominios fuera de la
+    # allowlist o conclusiones de alarma no permitidas no hay oración que
+    # "quitar": va directo al resumen determinista.
+    if hard_mejor and not dominios and not alarma:
+        parcial, quitados = sanitizar_texto_sin_respaldo(mejor, hard_mejor)
+        if len(parcial.strip()) >= 40:
+            print("   └─ ⚠️  [GROUNDING]: la regeneración no alcanzó; quito "
+                  f"{len(quitados)} dato(s) sin respaldo y entrego el resto, "
+                  "que sí está verificado.")
+            aviso = ""
+            if quitados:
+                # Igual criterio que resumen_determinista: los valores SIN
+                # RESPALDO no se repiten en la respuesta final (solo los
+                # tipos) — no les damos echo a los inventos.
+                tipos_q = ", ".join(sorted({t for t, v in hard_mejor
+                                            if v in quitados}))
+                aviso += ("\n\n⚠️ Quité afirmaciones que citaban datos sin "
+                          f"respaldo real ({tipos_q}).")
+            soft_restantes = [(t, v) for t, v in soft_mejor if v in parcial]
+            aviso += aviso_no_verificados(soft_restantes)
+            return parcial + aviso
     print("   └─ ⚠️  [GROUNDING]: la respuesta seguía sin respaldo; "
           "se descarta y se responde solo con datos verificables.")
-    return resumen_determinista(tool_outputs, ungrounded, veredicto=veredicto)
+    return resumen_determinista(
+        tool_outputs, (hard_mejor + soft_mejor) or None,
+        veredicto=veredicto, comandos=comandos)
 
 
 def _extraer_json_objeto(texto: str):
@@ -1842,10 +1960,13 @@ def node_agent_loop(state: AetherState) -> dict:
                 "agent_messages": agent_messages + [{"role": "assistant", "content": contenido}],
             }
 
-        # P0-4: en flujos de seguridad/red/sistema, la respuesta solo puede
-        # citar lo que está en las salidas reales (una regeneración; si
-        # vuelve a fallar, resumen determinista).
-        def _regenerar_con_fidelidad() -> str:
+        # P0-4 + alineación: en flujos de seguridad/red/sistema la respuesta
+        # solo puede citar lo respaldado. El validador recibe TAMBIÉN los
+        # comandos ejecutados (citar `du`/`mount` no es invención) y la
+        # regeneración recibe la lista exacta de lo que falló.
+        comandos_sesion = _comandos_ejecutados(agent_pasos_log, resultados_sesion)
+
+        def _regenerar_con_fidelidad(feedback: str = "") -> str:
             mensajes = agent_messages + [
                 {"role": "assistant", "content": contenido},
                 {"role": "user", "content": (
@@ -1854,7 +1975,9 @@ def node_agent_loop(state: AetherState) -> dict:
                     "Reescribila cumpliendo esta regla: solo podés citar datos "
                     "presentes en los resultados; no inventes IPs, puertos ni "
                     "procesos. Si un dato no está en los resultados, no lo "
-                    "menciones. Respondé en texto plano, sin tool calls."
+                    "menciones como verificado. Respondé en texto plano, sin "
+                    "tool calls."
+                    + (f" {feedback}" if feedback else "")
                     + _linea_veredicto_regeneracion(tool_outputs)
                 )},
             ]
@@ -1866,13 +1989,19 @@ def node_agent_loop(state: AetherState) -> dict:
         texto_final = _aplicar_validacion_grounding(
             texto_final or contenido, orden, tool_outputs,
             regenerar=_regenerar_con_fidelidad,
+            comandos=comandos_sesion,
         )
 
         return {
             "final_response": texto_final or contenido,
             "done":           True,
             "agent_activo":   False,
-            "agent_messages": agent_messages + [{"role": "assistant", "content": contenido}],
+            # Alineación: el mensaje assistant que queda en el historial es
+            # el VALIDADO (lo que el usuario recibió), no el descartado —
+            # antes la respuesta invalidada seguía viva en el contexto y los
+            # turnos siguientes podían volver a citarla.
+            "agent_messages": agent_messages + [
+                {"role": "assistant", "content": texto_final or contenido}],
         }
 
     agent_messages = agent_messages + [{
@@ -1935,11 +2064,14 @@ def node_agent_loop(state: AetherState) -> dict:
                 # estar respaldada por salidas reales (una regeneración y a
                 # fallar de nuevo, resumen determinista).
                 _ses_id = state.get("sesion_id", "")
+                _resultados_text_tool = obtener_resultados_tools(
+                    mem, sesion_id=_ses_id)
                 _outputs = ([p.get("resultado") for p in agent_pasos_log]
-                            + [r.get("resultado") for r in
-                               obtener_resultados_tools(mem, sesion_id=_ses_id)])
+                            + [r.get("resultado") for r in _resultados_text_tool])
+                _comandos_text_tool = _comandos_ejecutados(
+                    agent_pasos_log, _resultados_text_tool)
 
-                def _regen_text() -> str:
+                def _regen_text(feedback: str = "") -> str:
                     mensajes = agent_messages + [
                         {"role": "assistant", "content": respuesta_directa},
                         {"role": "user", "content": (
@@ -1948,7 +2080,10 @@ def node_agent_loop(state: AetherState) -> dict:
                             "de las herramientas. Reescribila cumpliendo esta "
                             "regla: solo podés citar datos presentes en los "
                             "resultados; no inventes IPs, puertos ni procesos. "
-                            "Respondé en texto plano, sin tool calls."
+                            "Si un dato no está en los resultados, no lo "
+                            "menciones como verificado. Respondé en texto "
+                            "plano, sin tool calls."
+                            + (f" {feedback}" if feedback else "")
                             + _linea_veredicto_regeneracion(_outputs)
                         )},
                     ]
@@ -1959,7 +2094,8 @@ def node_agent_loop(state: AetherState) -> dict:
                     return (r.get("content") or "").strip()
 
                 respuesta_directa = _aplicar_validacion_grounding(
-                    respuesta_directa, orden, _outputs, regenerar=_regen_text)
+                    respuesta_directa, orden, _outputs,
+                    regenerar=_regen_text, comandos=_comandos_text_tool)
                 agent_messages.append(
                     {"role": "assistant", "content": respuesta_directa})
                 agent_pasos_log.append({"tool": "text", "args": args,
@@ -3637,6 +3773,67 @@ def _extraer_path_archivo(texto: str) -> str | None:
     return None
 
 
+def _es_video(ruta: str) -> bool:
+    """True si la ruta es un video soportado. La lista vive UNA sola vez
+    en backend.core.attachments._EXTS_VIDEO (fuente compartida con los
+    adjuntos de la Web UI)."""
+    try:
+        from backend.core.attachments import _EXTS_VIDEO
+        return os.path.splitext(ruta)[1].lower() in _EXTS_VIDEO
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _analizar_video_vision(ruta: str) -> str | None:
+    """Analiza un VIDEO por FRAMES (pipeline compartido con los adjuntos
+    de la Web UI: extracción única persistida en <video>.frames/, con
+    reuso de lo ya procesado). Devuelve el texto con timestamps y
+    captions de MODELO_VISION por frame, o None si no hay
+    capacidad/frames (la matriz de capacidades decide)."""
+    try:
+        from backend.core.attachments import (
+            _extraer_frames_video, _formato_mmss, _vision_video_activa,
+            describir_imagen)
+        if not _vision_video_activa():
+            return None
+        frames = _extraer_frames_video(ruta)
+        if not frames:
+            return None
+        lineas = [f"Video '{ruta}': análisis visual por frames."]
+        for f in frames:
+            desc = describir_imagen(f["path"])
+            lineas.append(f"[t={_formato_mmss(f['t'])}] "
+                          f"{desc or '(frame sin descripción)'}")
+        return "\n".join(lineas)
+    except Exception:  # noqa: BLE001 — best-effort: degrada al [ERROR]
+        return None
+
+
+def _vision_video_o_error(orden: str, ruta: str) -> dict:
+    """Return de node_vision para un video: análisis por frames si la
+    matriz de capacidades lo permite; si no, [ERROR] explícito con lo
+    que SÍ está disponible (la transcripción del mensaje del usuario)."""
+    analisis = _analizar_video_vision(ruta)
+    if analisis:
+        print(f"   └─ [VISIÓN]: video analizado por frames "
+              f"({analisis.count('[t=')} fotogramas).")
+        return {"vision_result": analisis, "final_response": None,
+                "messages": [HumanMessage(content=orden)]}
+    print(f"   └─ [VISIÓN]: sin análisis visual del video {ruta}.")
+    return {
+        "vision_result": (
+            f"[ERROR] El video '{ruta}' no se pudo analizar visualmente "
+            "(hace falta ffmpeg y algún modelo con visión —ver la matriz "
+            "de capacidades—, o el archivo es ilegible). Si el mensaje "
+            "del usuario incluye su transcripción (sección [ADJUNTOS DEL "
+            "USUARIO]) o su texto, respondé con eso; también podés releer "
+            "el archivo con fs_read."
+        ),
+        "final_response": None,
+        "messages": [HumanMessage(content=orden)],
+    }
+
+
 def node_vision(state: AetherState) -> dict:
     """
     Visión: describe una IMAGEN DE ARCHIVO si la orden referencia una
@@ -3657,6 +3854,9 @@ def node_vision(state: AetherState) -> dict:
         if os.path.isfile(ruta_arg):
             if os.path.splitext(ruta_arg)[1].lower() in _EXTS_IMAGEN:
                 imagen = ruta_arg
+            elif _es_video(ruta_arg):
+                print(f"\n👁️  [VISIÓN]: analizando video {ruta_arg} por frames.")
+                return _vision_video_o_error(orden, ruta_arg)
             else:
                 # Archivo real pero NO imagen (pdf/docx/mp4/...): la visión
                 # no lo puede ver. Nada de capturar la pantalla — eso sería
@@ -3700,6 +3900,9 @@ def node_vision(state: AetherState) -> dict:
         otro = _extraer_path_archivo(
             f"{tool_args.get('instruccion') or ''}\\n{orden}")
         if otro and os.path.splitext(otro)[1].lower() not in _EXTS_IMAGEN:
+            if _es_video(otro):
+                print(f"\n👁️  [VISIÓN]: analizando video {otro} por frames.")
+                return _vision_video_o_error(orden, otro)
             print(f"\\n👁️  [VISIÓN]: {otro} no es imagen; sin captura.")
             return {
                 "vision_result": (
@@ -4104,8 +4307,9 @@ def node_text(state: AetherState) -> dict:
     _resultados_text = obtener_resultados_tools(mem, sesion_id=_ses_id_text)
     if _resultados_text and not _comando_rechazado_red:
         _outputs_text = [r.get("resultado") for r in _resultados_text]
+        _comandos_text = _comandos_ejecutados(resultados_sesion=_resultados_text)
 
-        def _regenerar_text() -> str:
+        def _regenerar_text(feedback: str = "") -> str:
             try:
                 raw2 = _llm_chat(
                     system=_system_prompt_chat(mem, state),
@@ -4116,7 +4320,9 @@ def node_text(state: AetherState) -> dict:
                         "de esta sesión. Reescribila cumpliendo esta regla: "
                         "solo podés citar datos presentes en los resultados; "
                         "no inventes IPs, puertos ni procesos. Si un dato no "
-                        "está en los resultados, no lo menciones."
+                        "está en los resultados, no lo menciones como "
+                        "verificado."
+                        + (f" {feedback}" if feedback else "")
                         + _linea_veredicto_regeneracion(_outputs_text)
                     ),
                 )
@@ -4126,7 +4332,8 @@ def node_text(state: AetherState) -> dict:
                 return ""
 
         respuesta = _aplicar_validacion_grounding(
-            respuesta, orden, _outputs_text, regenerar=_regenerar_text)
+            respuesta, orden, _outputs_text, regenerar=_regenerar_text,
+            comandos=_comandos_text)
 
     comando_colado = _extraer_comando_de_texto(respuesta)
     if comando_colado:
@@ -4286,12 +4493,19 @@ def node_finalize(state: AetherState) -> dict:
     registrar_turno(
         mem, "usuario", state.get("orden", ""),
         sesion_id=sesion_id, tema=tema,
+        # FIX reloj (Plan B): estampar con la hora REAL de envío de la orden
+        # (capturada por el entry point y viajando en el estado), no con la
+        # hora del finalize — en inferencias largas podían ser minutos de
+        # diferencia y el historial mentía sobre cuándo se escribió.
+        fecha=state.get("fecha_envio") or None,
     )
 
     if respuesta:
         # Pasamos tema_actual (seteado por context_manager) para que
         # _resolver_referencia_anaforica pueda distinguir el tipo de
         # payload del turno anterior (shell vs web vs vision, etc).
+        # Sin fecha explícita → datetime.now() = hora real de FINALIZACIÓN
+        # de la respuesta (la querida: cuándo Aether terminó de contestar).
         registrar_turno(
             mem, "aether", respuesta,
             sesion_id=sesion_id, tema=tema,
@@ -4398,13 +4612,17 @@ def node_plan_synthesizer(state: AetherState) -> dict:
     # están ahí (el bug original: intrusión inventada sobre un netstat
     # sano), se regenera UNA vez y, si insiste, resumen determinista.
     _ses_id_sint = state.get("sesion_id", "")
+    _resultados_sint = obtener_resultados_tools(mem, sesion_id=_ses_id_sint)
     _outputs_sintesis = (
         [str(r) for r in plan_resultados]
-        + [r.get("resultado") for r in
-           obtener_resultados_tools(mem, sesion_id=_ses_id_sint)]
+        + [r.get("resultado") for r in _resultados_sint]
+    )
+    _comandos_sintesis = _comandos_ejecutados(
+        plan_pasos=state.get("plan_pasos") or [],
+        resultados_sesion=_resultados_sint,
     )
 
-    def _regenerar_sintesis() -> str:
+    def _regenerar_sintesis(feedback: str = "") -> str:
         try:
             raw2 = _llm_chat(
                 system=_system_prompt_sintesis(mem, state),
@@ -4416,7 +4634,8 @@ def node_plan_synthesizer(state: AetherState) -> dict:
                     "crudos de las herramientas. Reescribila cumpliendo esta "
                     "regla: solo podés citar datos presentes en los resultados; "
                     "no inventes IPs, puertos ni procesos. Si un dato no está "
-                    "en los resultados, no lo menciones."
+                    "en los resultados, no lo menciones como verificado."
+                    + (f" {feedback}" if feedback else "")
                     + _linea_veredicto_regeneracion(_outputs_sintesis)
                 ),
             )
@@ -4426,7 +4645,8 @@ def node_plan_synthesizer(state: AetherState) -> dict:
             return ""
 
     respuesta = _aplicar_validacion_grounding(
-        respuesta, orden, _outputs_sintesis, regenerar=_regenerar_sintesis)
+        respuesta, orden, _outputs_sintesis, regenerar=_regenerar_sintesis,
+        comandos=_comandos_sintesis)
 
     return {
         "final_response": respuesta,

@@ -187,6 +187,9 @@ class ConfigManager:
         "OLLAMA_NUM_PARALLEL": lambda x: isinstance(x, int) and x > 0,
         "OLLAMA_MAX_LOADED_MODELS": lambda x: isinstance(x, int) and x > 0,
         "MAX_STEPS_COMPUTER_USE": lambda x: isinstance(x, int) and 1 <= x <= 64,
+        # ── PIPELINE DE FRAMES DE VIDEO (ver backend/core/attachments.py
+        # _video_frames_n: el tope duro 8 también vive ahí como sanity) ──
+        "VIDEO_FRAMES": lambda x: isinstance(x, int) and 1 <= x <= 8,
         "MAX_HISTORIAL": lambda x: isinstance(x, int) and x > 0,
         "CONTEXTO_CONV_MAX_CHARS": lambda x: isinstance(x, int) and x > 0,
         "BASE_AETHER": ConfigValidator.validate_string,
@@ -244,6 +247,7 @@ class ConfigManager:
         "OLLAMA_NUM_PARALLEL": 4,
         "OLLAMA_MAX_LOADED_MODELS": 2,
         "MAX_STEPS_COMPUTER_USE": 8,
+        "VIDEO_FRAMES": 4,
         "MAX_HISTORIAL": 100000,
         "CONTEXTO_CONV_MAX_CHARS": 16000,
         "BASE_AETHER": "~/Aether",

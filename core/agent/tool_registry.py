@@ -78,9 +78,10 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "node": "node_vision",
         "instruccion_requerida": False,  # puede capturar pantalla sin instrucción explícita
         "descripcion": (
-            "Analizar una IMAGEN: un archivo adjunto del usuario (pasando "
-            "'path' con la ruta del archivo) o la pantalla actual (captura "
-            "del monitor) si no hay archivo."
+            "Analizar una IMAGEN o VIDEO: un archivo adjunto del usuario "
+            "(pasando 'path' con la ruta del archivo; los videos se "
+            "analizan por frames con timestamps) o la pantalla actual "
+            "(captura del monitor) si no hay archivo."
         ),
     },
     "codigo": {
@@ -252,9 +253,10 @@ TOOL_PARAMETROS: dict[str, dict] = {
         "properties": {
             "instruccion": {"type": "string", "description": "Qué mirar/analizar (opcional)."},
             "path": {"type": "string", "description": (
-                "Ruta absoluta de la imagen adjunta a describir "
-                "(png/jpg/jpeg/webp/gif/bmp/tiff). Si se indica, se analiza "
-                "ese archivo en vez de capturar la pantalla."
+                "Ruta absoluta de la IMAGEN o VIDEO adjunto a analizar "
+                "(png/jpg/jpeg/webp/gif/bmp/tiff o mp4/webm/mov/mkv/avi/"
+                "m4v). Si se indica, se analiza ese archivo (los videos, "
+                "por frames) en vez de capturar la pantalla."
             )},
         },
         "required": [],

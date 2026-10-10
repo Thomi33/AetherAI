@@ -17,14 +17,8 @@ from pathlib import Path
 
 from backend.core.aether_service import (
     AetherService,
-    TokenEvent,
-    StdoutLineEvent,
-    NodeUpdateEvent,
-    DoneEvent,
-    ErrorEvent,
     _log_event,
-    _CURRENT_STATE,
-    _CANCEL_EVENT,
+    _modelo_con_reasoning,
 )
 from core.utils.response_cleaner import limpiar_respuesta_chat
 from tui.status_messages import real_state_for_node
@@ -95,7 +89,16 @@ def _delta_front(delta) -> dict:
 
 def _payload_de_evento(event) -> dict | None:
     """Convierte eventos internos a payloads SSE/WS normalizados.
-    Devuelve None para eventos desconocidos (se omiten en el stream)."""
+
+    ÚNICA vía de serialización de eventos del motor: la usan el SSE
+    (/api/chat/stream → _consumir) y el WS (/ws/chat → ws_routes) — sin
+    cadenas isinstance duplicadas. Regresión que esto evita: el SSE tenía su
+    propia cadena que omitía ReasoningEvent (y su `done` no traía
+    `reasoning`), así que el motor emitía el razonamiento por su canal
+    dedicado pero moría acá y la Web UI jamás lo mostraba.
+
+    Devuelve None para eventos desconocidos (se omiten en el stream).
+    """
     from backend.core.aether_service import (
         TokenEvent, ReasoningEvent, NodeUpdateEvent, StdoutLineEvent,
         DoneEvent, ErrorEvent,
@@ -103,20 +106,29 @@ def _payload_de_evento(event) -> dict | None:
     if isinstance(event, TokenEvent):
         return {"type": "token", "data": event.fragmento}
     if isinstance(event, ReasoningEvent):
+        # Canal de razonamiento separado de la respuesta (Web UI).
         return {"type": "reasoning", "data": event.fragmento}
     if isinstance(event, NodeUpdateEvent):
         return {
             "type": "node",
             "node": event.nodo,
-            "estado": getattr(event, "estado", ""),
+            # Estado humano (mismo mapa que la TUI, status_messages.py)
+            # para el chip de actividad de la web.
+            "estado": real_state_for_node(event.nodo, event.delta),
+            # Delta saneado: plan_pasos/plan_index/tool_actual/
+            # agent_pasos_log/etc. → panel de plan/actividad web.
             "delta": _delta_front(event.delta),
         }
     if isinstance(event, StdoutLineEvent):
-        return {"type": "log", "data": event.texto}
+        return {"type": "log", "data": event.texto[:2000]}
     if isinstance(event, DoneEvent):
         return {
             "type": "done",
-            "response": event.respuesta,
+            # Misma limpieza que la TUI (limpiar_respuesta_chat): sin
+            # [SHELL]...[/SHELL] ni JSON de tool-call residual.
+            "response": limpiar_respuesta_chat(event.respuesta),
+            # Razonamiento completo del turno (fuente autoritativa, por si
+            # el cliente perdió fragmentos del streaming).
             "reasoning": event.reasoning or "",
         }
     if isinstance(event, ErrorEvent):
@@ -146,8 +158,9 @@ def _preparar_orden(body: dict) -> tuple[str, list[dict], list[str]]:
     if not isinstance(adjuntos, list) or not adjuntos:
         return mensaje, [], []
     from backend.core.attachments import (
-        adjuntos_ya_guardados, componer_orden, guardar_adjuntos,
-        generar_thumbnail_b64, modelo_admite_imagenes,
+        _MAX_IMAGENES_INLINE, adjuntos_ya_guardados, componer_orden,
+        generar_thumbnail_b64, guardar_adjuntos, modelo_admite_imagenes,
+        thumbnails_frames_inline,
     )
     from core.config.settings import MODELO
     pendientes = [a for a in adjuntos if a.get("data")]
@@ -161,16 +174,29 @@ def _preparar_orden(body: dict) -> tuple[str, list[dict], list[str]]:
 
     # Generar thumbnails para imágenes SOLO si el modelo soporta visión
     imagenes_b64 = []
+    cupo_frames = 0
     if soporta_vision:
         for m in metas:
             if m.get("kind") == "image" and m.get("path"):
                 thumb = generar_thumbnail_b64(m["path"])
                 if thumb:
                     imagenes_b64.append(thumb)
+        # Frames de VIDEO inline: llenan el cupo SOBRANTE del presupuesto
+        # compartido (_MAX_IMAGENES_INLINE) — las imágenes del usuario van
+        # primero y el overflow de frames queda solo-caption. Reusa los
+        # frames persistidos (una sola extracción por video; ver
+        # _extraer_frames_video).
+        cupo_frames = max(0, _MAX_IMAGENES_INLINE - len(imagenes_b64))
+        if cupo_frames:
+            imagenes_b64.extend(
+                thumbnails_frames_inline(metas, MODELO, cupo=cupo_frames))
 
-    # inline=True saltea la descripción por visión (modelo la ve directo)
+    # inline=True saltea la descripción por visión (modelo la ve directo);
+    # cupo_inline le pasa a componer_orden el cupo EXACTO de frames para
+    # que el texto no marque como "adjuntos" más de los que viajan.
     inline = bool(imagenes_b64)
-    orden = componer_orden(mensaje, metas, errores, describir=not inline, inline=inline)
+    orden = componer_orden(mensaje, metas, errores, describir=not inline,
+                           inline=inline, cupo_inline=cupo_frames)
     return orden, metas, imagenes_b64
 
 
@@ -193,7 +219,7 @@ async def chat(request: dict):
 async def chat_stream(raw_request: Request):
     body = await raw_request.json()
     # Igual que /chat: visión/IO fuera del event loop.
-    orden, _metas, _imagenes = await asyncio.get_running_loop().run_in_executor(
+    orden, _metas, imagenes = await asyncio.get_running_loop().run_in_executor(
         None, _preparar_orden, body)
     if not orden.strip():
         return JSONResponse(
@@ -201,47 +227,27 @@ async def chat_stream(raw_request: Request):
             status_code=400)
 
     def _consumir():
-        """El generador es síncrono: el grafo corre en su propio hilo."""
-        for evento in AetherService.iter_eventos(orden):
-            if isinstance(evento, TokenEvent):
-                payload = {"type": "token", "data": evento.fragmento}
-            elif isinstance(evento, NodeUpdateEvent):
-                payload = {
-                    "type": "node",
-                    "node": evento.nodo,
-                    # Estado humano (mismo mapa que la TUI, status_messages.py)
-                    # para el chip de actividad de la web.
-                    "estado": real_state_for_node(evento.nodo, evento.delta),
-                    # Delta saneado: plan_pasos/plan_index/tool_actual/
-                    # agent_pasos_log/etc. → panel de plan/actividad web.
-                    "delta": _delta_front(evento.delta),
-                }
-            elif isinstance(evento, StdoutLineEvent):
-                payload = {"type": "log", "data": evento.texto[:2000]}
-            elif isinstance(evento, DoneEvent):
-                payload = {
-                    "type": "done",
-                    # Misma limpieza que la TUI (limpiar_respuesta_chat):
-                    # sin [SHELL]...[/SHELL] ni JSON de tool-call residual.
-                    "response": limpiar_respuesta_chat(evento.respuesta),
-                }
-            elif isinstance(evento, ErrorEvent):
-                payload = {"type": "error", "message": evento.mensaje}
-            else:
+        """El generador es síncrono: el grafo corre en su propio hilo.
+
+        Serializa con _payload_de_evento (única vía, compartida con el WS)
+        y le pasa las imágenes al grafo — paridad total con /ws/chat. La
+        cadena isinstance duplicada que vivía acá omitía ReasoningEvent (el
+        razonamiento nunca llegaba a la Web UI) y las imágenes no viajaban
+        (visión inline rota por SSE)."""
+        for evento in AetherService.iter_eventos(orden, imagenes):
+            payload = _payload_de_evento(evento)
+            if payload is None:
                 continue
             yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     async def stream_response():
         # Include model reasoning capability in start event so frontend knows
         # whether to show reasoning block (only for models with native reasoning)
-        from core.config.settings import MODELO
         from backend.core.attachments import modelo_admite_imagenes
-        # Check if model supports reasoning (native thinking models)
-        # Currently models with vision typically also support reasoning
-        # but we use a more specific check: models that emit ReasoningEvent
-        # For now, assume models with "gemma" or "qwen" or "deepseek" in name support reasoning
-        model_name = MODELO.lower()
-        has_reasoning = any(x in model_name for x in ("gemma", "qwen", "deepseek", "r1", "reasoning"))
+        # Flag de razonamiento nativo: única fuente de verdad
+        # (_modelo_con_reasoning, compartida con la sesión live del turno —
+        # antes el heurístico estaba duplicado acá y en el live re-attach).
+        has_reasoning = _modelo_con_reasoning()
         yield f"data: {json.dumps({'type': 'start', 'busy': AetherService.ocupado(), 'reasoning': has_reasoning})}\n\n"
 
         gen = _consumir()
@@ -314,6 +320,108 @@ async def chat_stream(raw_request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+# ── Sesión live del turno (re-attach de la Web UI tras refresh) ────────────
+# El backend NO cancela la inferencia cuando el navegador se desconecta
+# (el lock lo libera el hilo del grafo al terminar): /api/chat/live/* le
+# permite a una tab recargada re-engancharse al turno en curso — re-emite
+# los eventos ya ocurridos (replay desde seq 0) y sigue streameando en
+# vivo hasta el done/error del turno.
+
+_SSE_HEADERS = {
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "X-Accel-Buffering": "no",
+}
+
+
+@router.get("/chat/live/status")
+async def live_status():
+    """Estado de la sesión live de la inferencia (restaurar tras F5)."""
+    return AetherService.live_snapshot()
+
+
+@router.get("/chat/live/stream")
+async def live_stream(raw_request: Request, since: int = 0):
+    """SSE de RE-ATTACH: re-emite la sesión live desde seq > since, en vivo.
+
+    Mismo contrato de payloads que /api/chat/stream (vía _payload_de_evento,
+    + campo aditivo "seq"). Primero drena el buffer (replay del turno hasta
+    el momento del refresh) y después sigue en vivo hasta el done/error del
+    turno. Sin sesión (backend reiniciado o TTL vencido) emite
+    {"type": "live_none"} y cierra: el frontend finaliza el turno con el
+    parcial que le quedó en localStorage.
+    """
+    snapshot = AetherService.live_snapshot()
+    if not (snapshot.get("active") or snapshot.get("done")):
+        async def _sin_sesion():
+            yield f"data: {json.dumps({'type': 'live_none'})}\n\n"
+            yield "data: [DONE]\n\n"
+        return StreamingResponse(_sin_sesion(), media_type="text/event-stream",
+                                 headers=_SSE_HEADERS)
+
+    async def stream_response():
+        meta = {
+            "type": "live_start",
+            "inf_id": snapshot.get("inf_id"),
+            "estado": snapshot.get("estado"),
+            "reasoning": bool(snapshot.get("reasoning")),
+            "done": bool(snapshot.get("done")),
+            # Metadata informativa: tamaño actual del buffer (NO es el seq
+            # de un evento; los eventos llevan su propio "seq").
+            "seq_total": snapshot.get("seq", 0),
+            "inicio": snapshot.get("inicio"),
+        }
+        yield f"data: {json.dumps(meta)}\n\n"
+
+        gen = AetherService.iter_live_eventos(since)
+        loop = asyncio.get_running_loop()
+        _VACIO = itertools.chain()  # sentinel del run_in_executor
+        pending = None  # futuro del executor que corre next(gen) — uno solo
+        try:
+            while True:
+                # Desconexión del cliente: dejamos de consumir. La sesión live
+                # es del TURNO, no de esta conexión: no se cancela nada.
+                try:
+                    disconnected = await asyncio.wait_for(
+                        raw_request.is_disconnected(), timeout=0.01)
+                except asyncio.TimeoutError:
+                    disconnected = False
+                if disconnected:
+                    _log_event("LIVE_CLIENT_GONE", None,
+                               "cliente live desconectado (re-attach abortado)")
+                    break
+
+                if pending is None:
+                    pending = loop.run_in_executor(None, next, gen, _VACIO)
+                try:
+                    # Shield: el timeout NO cancela el executor (sigue solo).
+                    par = await asyncio.wait_for(asyncio.shield(pending), timeout=15)
+                    pending = None
+                except asyncio.TimeoutError:
+                    yield ": keep-alive\n\n"
+                    continue
+                if par is _VACIO:
+                    break
+                seq, evento = par
+                payload = _payload_de_evento(evento)
+                if payload is None:
+                    continue
+                payload["seq"] = seq
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        finally:
+            # Igual que /chat/stream: si el generador está "already executing"
+            # en el executor, no pasa nada (la sesión muere sola con el TTL).
+            try:
+                gen.close()
+            except Exception:  # noqa: BLE001
+                pass
+        yield f"data: {json.dumps({'type': 'live_end'})}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(stream_response(), media_type="text/event-stream",
+                             headers=_SSE_HEADERS)
 
 
 @router.post("/stop")
