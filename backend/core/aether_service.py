@@ -18,6 +18,7 @@ import queue
 import contextlib
 import re
 import time
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Iterator
@@ -54,6 +55,91 @@ _EVENT_LOG: list[dict] = []
 # El endpoint _enqueue_prompt pone; el worker consumer la drena con timeout
 # corto para no bloquear inútilmente.
 _PROMPT_QUEUE: "queue.Queue[tuple[str, dict]]" = queue.Queue()
+
+# ── Sesión live de la inferencia (re-attach de la Web UI tras refresh) ──
+# Buffer append-only con TODOS los eventos de la inferencia ACTIVA. Una tab
+# recargada (F5 / reinicio del navegador) puede re-engancharse a mitad de
+# turno y re-emitirlos desde seq 0: la UI se restaura tal como estaba
+# (tokens en vivo, plan, razonamiento). ADITIVO: el consumidor original
+# (SSE /api/chat/stream o /ws/chat) sigue recibiendo por su cola privada
+# exactamente igual que antes (_publish alimenta ambos destinos).
+_LIVE_SESSION: dict | None = None
+_LIVE_LOCK = threading.Lock()
+# Una sesión terminada se conserva 24 h (el navegador puede volver HORAS
+# después y la tab recargada igual recupera la respuesta completa del
+# turno; la sesión vieja se reemplaza sola cuando arranca la próxima
+# inferencia, así que el TTL es solo higiene de RAM).
+_LIVE_TTL_SEG = 24 * 60 * 60
+
+
+def _modelo_con_reasoning() -> bool:
+    """Razonamiento nativo del MODELO (ÚNICA fuente de verdad: la usan
+    el 'start' del SSE /chat/stream y la sesión live del turno).
+
+    DELEGADO en core.config.capabilities.modelo_con_reasoning (matriz
+    de capacidades): primero las capacidades REALES de Ollama
+    (/api/show → capabilities: "thinking", verificado contra Ollama
+    v0.40.0); el heurístico por nombre queda SOLO como fallback cuando
+    Ollama no reporta capabilities (caída / versión vieja / modelo no
+    instalado). Firma y contrato sin cambios (bool).
+    """
+    try:
+        from core.config.capabilities import modelo_con_reasoning
+        return bool(modelo_con_reasoning())
+    except Exception:  # noqa: BLE001 — nunca frenar un turno por esto
+        return False
+
+
+def _live_reset(inf_id: str, orden: str, razonamiento: bool) -> None:
+    """Crea la sesión live de la inferencia que arranca (reemplaza la previa)."""
+    global _LIVE_SESSION
+    with _LIVE_LOCK:
+        _LIVE_SESSION = {
+            "inf_id": inf_id,
+            "preview": (orden or "")[:120] + ("…" if len(orden or "") > 120 else ""),
+            "inicio": time.time(),
+            "seq": 0,
+            "eventos": [],       # [(seq, Evento)] append-only
+            "done": False,
+            "fin_ts": 0.0,
+            "estado": "RUNNING",
+            "reasoning": bool(razonamiento),
+        }
+
+
+def _live_fin(estado: str, inf_id: str | None = None) -> None:
+    """Marca la sesión live como terminada (COMPLETED/FAILED/CANCELLED)."""
+    with _LIVE_LOCK:
+        s = _LIVE_SESSION
+        if s is None or s["done"]:
+            return
+        if inf_id is not None and s["inf_id"] != inf_id:
+            return  # la sesión ya es de otro turno (defensivo)
+        s["done"] = True
+        s["estado"] = estado
+        s["fin_ts"] = time.time()
+
+
+def _live_purge_si_vencida() -> None:
+    """Purga la sesión TERMINADA si venció el TTL. El llamador debe
+    sostener _LIVE_LOCK (no la toma acá: reentrancia)."""
+    global _LIVE_SESSION
+    s = _LIVE_SESSION
+    if (s is not None and s.get("done")
+            and time.time() - s.get("fin_ts", 0.0) > _LIVE_TTL_SEG):
+        _LIVE_SESSION = None
+
+
+def _publish(q: "queue.Queue", evento) -> None:
+    """Única vía de emisión del hilo del grafo: cola del consumidor ACTUAL
+    (comportamiento de siempre) + buffer secuenciado de la sesión live
+    (copia para clientes que se reconecten después del refresh)."""
+    q.put(evento)
+    with _LIVE_LOCK:
+        s = _LIVE_SESSION
+        if s is not None and not s["done"]:
+            s["seq"] += 1
+            s["eventos"].append((s["seq"], evento))
 
 
 def _log_event(tipo: str, inf_id: str | None = None,
@@ -164,8 +250,11 @@ Evento = (NodeUpdateEvent | StdoutLineEvent | TokenEvent | ReasoningEvent
 class _QueueWriter:
     """Captura print()/stdout del grafo y lo manda a la cola como líneas."""
 
-    def __init__(self, q: "queue.Queue[Evento]"):
+    def __init__(self, q: "queue.Queue[Evento]", publicar=None):
         self._q = q
+        # publicar(evento): vía de emisión compartida (cola del consumidor +
+        # sesión live). Por defecto solo la cola (compat con otros usos).
+        self._publicar = publicar or (lambda ev: q.put(ev))
         self._buffer = ""
 
     def write(self, s: str) -> int:
@@ -176,7 +265,7 @@ class _QueueWriter:
             linea, self._buffer = self._buffer.split("\n", 1)
             texto = _RE_ANSI.sub("", linea).rstrip()
             if texto:
-                self._q.put(StdoutLineEvent(texto=texto))
+                self._publicar(StdoutLineEvent(texto=texto))
         return len(s)
 
     def flush(self) -> None:
@@ -187,7 +276,7 @@ class _QueueWriter:
         if len(resto) > 500:
             resto = resto[:500] + "…"
         if resto.strip():
-            self._q.put(StdoutLineEvent(texto=resto))
+            self._publicar(StdoutLineEvent(texto=resto))
         self._buffer = ""
 
 
@@ -224,6 +313,12 @@ class AetherService:
 
                 logger.debug("Cargando memoria desde BD...")
                 _AETHER_MEMORY = cargar_memoria()
+                # Sesión única por arranque del servicio (igual que la TUI):
+                # sin sesion_id, los turnos del backend quedan sin sesión y
+                # no aparecen en /sesiones ni en el historial por tema/sesión.
+                if not _AETHER_MEMORY.get("sesion_id"):
+                    import uuid
+                    _AETHER_MEMORY["sesion_id"] = uuid.uuid4().hex
 
                 # Índice de programas (best-effort: si falla no bloquea el arranque)
                 try:
@@ -307,6 +402,13 @@ class AetherService:
 
         inf_id = f"inf-{int(time.time())}-{id(orden) % 10000:04d}"
 
+        # FIX reloj (Plan B): hora REAL de llegada de la orden al runtime.
+        # Viaja por el estado del grafo (AetherState.fecha_envio) hasta
+        # node_finalize, que estampa el turno del usuario con ESTA fecha —
+        # antes quedaba con la hora del finalize (minutos después en
+        # inferencias largas: el bug del "reloj detenido en 7:43 pm").
+        fecha_envio = datetime.now().isoformat()
+
         # ── CICLO DE VIDA: QUEUED → RUNNING/FAILED/CANCELLED ──────────
         if not _GEN_LOCK.acquire(blocking=False):
             _emit_inference_queued(inf_id, "inferencia activa; en cola FIFO")
@@ -317,17 +419,22 @@ class AetherService:
             return
 
         _emit_inference_start(inf_id)
+        # Sesión live del turno (re-attach de la Web UI tras refresh): buffer
+        # append-only de los mismos eventos que van a la cola del consumidor.
+        _live_reset(inf_id, orden, _modelo_con_reasoning())
         try:
             AetherService._asegurar_inicializado()
         except Exception as e:
             _emit_inference_failed(inf_id, f"init failed: {e}")
+            _live_fin("FAILED", inf_id)
             _GEN_LOCK.release()
             yield ErrorEvent(mensaje=f"Aether no pudo inicializarse: {type(e).__name__}: {e}")
             return
 
         q: "queue.Queue[Evento]" = queue.Queue()
         hilo = threading.Thread(
-            target=_correr_grafo_en_hilo, args=(orden, q, imagenes, inf_id),
+            target=_correr_grafo_en_hilo,
+            args=(orden, q, imagenes, inf_id, fecha_envio),
             daemon=True,
             name=f"grafo-{inf_id}",
         )
@@ -372,6 +479,11 @@ class AetherService:
                 # Preferencias compartidas con la TUI (/effort y /agents).
                 "effort": cfg.get("EFFORT", "medium"),
                 "agent": cfg.get("AGENTE", "build"),
+                # Ciclo de vida de la inferencia (re-attach de la Web UI tras
+                # refresh; el detalle del turno vive en /api/chat/live/status).
+                "inf_estado": _CURRENT_STATE.get("estado"),
+                "inf_id": _CURRENT_STATE.get("inf_id"),
+                "inf_inicio": _CURRENT_STATE.get("inicio"),
             }
             if not _AETHER_INITIALIZED:
                 return {**base, "status": "uninitialized", "agent_status": "offline"}
@@ -388,19 +500,81 @@ class AetherService:
             return {"name": "Aether", "status": "error", "agent_status": "offline"}
 
 
+    @staticmethod
+    def live_snapshot() -> Dict[str, Any]:
+        """Estado de la sesión live del turno (re-attach de la Web UI).
+
+        active=True → inferencia en curso; done=True → terminada pero aún
+        bufferizada (TTL de 24 h: la sesión vieja se reemplaza sola con la
+        próxima inferencia). El frontend lo consulta al boot tras un
+        refresh/reinicio del navegador para decidir si re-attachearse.
+        """
+        with _LIVE_LOCK:
+            _live_purge_si_vencida()
+            s = _LIVE_SESSION
+            if s is None:
+                return {"active": False, "done": False, "seq": 0, "eventos": 0}
+            return {
+                "active": not s["done"],
+                "done": s["done"],
+                "inf_id": s["inf_id"],
+                "estado": s["estado"],
+                "inicio": s["inicio"],
+                "fin_ts": s["fin_ts"],
+                "seq": s["seq"],
+                "eventos": len(s["eventos"]),
+                "preview": s["preview"],
+                "reasoning": s["reasoning"],
+            }
+
+    @staticmethod
+    def iter_live_eventos(since: int = 0) -> Iterator[tuple[int, Any]]:
+        """Re-emite la sesión live desde seq > since, en vivo hasta done.
+
+        Generador síncrono (se consume vía run_in_executor como el grafo):
+        primero drena el buffer existente (replay del turno hasta el
+        momento del refresh) y después sigue los eventos nuevos (poll corto
+        de 100 ms) hasta que la sesión termina. Mantiene su propia
+        referencia al dict: la purga por TTL no puede quitárselo de arriba.
+        """
+        with _LIVE_LOCK:
+            _live_purge_si_vencida()
+            s = _LIVE_SESSION
+        if s is None:
+            return
+        indice = 0
+        while True:
+            total = len(s["eventos"])
+            while indice < total:
+                seq, evento = s["eventos"][indice]
+                indice += 1
+                if seq > since:
+                    yield seq, evento
+            # El evento terminal (Done/Error) SIEMPRE está en el buffer antes
+            # de done=True (lo publica el hilo antes de su finally), así que
+            # el consumidor jamás se queda esperando el final que ya pasó.
+            if s["done"] and indice >= total:
+                return
+            time.sleep(0.1)
+
+
 # =====================================================================
 # EJECUCIÓN DEL GRAFO EN HILO (espejo de tui/engine_bridge.py)
 # =====================================================================
 def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
                            imagenes: list[str] | None = None,
-                           inf_id: str | None = None) -> None:
+                           inf_id: str | None = None,
+                           fecha_envio: str = "") -> None:
     from core.agent.streaming import set_cancel_thread_event
     inf_id = inf_id or f"inf-{int(time.time())}-{id(orden) % 10000:04d}"
     cancelled = False
     # Registrar el evento de cancelación de este hilo: streaming.request_cancel()
     # hilo_context-cancel_event, y el check ISP (ver abajo) lo lee.
     set_cancel_thread_event(_CANCEL_EVENT)
-    writer = _QueueWriter(q)
+    # Emisión del hilo: cola del consumidor actual + sesión live (re-attach).
+    writer = _QueueWriter(q, lambda ev: _publish(q, ev))
+    ultimo_estado: dict[str, Any] = {}
+    llego_finalize = False
     try:
         from core.agent.graph_builder import get_graph
         from core.agent.graph_state import crear_estado_inicial
@@ -414,7 +588,7 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
         )
         from core.memory.memory_manager import programar_consolidacion
 
-        set_token_sink(lambda frag: q.put(TokenEvent(fragmento=frag)))
+        set_token_sink(lambda frag: _publish(q, TokenEvent(fragmento=frag)))
 
         # Canal de razonamiento: separado de tokens y de stdout (logs).
         # Además de streamear cada fragmento, se acumula el razonamiento del
@@ -423,20 +597,20 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
 
         def _sink_reasoning(frag: str) -> None:
             razonamiento_turno.append(frag)
-            q.put(ReasoningEvent(fragmento=frag))
+            _publish(q, ReasoningEvent(fragmento=frag))
 
         set_reasoning_sink(_sink_reasoning)
 
-        # NO registrar el turno del usuario aquí: si lo hacemos antes de correr
+        # NO registrar el turno del usuario acá: si lo hacemos antes de correr
         # el grafo, el context_manager lo verá en la memoria y lo incluirá en
-        # el contexto de conversación. El modelo vería el mensaje del usuario
-        # tanto en el historial como en el prompt actual, generando eco.
-        # El turno del usuario se registra al final (ver bloque finally).
+        # el contexto de conversación (eco). Ahora lo registra node_finalize
+        # —antes que la respuesta y con tema/sesión— al completarse la
+        # inferencia; el finally solo cubre los caminos sin finalize.
 
         grafo = get_graph()
         estado = crear_estado_inicial(orden, _AETHER_MEMORY, modo_autonomo=True,
-                                      imagenes=imagenes)
-        ultimo_estado: dict[str, Any] = dict(estado)
+                                      imagenes=imagenes, fecha_envio=fecha_envio)
+        ultimo_estado = dict(estado)
 
         with contextlib.redirect_stdout(writer):
             from core.agent.streaming import is_cancelled, InferenceCancelled
@@ -444,7 +618,9 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
                 for nodo, delta in update.items():
                     if isinstance(delta, dict):
                         ultimo_estado.update(delta)
-                    q.put(NodeUpdateEvent(nodo=nodo, delta=delta or {}))
+                    if nodo == "finalize":
+                        llego_finalize = True
+                    _publish(q, NodeUpdateEvent(nodo=nodo, delta=delta or {}))
                     # Chequeo cooperativo de cancelación entre pasos: si el
                     # frontend cerró la conexión (Stop, cierre de pestaña,
                     # pérdida de WebSocket), abortamos AHORA antes del
@@ -458,17 +634,18 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
                         raise InferenceCancelled()
             writer.vaciar_residual()
 
-        respuesta = ultimo_estado.get("final_response") or "Operación completada."
+        from core.services.graph_service import respuesta_final_o_informe
+        respuesta = respuesta_final_o_informe(ultimo_estado)
         programar_consolidacion(_AETHER_MEMORY)
-        q.put(DoneEvent(respuesta=respuesta, reasoning="".join(razonamiento_turno)))
+        _publish(q, DoneEvent(respuesta=respuesta, reasoning="".join(razonamiento_turno)))
 
     except InferenceCancelled:
         cancelled = True
         writer.vaciar_residual()
-        q.put(ErrorEvent(mensaje="Inferencia cancelada por el usuario."))
+        _publish(q, ErrorEvent(mensaje="Inferencia cancelada por el usuario."))
     except Exception as e:  # noqa: BLE001 — toda falla debe llegar a la UI
         writer.vaciar_residual()
-        q.put(ErrorEvent(mensaje=f"{type(e).__name__}: {e}"))
+        _publish(q, ErrorEvent(mensaje=f"{type(e).__name__}: {e}"))
     finally:
         try:
             from core.agent.streaming import clear_token_sink, clear_reasoning_sink
@@ -476,22 +653,31 @@ def _correr_grafo_en_hilo(orden: str, q: "queue.Queue[Evento]",
             clear_reasoning_sink()
         except Exception:
             pass
-        # Registrar el turno del usuario AHORA (después de que el grafo terminó).
-        # Así el context_manager no lo ve en el historial de la inferencia actual,
-        # evitando que el modelo eco el mensaje del usuario.
-        try:
-            from core.memory.memory_manager import registrar_turno
-            registrar_turno(_AETHER_MEMORY, "usuario", orden)
-        except Exception:
-            pass
+        # Fallback del turno del usuario: SOLO si el grafo no llegó a finalize
+        # (cancelación, error, END directo). Si llegó, node_finalize ya lo
+        # registró —antes que la respuesta y con tema/sesión—; no duplicar.
+        if not llego_finalize:
+            try:
+                from core.memory.memory_manager import registrar_turno
+                registrar_turno(
+                    _AETHER_MEMORY, "usuario", orden,
+                    sesion_id=_AETHER_MEMORY.get("sesion_id", ""),
+                    tema=ultimo_estado.get("tema_actual", ""),
+                    fecha=fecha_envio or None,
+                )
+            except Exception:
+                pass
         # Estado final: COMPLETED / FAILED / CANCELLED según cómo terminó.
         try:
             if cancelled:
                 _emit_inference_cancelled(inf_id, "cancelada por el usuario/stop")
+                _live_fin("CANCELLED", inf_id)
             elif _CURRENT_STATE.get("error"):
                 _emit_inference_failed(inf_id, _CURRENT_STATE["error"])
+                _live_fin("FAILED", inf_id)
             else:
                 _emit_inference_completed(inf_id)
+                _live_fin("COMPLETED", inf_id)
         except Exception:
             pass
         _CURRENT_STATE.pop("error", None)

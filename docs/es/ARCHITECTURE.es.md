@@ -261,22 +261,33 @@ Memoria RAM
     └── historial de comandos
           │
           ▼
-     current.db
+  memoria.json (<BASE_AETHER>/db/, escrituras atómicas + .bak rotativo)
           │
-          ├── conversaciones
+          ├── core
+          ├── resumen {texto, ultimo_turno_id, actualizado}
+          ├── conversaciones {id, fecha, rol, texto, sesion_id, tema, proyecto}
           ├── comandos
-          ├── recuerdos
-          ├── core_memory
-          └── resumen_memoria
+          └── recuerdos
 ```
 
-`memory_manager.py` utiliza `~/Aether/db/current.db` como DB de producción. La estructura RAM se normaliza mediante `normalizar_mem()`.
+`memory_manager.py` persiste todo a través de `memoria_store.py`: un único store JSON con escritura atómica, backup y recuperación ante corrupción. La DB legacy (`current.db`, sqlite) se importa una sola vez al primer arranque y no se vuelve a tocar. La estructura RAM se normaliza mediante `normalizar_mem()`.
 
-El contexto conversacional no se inyecta sin límite: `settings.py` define presupuestos de turnos y caracteres. Para planes multi-tool, el historial conversacional puede recortarse a cero turnos para evitar contaminación entre pasos; los resultados de pasos anteriores constituyen el contexto operativo relevante.
+El contexto conversacional no se inyecta sin límite: `settings.py` define presupuestos de turnos y caracteres. Para planes multi-tool, el historial conversacional puede recortarse a cero turnos para evitar contaminación entre pasos; los resultados de pasos anteriores constituyen el contexto operativo relevante. Con tema, el historial se inyecta por tema/sesión; sin tema, los últimos N turnos por recencia.
 
-`consolidator.py` programa la actualización del resumen acumulativo después de completar una orden.
+Los turnos se registran al completar la inferencia (`node_finalize`), en orden cronológico real (usuario → asistente) y con `tema`/`sesion_id` en ambos, así el mensaje actual nunca se duplica entre historial y prompt.
 
-El repositorio también contiene un subsistema `core/memory/store/` destinado a controlar esquema, migraciones, snapshots, staging y escritura persistente.
+La consolidación del resumen acumulativo se agenda tras completar una orden (la v2 la movió a `memory_manager`; el viejo `consolidator.py` se eliminó). El consolidador:
+
+- llama al modelo con `think=false` y toma la salida tras el ÚLTIMO bloque
+  de thinking (aunque falte el tag de apertura): el razonamiento del modelo
+  nunca llega al resumen;
+- exige que la salida empiece con `RESUMEN CONSOLIDADO` — si no, se conserva
+  el resumen anterior y se reintenta más tarde;
+- avanza el cursor `ultimo_turno_id` al último turno consolidado: los mismos
+  turnos no se re-procesan;
+- guarda solo hechos verificables, decisiones y pendientes — sin perfil
+  psicológico ni estado de ánimo, sin log de eventos, sin duplicados, y lo
+  que dice el asistente nunca se registra como hechos del usuario.
 
 ## 11. MCP y extensibilidad
 
@@ -319,9 +330,6 @@ bin/aether
 run.py
     └── CLI/TUI
           └── core.services.graph_service
-
-jarvis_new.py
-    └── entrada alternativa al motor
 ```
 
 El launcher `bin/aether` soporta ejecución desde cualquier directorio y comandos como `task`, `doctor`, `cli`, `--version` y `--help`.
@@ -390,3 +398,46 @@ Este documento se contrastó directamente con los componentes principales de `ma
 - `core/memory/memory_manager.py`
 - `core/tools/*`
 - `README.md`
+
+## 19. Modelos aprobados y pipeline multimodal (2026-10, v1.5)
+
+### Modelos aprobados (evaluados oficialmente)
+
+**Ornith** (`ornith-1.5:9b`) y **Granite**
+(`hf.co/ibm-granite/granite-4.2-8b-GGUF:Q6_K`) aprobaron las evaluaciones del
+mantenedor y figuran como modelos compatibles con Aether. Granite registra una
+**limitación de autonomía** (en tareas agénticas largas puede detenerse antes
+de completar y requerir intervención manual) que NO afecta su aprobación:
+compatibilidad funcional y autonomía sostenida son dimensiones distintas, y la
+causa no está atribuida (modelo, runtime o gestión de contexto). Detalle
+completo con capacidades medidas (`ollama show`), hardware registrado y la
+propuesta de mecanismos de recuperación (NO implementada):
+[`MODELOS.es.md`](./MODELOS.es.md) · [EN](../MODELOS.md). El instalador
+(`installer/install-core.sh`) ofrece ambos, detecta los ya instalados y
+mantiene la opción de modelo personalizado.
+
+### Matriz de capacidades por modelo
+
+`core/config/capabilities.py` es la fuente única de verdad de qué puede hacer
+Aether con cada modelo: capacidades DECLARADAS por Ollama
+(`capacidades_modelo()` → `/api/show`: vision/tools/thinking/embedding/audio,
+con fallback `projector_info`) vs capacidades EFECTIVAS
+(`funciones_disponibles()`: declaradas + entorno — ffmpeg / faster-whisper /
+grim — + config MODELO/MODELO_VISION). Los wrappers delegan
+(`attachments.modelo_admite_imagenes`, `aether_service._modelo_con_reasoning`);
+el `reasoning` del SSE `start` sale de las capacidades reales de Ollama, con el
+heurístico por nombre solo como fallback. Regla R19 de `ai_map.md`.
+
+### Pipeline de video multimodal
+
+Los adjuntos de video se analizan visualmente: `_extraer_frames_video` extrae
+N frames equiespaciados UNA vez (persisten en `<video>.frames/` y se reusan
+para captions, inline y turnos futuros; presupuesto ffmpeg 30 s; config
+`VIDEO_FRAMES`, default 4, tope 8). `componer_orden` embebe los captions con
+timestamps junto a la transcripción (faster-whisper, decodificada vía
+ffmpeg→ndarray — PyAV nunca se usa en runtime). Los modelos text-only reciben
+captions vía `MODELO_VISION`; los multimodales, los frames inline dentro del
+presupuesto compartido de 4 imágenes (las imágenes del usuario van primero).
+La tool `vision` del grafo también analiza videos por frames. El texto
+extraído/transcripciones se persisten como sidecar (`<archivo>.txt`) para que
+el flujo upload→path de la Web UI los recupere.

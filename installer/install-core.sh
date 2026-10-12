@@ -83,6 +83,66 @@ choose_suite() {
 }
 
 # ---------------------------------------------------------------------------
+# Modelos aprobados (evaluados oficialmente, ver docs/MODELOS.md y
+# docs/es/MODELOS.es.md): Ornith y Granite. El menú SOLO aparece en modo
+# interactivo; con --model, -y/--yes, --no-ollama o --minimal se mantiene
+# el flujo previo (recomendación del probe).
+# ---------------------------------------------------------------------------
+MODELO_ORNITH="ornith-1.5:9b"
+MODELO_GRANITE="hf.co/ibm-granite/granite-4.2-8b-GGUF:Q6_K"
+
+model_installed() { ollama list 2>/dev/null | grep -qiF "$1"; }
+
+modelo_recomendado() {
+  python -c 'import json,sys;print(json.load(sys.stdin).get("recomendado",{}).get("MODELO",""))' <<<"$PROBE_JSON" 2>/dev/null || true
+}
+
+choose_model() {
+  [ -n "$WANT_MODEL" ] && return                      # --model: ya decidido
+  if [ "$ASSUME_YES" = "1" ] || [ "$MINIMAL" = "1" ] || [ "$NO_OLLAMA" = "1" ]; then
+    WANT_MODEL="$(modelo_recomendado)"               # flujo previo, no interactivo
+    return
+  fi
+  have ollama || { WANT_MODEL="$(modelo_recomendado)"; return; }
+
+  local ornith_tag="" granite_tag="" rec default_sel sel custom
+  rec="$(modelo_recomendado)"
+  model_installed "$MODELO_ORNITH"  && ornith_tag="  [ya instalado]"
+  model_installed "$MODELO_GRANITE" && granite_tag="  [ya instalado]"
+  if [ -n "$rec" ]; then default_sel=3; else default_sel=1; fi
+
+  echo
+  echo "🧠 Elegí el modelo primario para Aether:"
+  echo "   Modelos aprobados (evaluados oficialmente — docs/MODELOS.md):"
+  echo "     1) Ornith 1.5 (9B, Q4_K_M)${ornith_tag}"
+  echo "        Multimodal (vision + thinking + tools); modelo de referencia del"
+  echo "        proyecto. Probe HIGH/ULTRA: ~12GB+ de VRAM o 32GB de RAM."
+  echo "     2) Granite 4.2 (8B, Q6_K)${granite_tag}"
+  echo "        tools + thinking; sin vision nativa (usa MODELO_VISION para imágenes)."
+  echo "        ⚠ registrado: en tareas agenticas largas puede detenerse antes de"
+  echo "        completar y requerir intervención manual (aprobado igualmente)."
+  echo "     3) Recomendado por tu hardware (tier $TIER): ${rec:-—}"
+  echo "     4) Otro modelo de Ollama (personalizado)"
+  while :; do
+    if ! read -r -p "Opción [1-4, Enter=$default_sel]: " sel; then
+      WANT_MODEL="$MODELO_ORNITH"; break
+    fi
+    case "$sel" in
+      1) WANT_MODEL="$MODELO_ORNITH";  break ;;
+      2) WANT_MODEL="$MODELO_GRANITE"; break ;;
+      3) if [ -n "$rec" ]; then WANT_MODEL="$rec"; break
+         else echo "   El probe no trae recomendación para este tier."; fi ;;
+      4) if ! read -r -p "   Nombre exacto en Ollama (ej. qwen3:4b): " custom; then continue; fi
+         if [ -n "$custom" ]; then WANT_MODEL="$custom"; break; fi ;;
+      "") if [ "$default_sel" = "3" ]; then WANT_MODEL="$rec"; else WANT_MODEL="$MODELO_ORNITH"; fi
+          break ;;
+      *) echo "   Opción inválida." ;;
+    esac
+  done
+  [ -n "$WANT_MODEL" ] || WANT_MODEL="$MODELO_ORNITH"
+}
+
+# ---------------------------------------------------------------------------
 # Repository safety / config migration
 # ---------------------------------------------------------------------------
 prepare_git_update() {
@@ -313,6 +373,9 @@ if [ -f tools/hardware_probe.py ]; then
   if [ -n "$TIER_REQ" ]; then PROBE_JSON=$(python tools/hardware_probe.py --force-tier "$(echo "$TIER_REQ" | tr '[:lower:]' '[:upper:]')" ${WANT_MODEL:+--model-override "$WANT_MODEL"} 2>/dev/null || echo "$PROBE_JSON"); TIER="$(echo "$TIER_REQ" | tr '[:lower:]' '[:upper:]')"; else PROBE_JSON=$(python tools/hardware_probe.py ${WANT_MODEL:+--model-override "$WANT_MODEL"} 2>/dev/null || echo "$PROBE_JSON"); TIER=$(python -c 'import json,sys;print(json.load(sys.stdin).get("tier","LOW"))' <<<"$PROBE_JSON" 2>/dev/null || echo "$TIER"); fi
 fi
 [ "$LOW_SPEC" = "1" ] && TIER=LOW
+# Menú de modelo primario (aprobados Ornith/Granite + probe + custom).
+# En modos no interactivos cae a la recomendación del probe, igual que antes.
+choose_model
 [ -z "$WANT_MODEL" ] && WANT_MODEL="$(python -c 'import json,sys;print(json.load(sys.stdin).get("recomendado",{}).get("MODELO",""))' <<<"$PROBE_JSON" 2>/dev/null || true)"
 write_local_config
 choose_suite

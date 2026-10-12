@@ -156,6 +156,21 @@ def _cfg_desde_body(body: McpServerBody, env_base: dict) -> dict:
     }
 
 
+def _reset_manager() -> None:
+    """Invalida el manager singleton tras mutar la config de MCP.
+
+    El manager cachea la vista de servers al crearse; sin esto, un toggle de
+    enabled (o un alta/edición/baja) no aplicaba hasta reiniciar el proceso
+    — el agente seguía viendo las tools del server deshabilitado. Nunca
+    bloquea la operación: si el reset falla, la config igual quedó escrita
+    (aplica en el próximo arranque)."""
+    try:
+        from core.tools.mcp_client import reset_mcp_manager
+        reset_mcp_manager()
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️  [MCP]: no se pudo resetear el manager: {e}")
+
+
 @router.post("/mcps")
 async def agregar(body: McpServerBody):
     """Agrega un server MCP custom. 409 si el nombre ya existe (usar PATCH).
@@ -179,6 +194,7 @@ async def agregar(body: McpServerBody):
         _escribir_local(local)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    _reset_manager()
     return {"ok": True, "server": _serializar(body.name, local[body.name])}
 
 
@@ -213,6 +229,7 @@ async def editar(nombre: str, body: McpServerBody):
         _escribir_local(local)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    _reset_manager()
     return {"ok": True, "server": _serializar(body.name, nueva)}
 
 
@@ -236,6 +253,7 @@ async def borrar(nombre: str):
         _escribir_local(local)
     except Exception as e:  # noqa: BLE001
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    _reset_manager()
     return {"ok": True}
 
 

@@ -175,12 +175,25 @@ def set_enabled(nombre: str, valor: bool) -> None:
 
 
 def _cargar_config_servers(ruta: Path | None = None) -> dict[str, dict]:
-    """Config que consume el manager: merge plantilla ← local.
+    """Config que consume el manager: merge plantilla ← local, SOLO habilitados.
+
+    FIX toggle: el flag `enabled` (capa local; lo escriben la Web UI /mcps y
+    la TUI /mcps vía set_enabled) se RESPETA acá — antes era cosmético: el
+    manager conectaba igual a un server deshabilitado y sus tools seguían
+    entrando al catálogo del agente (list_servers/list_all_tools), incluso
+    tratándose de servers con tokens (ej. github). La vista de la Web UI
+    (GET /mcps) usa cargar_merge directo, así que los servers deshabilitados
+    SE SIGUEN mostrando (para poder re-activarlos); solo el RUNTIME los
+    excluye.
 
     `ruta` (compat con MCPClientManager(config_path=...)) permite apuntar la
     PLANTILLA a otra ruta; la capa local se mergea igual.
     """
-    return cargar_merge(ruta_base=ruta or RUTA_BASE)
+    merged = cargar_merge(ruta_base=ruta or RUTA_BASE)
+    return {
+        nombre: cfg for nombre, cfg in merged.items()
+        if isinstance(cfg, dict) and cfg.get("enabled", True)
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -455,3 +468,24 @@ def get_mcp_manager() -> MCPClientManager:
             if _manager_singleton is None:
                 _manager_singleton = MCPClientManager()
     return _manager_singleton
+
+
+def reset_mcp_manager() -> None:
+    """Cierra y descarta el manager singleton.
+
+    El manager cachea la vista de servers al crearse, así que sin esto un
+    cambio de config (toggle de `enabled`, alta/edición/baja desde la Web UI
+    /mcps o la TUI /mcps) no aplicaba hasta reiniciar el proceso — el agente
+    seguía viendo y usando las tools del server deshabilitado. Los puntos
+    que mutan la config llaman este reset; el próximo get_mcp_manager()
+    reconstruye con la config nueva (reconecta los servers que queden).
+    """
+    global _manager_singleton
+    with _singleton_lock:
+        manager = _manager_singleton
+        _manager_singleton = None
+    if manager is not None:
+        try:
+            manager.close()
+        except Exception as e:  # noqa: BLE001 — el reset nunca debe romper la UI
+            print(f"⚠️  [MCP]: error cerrando el manager al resetear: {e}")

@@ -9,7 +9,7 @@ Slots:
     [SISTEMA]         — core_memory (siempre presente)
     [RECUERDOS]       — hechos permanentes relevantes al tema
     [INTENTOS RECIENTES] — acciones que ya se probaron y NO dieron resultado
-    [CONVERSACIÓN]    — solo turnos del tema actual (no todo el historial)
+    [CONVERSACIÓN]    — turnos del tema actual; sin tema, los últimos N por recencia
     [COMANDOS]        — últimos comandos ejecutados (solo si aplica)
 
 Context Dump:
@@ -21,12 +21,20 @@ from core.memory.memory_manager import (
     obtener_recuerdos,
     obtener_turnos_por_tema,
     obtener_ultimos_turnos,
+    obtener_resultados_tools,
 )
 from core.config.settings import (
     CONTEXTO_CONV_MAX_CHARS,
     MAX_TURNOS_CONTEXTO,
     MAX_TURNOS_CONTEXTO_CHAT,
     MAX_TURNOS_CONTEXTO_PLAN,
+    MAX_RESULTADOS_TOOLS_CONTEXTO,
+    MAX_LINEAS_RESULTADO_TOOL,
+)
+from core.agent.grounding import (
+    truncar_lineas,
+    INSTRUCCION_DATOS_TOOL,
+    delimitar_bloque_datos,
 )
 
 # Temas que NO necesitan historial de comandos en el contexto
@@ -112,6 +120,41 @@ def _limite_turnos(tema: str, es_multitool: bool) -> int:
     return MAX_TURNOS_CONTEXTO
 
 
+def _turnos_para_contexto(tema: str, sesion_id: str, mem: dict, limite: int) -> list:
+    """
+    Turnos que van a entrar al contexto (única fuente de verdad, compartida
+    entre construir_contexto_memoria y construir_context_dump).
+
+    - Con tema: solo turnos de ese tema (y sesión, si se sabe) — igual que
+      siempre.
+    - SIN tema (vacío/None): últimos N por recencia, preferentemente de la
+      SESIÓN actual (aislamiento: no se mezclan sesiones). Fallback final:
+      últimos N del store global.
+
+    Fix del bug "Turnos (tema): 0 inyectados": la recuperación por recencia
+    ya existía, pero el dump no la mostraba y el fallback global podía traer
+    turnos de otras sesiones.
+    """
+    if limite <= 0:
+        return []
+    if tema:
+        return obtener_turnos_por_tema(tema, sesion_id=sesion_id, limit=limite)
+    sesion_actual = sesion_id or _sesion_actual(mem)
+    if sesion_actual:
+        # Aislamiento por sesión: quedan los turnos de la sesión actual y
+        # los legacy guardados sin sesion_id (los bridges viejos no la
+        # seteaban; no se les puede atribuir otra sesión). Se EXCLUYEN los
+        # turnos de sesiones distintas.
+        turnos_sesion = [
+            t for t in (mem.get("conversacion") or [])
+            if isinstance(t, dict)
+            and (not t.get("sesion_id") or t.get("sesion_id") == sesion_actual)
+        ]
+        if turnos_sesion:
+            return turnos_sesion[-limite:]
+    return obtener_ultimos_turnos(limite)
+
+
 def construir_contexto_memoria(
     mem: dict, tema: str = "", sesion_id: str = "", es_multitool: bool = False,
     orden: str = "",
@@ -122,7 +165,8 @@ def construir_contexto_memoria(
     Args:
         mem:  dict RAM de Aether (cargado por memory_manager)
         tema: intención detectada por el planner ("web", "shell", "chat", etc.)
-              Si está vacío, solo inyecta core_memory y recuerdos importantes.
+              Si está vacío, el historial entra por recencia (últimos N turnos
+              sin filtro de tema) además de core_memory y recuerdos.
         es_multitool: True si el plan activo tiene más de 1 paso. Fuerza
               MAX_TURNOS_CONTEXTO_PLAN (ventana adaptativa, ver arriba).
         orden: pedido original del usuario. Matchea los intentos fallidos
@@ -216,13 +260,13 @@ def construir_contexto_memoria(
             "reportá que no hay resultados y cerrá ahí.\n" + intentos
         )
 
-    # ── Slot 3: CONVERSACIÓN filtrada por tema ────────────────────────
-    turnos_relevantes = []
-
-    if tema and limite_turnos > 0:
-        turnos_relevantes = obtener_turnos_por_tema(
-            tema, sesion_id=sesion_id, limit=limite_turnos
-        )
+    # ── Slot 3: CONVERSACIÓN ───────────────────────────────────────────
+    # Con tema: solo turnos de ese tema (y sesión, si se sabe). SIN tema no
+    # hay criterio de relevancia → últimos N turnos por recencia, de la
+    # sesión actual si se conoce (ver _turnos_para_contexto).
+    turnos_relevantes = _turnos_para_contexto(
+        tema, sesion_id, mem, limite_turnos
+    )
 
     if not turnos_relevantes and limite_turnos > 0:
         # Usar sesion_id explícito, o fallback al último de la RAM
@@ -270,6 +314,31 @@ def construir_contexto_memoria(
     else:
         descartado.append(f"comandos (innecesarios para tema '{tema}')")
 
+    # ── Slot 5: RESULTADOS DE TOOLS (follow-ups: "qué encontraste") ─────
+    # Fix del bug "síntesis inventada": en un turno follow-up el modelo debe
+    # ver las salidas REALES de las últimas tools de la sesión, verbatim.
+    # Sin esto, "dame una síntesis de lo que encontraste" se respondía sin
+    # ningún dato y el modelo rellenaba con IPs/puertos/procesos inventados.
+    # Los datos van en bloques DELIMITADOS (<<<DATOS_TOOL ... DATOS_TOOL>>>)
+    # y sanitizados: son datos observados, NUNCA instrucciones — una salida
+    # maliciosa no puede cerrar el bloque ni inyectar órdenes (prompt
+    # injection). No se inyecta en pasos multi-tool (anti-contaminación).
+    if not es_multitool:
+        resultados = obtener_resultados_tools(
+            mem, sesion_id=sesion_id or _sesion_actual(mem),
+            limit=MAX_RESULTADOS_TOOLS_CONTEXTO,
+        )
+        if resultados:
+            lineas_rt = [INSTRUCCION_DATOS_TOOL]
+            for r in resultados:
+                cuerpo, aviso = truncar_lineas(
+                    str(r.get("resultado") or ""), MAX_LINEAS_RESULTADO_TOOL)
+                encabezado = f"{r.get('tool', '?')} {r.get('fecha', '')}"
+                if aviso:
+                    encabezado += f" {aviso}"
+                lineas_rt.append(delimitar_bloque_datos(encabezado, cuerpo))
+            slots["RESULTADOS DE TOOLS DEL TURNO ANTERIOR"] = "\n\n".join(lineas_rt)
+
     # ── Ensamblar contexto final ──────────────────────────────────────
     partes = []
     for nombre, contenido in slots.items():
@@ -309,18 +378,29 @@ def construir_context_dump(mem: dict, tema: str = "", sesion_id: str = "", es_mu
         obtener_recuerdos(categoria=tema if tema else None, importancia_min=1, limit=MAX_RECUERDOS)
     )
     limite_turnos = _limite_turnos(tema, es_multitool)
+    # Lo que REALMENTE entra al contexto (misma fuente de verdad que
+    # construir_contexto_memoria). Antes, con tema vacío, el dump contaba
+    # solo obtener_turnos_por_tema → reportaba "0 inyectados" aunque la
+    # recuperación por recencia sí inyectara turnos.
+    turnos_inyectados = _turnos_para_contexto(tema, sesion_id, mem, limite_turnos)
     turnos_tema = (
-        obtener_turnos_por_tema(tema, sesion_id=sesion_id, limit=limite_turnos)
-        if tema and limite_turnos > 0 else []
+        [t for t in turnos_inyectados if isinstance(t, dict) and t.get("tema") == tema]
+        if tema else []
     )
-    
+    resultados_tools = obtener_resultados_tools(
+        mem, sesion_id=sesion_id or _sesion_actual(mem),
+        limit=MAX_RESULTADOS_TOOLS_CONTEXTO,
+    )
+
     slots_activos = ["SISTEMA"]
     if recuerdos_count:
         slots_activos.append("RECUERDOS")
-    if turnos_tema or turnos:
+    if turnos_inyectados or turnos:
         slots_activos.append("CONVERSACIÓN")
     if tema not in _TEMAS_SIN_COMANDOS and comandos:
         slots_activos.append("COMANDOS RECIENTES")
+    if resultados_tools:
+        slots_activos.append("RESULTADOS DE TOOLS DEL TURNO ANTERIOR")
 
     lineas = [
         "=== DEBUG: CONTEXT DUMP ===",
@@ -328,8 +408,11 @@ def construir_context_dump(mem: dict, tema: str = "", sesion_id: str = "", es_mu
         f"Core memory:       {len(core)} claves",
         f"Slots activos:     {', '.join(slots_activos)}",
         f"Recuerdos:         {recuerdos_count} inyectados",
-        f"Turnos (tema):     {len(turnos_tema)} inyectados (límite={limite_turnos}) de {len(turnos)} en RAM",
+        (f"Turnos (tema):     {len(turnos_inyectados)} inyectados "
+         f"({'por recencia de la sesión' if not tema else f'{len(turnos_tema)} del tema'}) "
+         f"(límite={limite_turnos}) de {len(turnos)} en RAM"),
         f"Comandos en RAM:   {len(comandos)}",
+        f"Resultados tools:  {len(resultados_tools)} de la sesión (para follow-ups)",
         "====================",
     ]
     return "\n".join(lineas)

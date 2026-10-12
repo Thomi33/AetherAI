@@ -73,6 +73,7 @@ def _memoria_vacia() -> dict:
         "flatpaks":          {},
         "conversacion":       [],   # [{rol, texto, fecha, sesion_id, tema}]
         "historial_comandos": [],   # [{orden, cmd, fecha, sesion_id}]
+        "resultados_tools":   [],   # [{tool, args, resultado, fecha, sesion_id}] (RAM, por sesión)
         "core":               {},   # espejo de core
         "resumen":            "",   # espejo de resumen.texto
         "sesion_id":          "",
@@ -103,6 +104,8 @@ def normalizar_mem(mem: dict | None) -> dict:
         mem["conversacion"] = []
     if not isinstance(mem.get("historial_comandos"), list):
         mem["historial_comandos"] = []
+    if not isinstance(mem.get("resultados_tools"), list):
+        mem["resultados_tools"] = []
     if not isinstance(mem.get("core"), dict):
         mem["core"] = {}
     if "sesion_id" not in mem:
@@ -216,10 +219,20 @@ def registrar_turno(
     sesion_id: str = "",
     tema: str = "",
     proyecto: str = "",
+    fecha: str | None = None,
 ) -> None:
-    """Registra un turno en el store JSON y en el dict RAM."""
+    """Registra un turno en el store JSON y en el dict RAM.
+
+    fecha (ISO, opcional): estampa el turno con su hora REAL. Caso de uso
+    (fix "reloj detenido en 7:43 pm", Plan B): el turno del usuario se
+    registra al FINAL de la inferencia (node_finalize — fix del eco de
+    contexto), así que sin este parámetro su fecha era la del registro y
+    no la del envío real (una inferencia de 5 min nacía "enviada" 5 min
+    tarde en el historial). El entry point captura la hora de llegada y
+    la hace viajar por el estado del grafo (AetherState.fecha_envio)
+    hasta acá. Sin fecha → datetime.now() (comportamiento histórico)."""
     texto = str(texto)[:MAX_TEXTO]
-    fecha = datetime.now().isoformat()
+    fecha = fecha or datetime.now().isoformat()
     try:
         data = memoria_store.cargar()
         data["conversaciones"].append({
@@ -273,6 +286,72 @@ def registrar_comando(
         "orden": orden, "cmd": cmd, "fecha": fecha, "sesion_id": sesion_id,
     })
     mem["historial_comandos"] = mem["historial_comandos"][-50:]
+
+
+# ══════════════════════════════════════════════════════════════════════
+# RESULTADOS DE TOOLS (RAM, por sesión — para turnos follow-up)
+# ══════════════════════════════════════════════════════════════════════
+def registrar_resultado_tool(
+    mem: dict,
+    tool: str,
+    args,
+    resultado,
+    sesion_id: str = "",
+) -> None:
+    """
+    Conserva en el dict RAM la salida de una tool ejecutada, para que los
+    turnos follow-up ("dame una síntesis de lo que encontraste", "qué
+    encontraste") tengan los DATOS REALES en contexto y no alucinen.
+
+    Fix del bug "síntesis inventada": antes las salidas morían con el estado
+    del grafo al cerrar el turno y el modelo rellenaba el hueco con IPs,
+    puertos y procesos inventados. Solo vive en RAM (por sesión); no se
+    persiste al store JSON — la sesión lo mantiene vivo el servicio/TUI.
+    """
+    try:
+        if not isinstance(mem, dict):
+            return
+        lista = mem.get("resultados_tools")
+        if not isinstance(lista, list):
+            lista = []
+            mem["resultados_tools"] = lista
+        from core.config.settings import MAX_RESULTADOS_TOOLS_RAM
+        lista.append({
+            "tool": str(tool or "?"),
+            "args": str(args or "")[:300],
+            "resultado": str(resultado or "")[:6000],
+            "fecha": datetime.now().isoformat(timespec="seconds"),
+            "sesion_id": str(sesion_id or ""),
+        })
+        limite = int(MAX_RESULTADOS_TOOLS_RAM)
+        if limite > 0 and len(lista) > limite:
+            del lista[:-limite]
+    except Exception as e:
+        print(f"[MEMORIA] Error registrando resultado de tool: {e}")
+
+
+def obtener_resultados_tools(
+    mem: dict,
+    sesion_id: str = "",
+    limit: int | None = None,
+) -> list[dict]:
+    """
+    Últimos resultados de tools de la SESIÓN indicada (los más recientes al
+    final). Si se pasa sesion_id y no hay resultados de esa sesión, devuelve
+    [] (aislamiento: no se mezclan sesiones).
+    """
+    if not isinstance(mem, dict):
+        return []
+    lista = mem.get("resultados_tools")
+    if not isinstance(lista, list):
+        return []
+    if sesion_id:
+        lista = [r for r in lista
+                 if isinstance(r, dict) and r.get("sesion_id") == sesion_id]
+    lista = [r for r in lista if isinstance(r, dict)]
+    if limit and limit > 0:
+        lista = lista[-limit:]
+    return lista
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -429,16 +508,51 @@ def listar_sesiones(limit: int = 15) -> list[dict]:
 MIN_TURNOS_PARA_CONSOLIDAR = 12
 COMPACTACION_MIN_CHARS = 12000
 
+# Marca con la que DEBE arrancar la salida del consolidador. Si el modelo no
+# la emite (p.ej. la "respuesta" quedó siendo puro razonamiento), se descarta
+# la salida y se conserva el resumen anterior.
+_MARCA_RESUMEN = "RESUMEN CONSOLIDADO"
+
+# Cierre del bloque de razonamiento de Ornith. Se construye por partes (mismo
+# criterio que _ThinkingStreamSplitter en core/agent/graph_nodes.py) para que
+# el marcador exacto quede visible y auditable en el diff.
+_THINK_CLOSE = "<" + "/think" + ">"
+
+
+def _extraer_salida_post_thinking(raw: str) -> str:
+    """
+    Se queda SOLO con el texto posterior al ÚLTIMO cierre de thinking.
+
+    Ornith razona en bloques inline; a veces el tag de APERTURA no llega en
+    la salida (el server lo consume) y queda razonamiento suelto terminado
+    en el tag de cierre. Quedarse con lo posterior al ÚLTIMO cierre descarta
+    todo el razonamiento y deja el contenido final, haya llegado o no el
+    tag de apertura.
+    """
+    texto = str(raw or "")
+    if _THINK_CLOSE in texto:
+        texto = texto.rsplit(_THINK_CLOSE, 1)[-1]
+    return texto.strip()
+
+
 _SYSTEM_PROMPT_CONSOLIDATOR = (
     "Sos el consolidador de memoria de Aether. Tu única salida es un resumen "
     "acumulativo actualizado — NO un log de conversación, NO una lista de "
     "turnos, NO explicaciones sobre lo que hiciste.\n\n"
+    "Formato de salida:\n"
+    f"- La salida EMPIEZA con la línea '{_MARCA_RESUMEN}', seguida del resumen.\n\n"
     "Reglas:\n"
     "- Reescribís el resumen COMPLETO cada vez, integrando lo nuevo relevante "
     "y descartando charla efímera, saludos, o información que ya quedó "
     "obsoleta (ej: un problema que ya se resolvió, un plan que cambió).\n"
-    "- Priorizá: hechos estables del usuario, proyectos activos y su estado, "
-    "preferencias técnicas, decisiones tomadas, problemas pendientes.\n"
+    "- Guardá SOLO hechos verificables (datos, preferencias, proyectos con "
+    "su estado), decisiones tomadas y pendientes.\n"
+    "- PROHIBIDO el perfil psicológico y el estado de ánimo del usuario: no "
+    "registres cómo se siente ni especulaciones sobre su personalidad.\n"
+    "- Sin log de eventos ni cronología de la conversación: no es una bitácora.\n"
+    "- Sin duplicados: cada dato figura UNA sola vez, en su versión más actual.\n"
+    "- Lo que dice el asistente (turnos [AETHER]) NO es un hecho del usuario: "
+    "solo consolidá como hechos lo que el usuario dijo, hizo o confirmó.\n"
     "- Nunca inventes datos que no estén en el resumen previo o los turnos "
     "nuevos.\n"
     "- Prosa organizada en secciones cortas si hace falta, sin relleno, en "
@@ -465,13 +579,15 @@ def consolidar_resumen(forzar: bool = False, min_turnos: int = MIN_TURNOS_PARA_C
     
     Retorna el nuevo resumen si se consolidó, None si no hizo falta.
     """
-    from core.config.settings import RUTA_NOTAS
-
     pendientes = obtener_turnos_pendientes_de_resumen()
+    if not pendientes:
+        return None
     if not forzar and (len(pendientes) < min_turnos):
         return None
 
-    resumen_previo = obtener_resumen()
+    # [RESUMEN PREVIO] va como TEXTO: obtener_resumen() es un dict
+    # {texto, ultimo_turno_id, actualizado} y antes se inyectaba entero.
+    resumen_previo = obtener_resumen().get("texto", "") or ""
     prompt = f"{_SYSTEM_PROMPT_CONSOLIDATOR}\n\n[RESUMEN PREVIO]:\n{resumen_previo or '(vacío)'} \n\n[TURNOS NUEVOS]:\n{_bloque_turnos(pendientes)}"
 
     from core.config.settings import OLLAMA_HOST, MODELO, NUM_CTX
@@ -481,6 +597,10 @@ def consolidar_resumen(forzar: bool = False, min_turnos: int = MIN_TURNOS_PARA_C
         "model": MODELO,
         "prompt": prompt,
         "stream": False,
+        # Ornith es thinking: sin think=False el razonamiento llega inline en
+        # "response" y contamina el resumen (el parseo de abajo es la red de
+        # seguridad para cuando el server no soporta/respeta el flag).
+        "think": False,
         "options": {"temperature": 0.3, "num_ctx": NUM_CTX},
         "keep_alive": "10m",
     }
@@ -500,13 +620,27 @@ def consolidar_resumen(forzar: bool = False, min_turnos: int = MIN_TURNOS_PARA_C
         print(f"[MEMORIA] Error del modelo consolidando: {data['error']}")
         return None
 
-    nuevo_resumen = data.get("response", "").strip()
+    # 1) El modelo puede razonar antes de contestar: quedarse SOLO con el
+    #    texto posterior al ÚLTIMO cierre de thinking (falte o no el de apertura).
+    nuevo_resumen = _extraer_salida_post_thinking(data.get("response", ""))
     if not nuevo_resumen:
         print("[MEMORIA] Resumen vacío devuelto por el modelo")
         return None
 
-    guardar_resumen(nuevo_resumen)
-    print(f"[MEMORIA] Resumen consolidado ({len(pendientes)} turnos integrados)")
+    # 2) Sanity check de formato: sin la marca, la salida no es un resumen
+    #    (quedó siendo razonamiento o charla) → conservar el anterior y no
+    #    avanzar el cursor, para reintentar en la próxima consolidación.
+    if not nuevo_resumen.startswith(_MARCA_RESUMEN):
+        print(f"[MEMORIA] ⚠️  Salida del consolidador inválida (no empieza con "
+              f"'{_MARCA_RESUMEN}'); se conserva el resumen anterior")
+        return None
+
+    # 3) Avanzar el cursor de consolidación al último turno integrado: sin
+    #    esto la próxima corrida re-procesa los mismos turnos para siempre.
+    ultimo_id = int(pendientes[-1].get("id") or 0)
+    guardar_resumen(nuevo_resumen, ultimo_turno_id=ultimo_id)
+    print(f"[MEMORIA] Resumen consolidado ({len(pendientes)} turnos integrados, "
+          f"hasta turno #{ultimo_id})")
     return nuevo_resumen
 
 

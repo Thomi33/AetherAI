@@ -37,11 +37,22 @@ import tempfile
 import time
 from pathlib import Path
 
+from core.config import capabilities as _capabilities
+
 _MAX_BYTES = 10 * 1024 * 1024      # 10 MB por adjunto
 _MAX_TEXTO_INLINE = 4000           # chars por archivo de texto embebido
 _MAX_TEXTO_EMBEBIDOS = 4           # cuántos archivos de texto se embeben
 _MAX_IMAGENES_DESCRITAS = 2        # cuántas imágenes se describen con visión
 _MAX_AUDIO_SEGUNDOS = 600          # tope de 10 min para transcribir
+# ── Pipeline de frames de video (análisis visual) ──
+# Cada frame se extrae UNA sola vez (ffmpeg), persiste junto al video y
+# se reusa para captions e inline (ver _extraer_frames_video). Los
+# límites son de degradación: si se exceden, el video queda en el
+# comportamiento anterior (solo transcripción), nunca rompe el turno.
+_VIDEO_FRAMES = 4                  # default: frames equiespaciados por video
+_VIDEO_FRAMES_TOPE = 8             # tope duro del config VIDEO_FRAMES (sanity)
+_VIDEO_DURACION_MAX = 4 * 3600     # videos más largos → sin frames
+_VIDEO_FRAME_TIMEOUT = 30          # presupuesto total (s) de ffmpeg por video
 _THUMB_MAX_LADO = 1024             # lado mayor (px) del thumbnail para visión
 _THUMB_CALIDAD_JPEG = 85           # calidad del JPEG del thumbnail
 _MAX_IMAGENES_INLINE = 4           # cuántos thumbnails van inline al modelo
@@ -127,43 +138,196 @@ def _extraer_texto_vector(ruta: Path) -> str | None:
         return " ".join(t.strip() for t in textos if t.strip()) or None
     except Exception:
         return None
+def _audio_a_numpy(ruta: Path):
+    """Decodifica el audio (de cualquier archivo de audio/VIDEO) a un
+    ndarray float32 mono 16 kHz vía ffmpeg + PCM crudo, SIN PyAV.
+
+    Por qué: faster-whisper decodifica con PyAV cuando recibe un PATH y
+    llama av.open(..., metadata_errors=...) — kwarg que PyAV 19 eliminó
+    (y PyAV 14 no publica wheels para Python 3.14): cualquier
+    combinación de versiones revienta la transcripción. Pasando el
+    ARRAY, faster-whisper no toca PyAV y ffmpeg — dependencia que el
+    pipeline de video ya requiere — hace la decodificación.
+    """
+    try:
+        import numpy as np
+        r = subprocess.run(
+            ["ffmpeg", "-i", str(ruta), "-vn", "-ac", "1", "-ar", "16000",
+             "-f", "f32le", "-acodec", "pcm_f32le", "-"],
+            capture_output=True, timeout=120)
+        if r.returncode != 0 or not r.stdout:
+            return None
+        return np.frombuffer(r.stdout, dtype=np.float32)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _transcribir_audio(ruta: Path) -> str | None:
     """Transcribe audio/video usando faster-whisper.
-    Extrae audio si es video, luego transcribe.
+
+    El audio se decodifica UNA vez a ndarray con ffmpeg (_audio_a_numpy)
+    y WhisperModel.transcribe recibe el ARRAY (no el path): PyAV queda
+    fuera del pipeline, inmune al conflicto de versiones (ver
+    _audio_a_numpy). Sin pista de audio / ffmpeg caído / whisper no
+    instalado → None (el adjunto degrada a "no se pudo transcribir").
     """
     try:
         from faster_whisper import WhisperModel
         from core.config.config_manager import get_config_manager
         cfg = get_config_manager()
         modelo = cfg.get("WHISPER_MODEL", "base")  # tiny, base, small, medium, large
-        if ruta.suffix.lower() in {".mp4", ".webm", ".mov", ".mkv", ".avi", ".m4v"}:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
-                audio_path = Path(tmp_audio.name)
-            try:
-                subprocess.run([
-                    "ffmpeg", "-y", "-i", str(ruta),
-                    "-ac", "1", "-ar", "16000", "-vn", str(audio_path)
-                ], check=True, capture_output=True, timeout=60)
-                ruta_audio = audio_path
-            except Exception:
-                if audio_path.exists():
-                    audio_path.unlink(missing_ok=True)
-                return None
-        else:
-            ruta_audio = ruta
+        audio = _audio_a_numpy(ruta)
+        if audio is None or len(audio) == 0:
+            return None
         model = WhisperModel(modelo, device="cpu", compute_type="int8")
         segments, info = model.transcribe(
-            str(ruta_audio),
-            language=None,  # auto-detect
+            audio, language=None,  # auto-detect
             vad_filter=True,
             max_initial_timestamp=_MAX_AUDIO_SEGUNDOS,
         )
         texto = " ".join(seg.text for seg in segments).strip()
-        if ruta_audio != ruta:
-            ruta_audio.unlink(missing_ok=True)
         return texto or None
     except Exception:
         return None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# FRAMES DE VIDEO: análisis visual del contenido (matriz de capacidades
+# core/config/capabilities — feature "video_frames": ffmpeg + algún
+# modelo con visión). Cada frame se extrae UNA sola vez por procesamiento
+# y se REUTILIZA para captions (describir_imagen) e imágenes inline
+# (thumbnails_frames_inline): los JPEG persisten junto al video y
+# generar_thumbnail_b64 cachea por path+mtime.
+# ════════════════════════════════════════════════════════════════════════
+
+def _vision_video_activa() -> bool:
+    """True si el pipeline de frames está activo según la matriz de
+    capacidades (fuente única: core/config/capabilities). Nunca revienta."""
+    try:
+        return bool(_capabilities.funciones_disponibles()["video_frames"])
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _duracion_video(ruta: Path) -> float:
+    """Duración en segundos vía ffprobe (0.0 si falla). Best-effort."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", str(ruta)],
+            capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return 0.0
+        return max(0.0, float(r.stdout.strip()))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _formato_mmss(seg: float) -> str:
+    """'03:12' / '01:03:12' para etiquetar timestamps de frames."""
+    s = max(0, int(round(seg)))
+    h, resto = divmod(s, 3600)
+    m, s = divmod(resto, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def _video_frames_n() -> int:
+    """VIDEO_FRAMES de config con default 4 (ajuste aprobado) y tope duro."""
+    try:
+        from core.config.config_manager import get_config_manager
+        n = int(get_config_manager().get("VIDEO_FRAMES", _VIDEO_FRAMES))
+    except Exception:  # noqa: BLE001
+        n = _VIDEO_FRAMES
+    return max(1, min(n, _VIDEO_FRAMES_TOPE))
+
+
+def _extraer_frames_video(ruta: Path, n: int | None = None) -> list[dict]:
+    """n frames equiespaciados del video, EXTRAÍDOS UNA SOLA VEZ.
+
+    Los JPEG persisten junto al video (<video>.frames/frame_NN.jpg) y se
+    reutilizan para todo: captions de MODELO_VISION, thumbnails inline y
+    turnos futuros (generar_thumbnail_b64 cachea por path+mtime, así el
+    mismo frame nunca se extrae ni re-escala dos veces). Solo se
+    regeneran si el video cambió (mtime del frame < mtime del video).
+
+    Límites (degradación a transcripción-only, nunca rompe el turno):
+      - duración del video <= _VIDEO_DURACION_MAX;
+      - presupuesto total de ffmpeg de _VIDEO_FRAME_TIMEOUT segundos
+        (además del timeout individual de cada comando);
+      - resolución acotada en la extracción (scale <= 1024px, mismo
+        filtro que _thumb_ffmpeg): el JPEG persistido ya es liviano.
+
+    Devuelve [{'t': seg, 'path': Path, 'thumb': b64}]; [] si no se pudo.
+    """
+    try:
+        ruta = Path(ruta)
+        if not ruta.is_file():
+            return []
+        n = n if n and n > 0 else _video_frames_n()
+        dur = _duracion_video(ruta)
+        if dur <= 0 or dur > _VIDEO_DURACION_MAX:
+            return []
+        try:
+            mtime_video = ruta.stat().st_mtime
+        except OSError:
+            return []
+        dframes = ruta.with_name(ruta.name + ".frames")
+        dframes.mkdir(exist_ok=True)
+        # Equiespaciado interior (evita frame negro de inicio y corte final)
+        instantes = [dur * (i + 0.5) / n for i in range(n)]
+        frames: list[dict] = []
+        presupuesto = time.monotonic() + _VIDEO_FRAME_TIMEOUT
+        for i, t in enumerate(instantes):
+            out = dframes / f"frame_{i:02d}.jpg"
+            try:
+                reusar = out.is_file() and out.stat().st_mtime >= mtime_video
+            except OSError:
+                reusar = False
+            if not reusar:
+                if time.monotonic() > presupuesto:
+                    break  # presupuesto agotado: degradar con lo que hay
+                try:
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-ss", f"{t:.3f}", "-i", str(ruta),
+                         "-frames:v", "1",
+                         "-vf", ("scale='min(iw,1024)':'min(ih,1024)'"
+                                 ":force_original_aspect_ratio=decrease"),
+                         "-q:v", "4", str(out)],
+                        capture_output=True, timeout=15, check=True)
+                except Exception:  # noqa: BLE001
+                    continue
+            thumb = generar_thumbnail_b64(out)
+            if thumb:
+                frames.append({"t": t, "path": out, "thumb": thumb})
+        return frames
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def thumbnails_frames_inline(metas: list[dict], modelo: str,
+                             cupo: int | None = None) -> list[str]:
+    """Thumbnails (b64) de frames de videos adjuntos si `modelo` admite
+    visión nativa (ver modelo_admite_imagenes).
+
+    `cupo` = espacio restante del presupuesto compartido de imágenes
+    inline (_MAX_IMAGENES_INLINE): las imágenes del usuario van primero
+    (el caller _preparar_orden pasa el cupo sobrante; el overflow de
+    frames queda solo-caption).
+
+    Reusa los frames persistidos por _extraer_frames_video (una sola
+    extracción por video; el thumbnail ya está cacheado).
+    """
+    if cupo is None:
+        cupo = _MAX_IMAGENES_INLINE
+    if cupo <= 0 or not modelo_admite_imagenes(modelo):
+        return []
+    out: list[str] = []
+    for m in [x for x in metas if x.get("kind") == "video" and x.get("path")]:
+        for f in _extraer_frames_video(Path(m["path"])):
+            out.append(f["thumb"])
+            if len(out) >= cupo:
+                return out
+    return out
 # ════════════════════════════════════════════════════════════════════════
 # THUMBNAILS: la foto se manda al modelo como thumbnail, no a resolución
 # completa (una foto de 4000px son ~4 MB de base64; el mismo contenido en
@@ -277,35 +441,25 @@ def generar_thumbnail_b64(ruta: Path | str,
     return data
 
 
-_CACHE_MODELO_VISION: dict[str, bool] = {}
+# Cache delegado a core/config/capabilities (fuente única de verdad de
+# la matriz de capacidades por modelo). ES EL MISMO objeto dict: el
+# fixture de tests que hace attachments._CACHE_MODELO_VISION.clear()
+# sigue limpiando el cache real tras la delegación.
+_CACHE_MODELO_VISION: dict[str, dict] = _capabilities._CACHE_CAPACIDADES
 
 
 def modelo_admite_imagenes(modelo: str) -> bool:
     """True si el modelo de Ollama acepta imágenes (visión nativa).
 
-    Consulta POST /api/show y mira `capabilities` (formato nuevo) o
-    `projector_info` (encoder CLIP); cacheado por host+modelo. Un modelo
+    DELEGADO en core/config/capabilities.modelo_admite_imagenes: consulta
+    POST /api/show y mira `capabilities` (formato nuevo) o
+    `projector_info` (encoder CLIP), cacheado por host+modelo. Este
+    wrapper se conserva para no romper callers ni tests. Un modelo
     text-only rechaza mensajes con "images" (HTTP 400), así que el
     thumbnail inline SOLO se activa cuando esto devuelve True — si no,
     el análisis de la imagen cae al caption de MODELO_VISION.
     """
-    import requests
-    from core.config.settings import OLLAMA_HOST
-    clave = f"{OLLAMA_HOST}|{modelo}"
-    if clave in _CACHE_MODELO_VISION:
-        return _CACHE_MODELO_VISION[clave]
-    try:
-        r = requests.post(f"{OLLAMA_HOST}/api/show",
-                          json={"model": modelo}, timeout=10)
-        data = r.json() if r.status_code == 200 else {}
-    except Exception:
-        return False  # sin info confiable: no arriesgar un 400
-    caps = data.get("capabilities") or []
-    projector = data.get("projector_info") or {}
-    admite = ("vision" in caps
-              or bool(projector.get("clip.has_vision_encoder")))
-    _CACHE_MODELO_VISION[clave] = admite
-    return admite
+    return _capabilities.modelo_admite_imagenes(modelo)
 
 
 def thumbnails_inline(metas: list[dict], modelo: str) -> list[str]:
@@ -345,6 +499,44 @@ def _decodificar(adj: dict, indice: int) -> tuple[dict | None, str | None]:
                       f"({len(crudo) // (1024 * 1024)} MB)")
     return {"name": nombre, "mime": mime, "bytes": crudo,
             "kind": _kind(nombre, mime)}, None
+
+
+# ── SIDECAR DE TEXTO EXTRAÍDO (fix del flujo upload→path) ──
+# La Web UI sube con /api/attachments/upload (que transcribe audio/video y
+# extrae PDF/DOCX/SVG) pero el turno referencia el adjunto solo por PATH:
+# el texto obtenido en el upload se perdía. Se persiste junto al archivo
+# (<archivo>.txt) y adjuntos_ya_guardados lo relee — mismo patrón de
+# persistencia+reuso que los frames de video (<video>.frames/).
+# kind "text" no necesita sidecar: componer_orden relee el original.
+_KINDS_TEXTO_SIDECAR = {"pdf", "docx", "vector", "audio", "video"}
+_MAX_TEXTO_SIDECAR = 2 * 1024 * 1024   # sanity al leer (2 MB)
+
+
+def _path_texto_adjunto(ruta: Path) -> Path:
+    """Sidecar de texto extraído: <archivo>.txt junto al adjunto."""
+    return ruta.with_name(ruta.name + ".txt")
+
+
+def _guardar_texto_adjunto(ruta: Path, texto: str) -> None:
+    """Persiste el texto extraído junto al adjunto (best-effort)."""
+    try:
+        _path_texto_adjunto(ruta).write_text(texto, encoding="utf-8")
+    except Exception:  # noqa: BLE001 — nunca romper el guardado
+        pass
+
+
+def _leer_texto_adjunto(ruta: Path) -> str | None:
+    """Texto extraído persistido junto al adjunto, o None. Best-effort."""
+    try:
+        sidecar = _path_texto_adjunto(ruta)
+        if sidecar.stat().st_size > _MAX_TEXTO_SIDECAR:
+            return None
+        return sidecar.read_text(encoding="utf-8",
+                                 errors="replace").strip() or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def guardar_adjuntos(attachments: list[dict]) -> tuple[list[dict], list[str]]:
     """Guarda los adjuntos en disco. Devuelve (metas, errores)."""
     metas: list[dict] = []
@@ -382,6 +574,12 @@ def guardar_adjuntos(attachments: list[dict]) -> tuple[list[dict], list[str]]:
             texto_extra = _transcribir_audio(path)
         if texto_extra:
             m["texto_extraido"] = texto_extra
+            # Persistir junto al archivo (sidecar) para que los turnos
+            # futuros vía upload→path lo recuperen: la UI referencia el
+            # adjunto por path SIN re-mandar el texto (ver
+            # _KINDS_TEXTO_SIDECAR).
+            if kind in _KINDS_TEXTO_SIDECAR:
+                _guardar_texto_adjunto(path, texto_extra)
     return metas, errores
 def adjuntos_ya_guardados(adjuntos: list[dict]) -> list[dict]:
     """Reconstruye metas de adjuntos subidos previamente (upload multipart).
@@ -408,11 +606,18 @@ def adjuntos_ya_guardados(adjuntos: list[dict]) -> list[dict]:
             nombre = _RE_NOMBRE_SEGURO.sub(
                 "_", str(adj.get("name") or p.name))
             mime = str(adj.get("mime") or "application/octet-stream")
-            metas.append({
-                "name": nombre, "mime": mime,
-                "kind": _kind(nombre, mime),
-                "path": str(p), "size": size,
-            })
+            kind = _kind(nombre, mime)
+            meta = {"name": nombre, "mime": mime, "kind": kind,
+                     "path": str(p), "size": size}
+            # Fix del flujo upload→path: recuperar el texto extraído que
+            # el upload persistió junto al archivo (transcripción de
+            # audio/video, texto de PDF/DOCX/SVG). Antes se perdía y el
+            # video llegaba al turno como "no se pudo transcribir".
+            if kind in _KINDS_TEXTO_SIDECAR:
+                texto = _leer_texto_adjunto(p)
+                if texto:
+                    meta["texto_extraido"] = texto
+            metas.append(meta)
         except OSError:
             continue
     return metas
@@ -525,7 +730,8 @@ def describir_imagen(ruta: Path, pregunta: str | None = None) -> str | None:
     except Exception:
         return None
 def componer_orden(mensaje: str, metas: list[dict], errores: list[str],
-                   describir: bool = True, inline: bool = False) -> str:
+                   describir: bool = True, inline: bool = False,
+                   cupo_inline: int | None = None) -> str:
     """Mensaje + bloque [ADJUNTOS] con lo que el agente necesita:
     contenido de texto embebido, descripciones de imágenes y rutas en disco.
 
@@ -537,6 +743,11 @@ def componer_orden(mensaje: str, metas: list[dict], errores: list[str],
     mensaje del usuario del grafo (ver _preparar_orden): el modelo con
     visión nativa las analiza directamente y el caption de MODELO_VISION
     es redundante (el caller lo saltea con describir=False).
+
+    cupo_inline (opcional): cuántos FRAMES de video van incrustados
+    cuando inline=True — presupuesto compartido con las imágenes del
+    usuario, que tienen prioridad (el caller _preparar_orden pasa el
+    cupo exacto). Default: _MAX_IMAGENES_INLINE.
     """
     if not metas and not errores:
         return mensaje
@@ -591,14 +802,44 @@ def componer_orden(mensaje: str, metas: list[dict], errores: list[str],
             lineas.append(f"-- Audio '{m['name']}' (guardado en {m['path']}). Transcripción:\n" f"```\n{txt}\n```")
         else:
             lineas.append(f"-- Audio '{m['name']}' guardado en {m['path']} (no se pudo transcribir).")
+    # Presupuesto de FRAMES que viajan inline, GLOBAL al mensaje (compartido
+    # entre todos los videos; las imágenes del usuario ya ocuparon su parte
+    # — el caller pasa el cupo exacto vía cupo_inline).
+    marcar = ((cupo_inline if cupo_inline is not None
+               else _MAX_IMAGENES_INLINE) if inline else 0)
     for m in videos:
         txt = m.get("texto_extraido")
         if txt:
             if len(txt) > _MAX_TEXTO_INLINE:
                 txt = txt[:_MAX_TEXTO_INLINE] + "\n…[truncado]"
-            lineas.append(f"-- Video '{m['name']}' (guardado en {m['path']}). Transcripción:\n" f"```\n{txt}\n```")
+            encabezado = (f"-- Video '{m['name']}' (guardado en {m['path']}). "
+                          f"Transcripción:\n```\n{txt}\n```")
         else:
-            lineas.append(f"-- Video '{m['name']}' guardado en {m['path']} (no se pudo transcribir).")
+            encabezado = (f"-- Video '{m['name']}' guardado en {m['path']} "
+                          "(no se pudo transcribir).")
+        # Análisis VISUAL por frames (feature "video_frames" de la matriz
+        # de capacidades). El frame se extrae UNA vez y se reusa para el
+        # caption (MODELO_VISION) y para el inline (ver _preparar_orden).
+        # Si algo falla (sin ffmpeg, video corrupto, etc.) degrada al
+        # comportamiento anterior: solo la transcripción.
+        if _vision_video_activa():
+            frames = _extraer_frames_video(Path(m["path"]))
+            if frames:
+                cuerpo: list[str] = []
+                for f in frames:
+                    desc = (describir_imagen(f["path"], pregunta=mensaje)
+                            if describir else None)
+                    linea = f"[t={_formato_mmss(f['t'])}]"
+                    if desc:
+                        linea += f" {desc}"
+                    elif marcar > 0:
+                        marcar -= 1
+                        linea += " (frame adjunto como imagen; analizalo directamente)"
+                    cuerpo.append(linea)
+                if cuerpo:
+                    encabezado += ("\n   Frames analizados (visión activa):\n   "
+                                   + "\n   ".join(cuerpo))
+        lineas.append(encabezado)
     for i, m in enumerate(imagenes):
         # inline=True → el thumbnail de esta imagen viaja incrustado en el
         # mensaje del usuario (ver _preparar_orden): el modelo la ve directo.

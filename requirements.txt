@@ -15,3 +15,11 @@ mcp>=1.0
 textual>=6.0
 rich>=14.0
 opencv-python-headless>=4.10
+
+# Adjuntos multimedia (transcripción local de audio/video).
+# La decodificación va por ffmpeg a ndarray (attachments._audio_a_numpy):
+# NUNCA pasar paths a WhisperModel.transcribe (conflicto faster-whisper ×
+# PyAV 19 con metadata_errors; ver ai_map.md gotcha 11).
+faster-whisper>=1.2.0
+av>=19  # solo para el import de faster_whisper
+numpy>=2.0

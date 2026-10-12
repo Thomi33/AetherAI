@@ -78,9 +78,10 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "node": "node_vision",
         "instruccion_requerida": False,  # puede capturar pantalla sin instrucción explícita
         "descripcion": (
-            "Analizar una IMAGEN: un archivo adjunto del usuario (pasando "
-            "'path' con la ruta del archivo) o la pantalla actual (captura "
-            "del monitor) si no hay archivo."
+            "Analizar una IMAGEN o VIDEO: un archivo adjunto del usuario "
+            "(pasando 'path' con la ruta del archivo; los videos se "
+            "analizan por frames con timestamps) o la pantalla actual "
+            "(captura del monitor) si no hay archivo."
         ),
     },
     "codigo": {
@@ -115,6 +116,20 @@ TOOL_REGISTRY: dict[str, dict[str, Any]] = {
         "node": "node_memory",
         "instruccion_requerida": True,
         "descripcion": "Gestionar la memoria del agente (ver, borrar, recordar).",
+    },
+    "net_audit": {
+        "node": "node_net_audit",
+        "instruccion_requerida": False,  # releva la red completa sin args
+        "descripcion": (
+            "Auditoría de red SOLO LECTURA: conexiones establecidas "
+            "(con clase loopback/LAN/externa), puertos en escucha (expuestos "
+            "vs. loopback), intentos fallidos de SSH, últimos logins y mtime "
+            "de ~/.ssh/authorized_keys. Devuelve JSON estructurado que SOLO "
+            "hay que resumir. Usala ANTES que shell/netstat ante pedidos de "
+            "'revisar mi tráfico de red', 'mirá mis conexiones', 'chequeá si "
+            "hay algo sospechoso', 'qué puertos están abiertos'. No usa sudo "
+            "ni modifica nada."
+        ),
     },
     "file_write": {
     "node": "node_file_write",
@@ -238,9 +253,10 @@ TOOL_PARAMETROS: dict[str, dict] = {
         "properties": {
             "instruccion": {"type": "string", "description": "Qué mirar/analizar (opcional)."},
             "path": {"type": "string", "description": (
-                "Ruta absoluta de la imagen adjunta a describir "
-                "(png/jpg/jpeg/webp/gif/bmp/tiff). Si se indica, se analiza "
-                "ese archivo en vez de capturar la pantalla."
+                "Ruta absoluta de la IMAGEN o VIDEO adjunto a analizar "
+                "(png/jpg/jpeg/webp/gif/bmp/tiff o mp4/webm/mov/mkv/avi/"
+                "m4v). Si se indica, se analiza ese archivo (los videos, "
+                "por frames) en vez de capturar la pantalla."
             )},
         },
         "required": [],
@@ -258,6 +274,11 @@ TOOL_PARAMETROS: dict[str, dict] = {
             "instruccion": {"type": "string", "description": "Qué operación de memoria realizar (ver, borrar, recordar)."},
         },
         "required": ["instruccion"],
+    },
+    "net_audit": {
+        "type": "object",
+        "properties": {},
+        "required": [],
     },
     "file_write": {
         "type": "object",

@@ -13,9 +13,10 @@ Servidor → cliente (mismo contrato de eventos que el SSE /api/chat/stream):
     {"type": "hello", "version": ..., "busy": ...}   (al conectar)
     {"type": "start", "busy": ...}
     {"type": "token", "data": "..."}
+    {"type": "reasoning", "data": "..."}
     {"type": "node", "node": "...", "estado": "...", "delta": {...}}
     {"type": "log", "data": "..."}
-    {"type": "done", "response": "..."}
+    {"type": "done", "response": "...", "reasoning": "..."}
     {"type": "error", "message": "..."}
     {"type": "pong"}
 
@@ -29,48 +30,25 @@ import itertools
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from backend.core.aether_service import (
-    AetherService,
-    TokenEvent,
-    ReasoningEvent,
-    StdoutLineEvent,
-    NodeUpdateEvent,
-    DoneEvent,
-    ErrorEvent,
-)
-from backend.api.routes.chat import _delta_front, _preparar_orden
-from core.utils.response_cleaner import limpiar_respuesta_chat
-from tui.status_messages import real_state_for_node
+from backend.core.aether_service import AetherService
+# Serialización de eventos COMPARTIDA con el SSE /api/chat/stream: una sola
+# vía (_payload_de_evento) mantiene ambos transportes a paridad — la cadena
+# isinstance duplicada del SSE era la que perdía el ReasoningEvent.
+from backend.api.routes.chat import _payload_de_evento, _preparar_orden
 
 router = APIRouter()
 
 
 def _iter_payloads(mensaje: str, imagenes: list[str] | None = None):
-    """Generador síncrono: eventos del grafo → dicts JSON (espejo del SSE)."""
+    """Generador síncrono: eventos del grafo → dicts JSON (espejo del SSE).
+
+    Serializa con _payload_de_evento (chat.py): ReasoningEvent por su canal
+    propio y done con respuesta limpia + razonamiento completo — idéntico
+    contrato que /api/chat/stream."""
     for evento in AetherService.iter_eventos(mensaje, imagenes):
-        if isinstance(evento, TokenEvent):
-            yield {"type": "token", "data": evento.fragmento}
-        elif isinstance(evento, ReasoningEvent):
-            # Canal de razonamiento separado de la respuesta (Web UI).
-            yield {"type": "reasoning", "data": evento.fragmento}
-        elif isinstance(evento, NodeUpdateEvent):
-            yield {
-                "type": "node",
-                "node": evento.nodo,
-                "estado": real_state_for_node(evento.nodo, evento.delta),
-                "delta": _delta_front(evento.delta),
-            }
-        elif isinstance(evento, StdoutLineEvent):
-            yield {"type": "log", "data": evento.texto[:2000]}
-        elif isinstance(evento, DoneEvent):
-            yield {
-                "type": "done",
-                "response": limpiar_respuesta_chat(evento.respuesta),
-                # Razonamiento completo del turno (por si se perdió streaming).
-                "reasoning": evento.reasoning,
-            }
-        elif isinstance(evento, ErrorEvent):
-            yield {"type": "error", "message": evento.mensaje}
+        payload = _payload_de_evento(evento)
+        if payload is not None:
+            yield payload
 
 
 async def _stream_mensaje(ws: WebSocket, mensaje: str,

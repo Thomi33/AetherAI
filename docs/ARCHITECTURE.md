@@ -350,26 +350,45 @@ RAM memory
     └── command history
           │
           ▼
-     current.db
+  memoria.json (<BASE_AETHER>/db/, atomic writes + rotating .bak)
           │
-          ├── conversations
-          ├── commands
-          ├── memories
-          ├── core_memory
-          └── summary_memory
+          ├── core
+          ├── resumen {texto, ultimo_turno_id, actualizado}
+          ├── conversaciones {id, fecha, rol, texto, sesion_id, tema, proyecto}
+          ├── comandos
+          └── recuerdos
 ```
 
-`memory_manager.py` uses `~/Aether/db/current.db` as the production DB. The
+`memory_manager.py` persists everything through `memoria_store.py`: a single
+atomic JSON store with backup and corruption recovery. The legacy sqlite DB
+(`current.db`) is imported once on first boot, then never touched again. The
 RAM structure is normalized through `normalizar_mem()`.
 
 Conversational context is not injected without limits: `settings.py` defines
 per-turn and character budgets. For multi-tool plans, conversational history
 can be trimmed to zero turns to avoid contamination between steps; previous
-step results are the relevant operating context.
+step results are the relevant operating context. With a topic, history is
+injected per topic/session; without one, the last N turns by recency.
+
+Turns are registered when the inference completes (`node_finalize`), in real
+chronological order (user → assistant) and with `tema`/`sesion_id` on both
+turns, so the current message is never duplicated between history and
+prompt.
 
 Consolidation of the accumulated summary is scheduled after completing an
 order (v2 moved this into `memory_manager`; the old `consolidator.py` was
-removed).
+removed). The consolidator:
+
+- calls the model with `think=false` and takes the output after the LAST
+  thinking block (even when the opening tag is missing), so the model's
+  reasoning never reaches the summary;
+- requires the output to start with `RESUMEN CONSOLIDADO` — otherwise the
+  previous summary is kept and consolidation is retried later;
+- advances the `ultimo_turno_id` cursor to the last consolidated turn, so
+  the same turns are never re-processed;
+- stores only verifiable facts, decisions and pending items — no
+  psychological profile or mood, no event log, no duplicates, and nothing
+  the assistant said is ever recorded as a user fact.
 
 ### Shared central memory (v2: SQLite)
 
@@ -435,6 +454,45 @@ The v2 migration removed the old observational model policy
 (`model_policy.py`): the configured model is used directly. The decision
 point for future adaptive policies now lives in the plain config layer.
 
+### Approved models (officially evaluated)
+
+**Ornith** (`ornith-1.5:9b`) and **Granite**
+(`hf.co/ibm-granite/granite-4.2-8b-GGUF:Q6_K`) passed the maintainer's
+evaluations and are approved for Aether. Granite carries a recorded
+autonomy limitation (during long agentic tasks it may stop before
+completing and require manual intervention) that does NOT affect its
+approval — functional compatibility and sustained autonomy are distinct
+dimensions. Full details, measured capabilities, recorded hardware
+requirements and the proposed (not implemented) recovery mechanisms:
+[`MODELOS.md`](./MODELOS.md). The installer offers both models, detects
+already-installed ones, and keeps the custom-model option.
+
+### Per-model capability matrix (2026-10)
+
+`core/config/capabilities.py` is the single source of truth for what
+Aether can do with each model: capabilities declared by Ollama
+(`capacidades_modelo()` → `/api/show`: vision/tools/thinking/embedding/
+audio, with `projector_info` fallback) vs Aether's effective features
+(`funciones_disponibles()`: declared + environment — ffmpeg /
+faster-whisper / grim — + config). Wrappers delegate
+(`attachments.modelo_admite_imagenes`, `aether_service._modelo_con_reasoning`);
+the SSE `start.reasoning` flag comes from real Ollama capabilities, with
+the name-based heuristic as fallback only.
+
+### Multimodal video pipeline (2026-10)
+
+Video attachments are analyzed visually: `_extraer_frames_video` extracts
+N evenly-spaced frames ONCE (persisted under `<video>.frames/` and reused
+across captions, inline images and future turns; ffmpeg budget 30s;
+`VIDEO_FRAMES` config, default 4, max 8). `componer_orden` embeds frame
+captions with timestamps next to the transcription (faster-whisper,
+decoded via ffmpeg→ndarray — PyAV is never used at runtime). Text-only
+models get captions through `MODELO_VISION`; multimodal models receive
+the frames inline within the shared 4-image budget (user images first).
+The graph's `vision` tool also analyzes videos by frames. Extracted
+text/transcriptions are persisted as a sidecar (`<file>.txt`) so the
+Web UI's upload→path flow recovers them.
+
 ## 14. CLI and launcher
 
 The relevant entry points are:
@@ -477,7 +535,7 @@ AetherAI/
 ├── core/
 │   ├── agent/                   # graph, state, planner, loop, registry
 │   ├── config/                  # two-layer config and directory authorization
-│   ├── memory/                  # memory + SQLite stores (session + central v2)
+│   ├── memory/                  # memory: JSON session store + SQLite central v2
 │   ├── parser/                  # shell/response parsing
 │   ├── services/                # compatible facades/services
 │   ├── skills/                  # reusable behavior
